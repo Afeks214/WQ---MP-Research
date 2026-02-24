@@ -5,7 +5,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Optional, Union
 
 import numpy as np
 
@@ -48,9 +48,9 @@ class DataConfigModel(BaseModel):
     root: str = "./data/minute"
     format: Literal["parquet", "csv"] = "parquet"
     path_by_symbol: dict[str, str] = Field(default_factory=dict)
-    timestamp_column: str | None = None
-    start: datetime | None = None
-    end: datetime | None = None
+    timestamp_column: Optional[str] = None
+    start: Optional[datetime] = None
+    end: Optional[datetime] = None
 
     @model_validator(mode="after")
     def validate_time_range(self) -> "DataConfigModel":
@@ -79,7 +79,7 @@ class EngineConfigModel(BaseModel):
     seed: int = 17
     fail_on_nan: bool = True
 
-    tick_size: list[float] | None = None
+    tick_size: Optional[list[float]] = None
     tick_size_default: float = 0.01
     tick_size_by_symbol: dict[str, float] = Field(default_factory=dict)
 
@@ -90,13 +90,13 @@ class Module2ConfigModel(BaseModel):
     profile_window_bars: int = 60
     profile_warmup_bars: int = 60
     atr_span: int = 14
-    atr_alpha: float | None = None
+    atr_alpha: Optional[float] = None
     atr_floor_mult_tick: float = 4.0
-    atr_floor_abs: float | list[float] = 0.0
+    atr_floor_abs: Union[float, list[float]] = 0.0
     rvol_lookback_sessions: int = 20
     rvol_policy: str = "neutral_one"
     rvol_vol_eps_mult_tick: float = 1.0
-    rvol_vol_eps_abs: float | list[float] = 1e-12
+    rvol_vol_eps_abs: Union[float, list[float]] = 1e-12
     rvol_clip_min: float = 0.0
     rvol_clip_max: float = 50.0
     volume_cap_window_bars: int = 60
@@ -245,7 +245,7 @@ class CandidateSpecModel(BaseModel):
     m2_idx: int
     m3_idx: int
     m4_idx: int
-    enabled_assets: str | list[str] | list[bool] = "all"
+    enabled_assets: Union[str, list[str], list[bool]] = "all"
     tags: list[str] = Field(default_factory=list)
 
 
@@ -273,7 +273,7 @@ class RunConfigModel(BaseModel):
     module3_configs: list[Module3ConfigModel] = Field(default_factory=lambda: [Module3ConfigModel()])
     module4_configs: list[Module4ConfigModel] = Field(default_factory=lambda: [Module4ConfigModel()])
     harness: HarnessConfigModel = Field(default_factory=HarnessConfigModel)
-    stress_scenarios: list[StressScenarioModel] | None = None
+    stress_scenarios: Optional[list[StressScenarioModel]] = None
     candidates: CandidatesModel = Field(default_factory=CandidatesModel)
 
     @model_validator(mode="after")
@@ -508,7 +508,7 @@ def in_memory_date_filter_loader(data_cfg: DataConfigModel) -> Callable[[str, st
     return _load
 
 
-def _build_stress_scenarios(cfg: RunConfigModel) -> list[StressScenario] | None:
+def _build_stress_scenarios(cfg: RunConfigModel) -> Optional[list[StressScenario]]:
     if cfg.stress_scenarios is None:
         return None
 
@@ -529,7 +529,7 @@ def _build_stress_scenarios(cfg: RunConfigModel) -> list[StressScenario] | None:
     return out
 
 
-def _build_candidates(cfg: RunConfigModel) -> list[CandidateSpec] | None:
+def _build_candidates(cfg: RunConfigModel) -> Optional[list[CandidateSpec]]:
     if cfg.candidates.mode == "auto_grid":
         return None
 

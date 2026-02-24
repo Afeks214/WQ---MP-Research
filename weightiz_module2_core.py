@@ -233,9 +233,9 @@ def _rolling_median_mad_causal(
         return med, mad
 
     if T >= w:
-        wins = sliding_window_view(arr, window_shape=w, axis=0)  # (T-w+1, w, A)
-        med_full = np.nanmedian(wins, axis=1)
-        mad_full = np.nanmedian(np.abs(wins - med_full[:, None, :]), axis=1)
+        wins = sliding_window_view(arr, window_shape=w, axis=0)  # (T-w+1, A, w)
+        med_full = np.nanmedian(wins, axis=-1)
+        mad_full = np.nanmedian(np.abs(wins - med_full[:, :, None]), axis=-1)
         med[w - 1 :] = med_full
         mad[w - 1 :] = mad_full
 
@@ -520,8 +520,8 @@ def precompute_market_physics(state: TensorState, cfg: Module2Config) -> MarketP
 
         baseline = np.full((S, A), np.nan, dtype=np.float64)
         if S >= L:
-            windows = sliding_window_view(vals_prev, window_shape=L, axis=0)  # (S-L+1, L, A)
-            baseline[L - 1 :] = np.nanmedian(windows, axis=1)
+            windows = sliding_window_view(vals_prev, window_shape=L, axis=0)  # (S-L+1, A, L)
+            baseline[L - 1 :] = np.nanmedian(windows, axis=-1)
             prefix = min(L - 1, S)
         else:
             prefix = S
@@ -694,6 +694,10 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
     A = state.cfg.A
     B = state.cfg.B
     W = int(cfg.profile_window_bars)
+    x = np.asarray(state.x_grid, dtype=np.float64)
+    x2 = x * x
+    dx = float(state.cfg.dx)
+    idx_zero = int(np.argmin(np.abs(x)))
 
     physics = precompute_market_physics(state, cfg)
 
@@ -704,8 +708,12 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
     # Reset outputs in a deterministic way.
     state.vp.fill(0.0)
     state.vp_delta.fill(0.0)
-    state.profile_stats.fill(np.nan)
-    state.scores.fill(np.nan)
+    state.profile_stats.fill(0.0)
+    state.scores.fill(0.0)
+    # Neutral categorical anchors must always remain finite for strict downstream checks.
+    state.profile_stats[:, :, int(ProfileStatIdx.IPOC)] = float(idx_zero)
+    state.profile_stats[:, :, int(ProfileStatIdx.IVAH)] = float(idx_zero)
+    state.profile_stats[:, :, int(ProfileStatIdx.IVAL)] = float(idx_zero)
 
     # Precompute windows once (no per-window reconstruction).
     close_w = sliding_window_view(np.asarray(state.close_px, dtype=np.float64), window_shape=W, axis=0)
@@ -726,11 +734,26 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
     n_win = close_w.shape[0]
     if n_win != (T - W + 1):
         raise RuntimeError("Unexpected window count from sliding_window_view")
-
-    x = np.asarray(state.x_grid, dtype=np.float64)
-    x2 = x * x
-    dx = float(state.cfg.dx)
-    idx_zero = int(np.argmin(np.abs(x)))
+    expected_win_shape = (T - W + 1, A, W)
+    for name, arr in [
+        ("close_w", close_w),
+        ("vol_w", vol_w),
+        ("valid_w", valid_w),
+        ("clv_w", clv_w),
+        ("sig1_w", sig1_w),
+        ("sig2_w", sig2_w),
+        ("w1_w", w1_w),
+        ("w2_w", w2_w),
+        ("body_w", body_w),
+        ("rvol_w", rvol_w),
+        ("cap_w", cap_w),
+        ("ret_norm_w", ret_norm_w),
+        ("s_r_w", s_r_w),
+    ]:
+        if arr.shape != expected_win_shape:
+            raise RuntimeError(
+                f"{name} shape mismatch from sliding_window_view: got {arr.shape}, expected {expected_win_shape}"
+            )
 
     poc_rank = _build_poc_rank(x)
     va_offsets = _make_va_offsets(B)
@@ -747,21 +770,25 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
         if state.phase[t] == np.int8(Phase.WARMUP):
             continue
 
-        # (W, A)
-        close_win = close_w[win_idx]
-        vol_win = np.maximum(vol_w[win_idx], 0.0)
-        valid_win = valid_w[win_idx]
+        # sliding_window_view over axis=0 yields (A, W); transpose to canonical (W, A).
+        close_win = close_w[win_idx].T
+        vol_win = np.maximum(vol_w[win_idx].T, 0.0)
+        valid_win = valid_w[win_idx].T
 
-        clv_win = clv_w[win_idx]
-        sig1_win = sig1_w[win_idx]
-        sig2_win = sig2_w[win_idx]
-        w1_win = w1_w[win_idx]
-        w2_win = w2_w[win_idx]
-        body_pct_win = body_w[win_idx]
-        rvol_win = rvol_w[win_idx]
-        cap_win = cap_w[win_idx]
-        ret_norm_win = ret_norm_w[win_idx]
-        s_r_win = s_r_w[win_idx]
+        clv_win = clv_w[win_idx].T
+        sig1_win = sig1_w[win_idx].T
+        sig2_win = sig2_w[win_idx].T
+        w1_win = w1_w[win_idx].T
+        w2_win = w2_w[win_idx].T
+        body_pct_win = body_w[win_idx].T
+        rvol_win = rvol_w[win_idx].T
+        cap_win = cap_w[win_idx].T
+        ret_norm_win = ret_norm_w[win_idx].T
+        s_r_win = s_r_w[win_idx].T
+        if close_win.shape != (W, A):
+            raise RuntimeError(
+                f"Window orientation mismatch at win_idx={win_idx}: got {close_win.shape}, expected {(W, A)}"
+            )
 
         close_t = state.close_px[t]
         atr_t = physics.atr_eff[t]
@@ -873,20 +900,18 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
         tradable_idx = np.where(tradable_t)[0]
         if tradable_idx.size > 0:
             a = tradable_idx
-            ps = state.profile_stats[t, a]
-
-            ps[:, int(ProfileStatIdx.MU_PROF)] = mu_prof[a]
-            ps[:, int(ProfileStatIdx.SIGMA_PROF)] = sigma_prof[a]
-            ps[:, int(ProfileStatIdx.SIGMA_EFF)] = sigma_eff[a]
-            ps[:, int(ProfileStatIdx.D)] = D[a]
-            ps[:, int(ProfileStatIdx.DCLIP)] = Dclip[a]
-            ps[:, int(ProfileStatIdx.A_AFFINITY)] = A_aff[a]
-            ps[:, int(ProfileStatIdx.DELTA0)] = delta0[a]
-            ps[:, int(ProfileStatIdx.DELTA_POC)] = delta_poc[a]
-            ps[:, int(ProfileStatIdx.DELTA_EFF)] = delta_eff[a]
-            ps[:, int(ProfileStatIdx.IPOC)] = ipoc[a].astype(np.float64)
-            ps[:, int(ProfileStatIdx.IVAH)] = ivah[a].astype(np.float64)
-            ps[:, int(ProfileStatIdx.IVAL)] = ival[a].astype(np.float64)
+            state.profile_stats[t, a, int(ProfileStatIdx.MU_PROF)] = mu_prof[a]
+            state.profile_stats[t, a, int(ProfileStatIdx.SIGMA_PROF)] = sigma_prof[a]
+            state.profile_stats[t, a, int(ProfileStatIdx.SIGMA_EFF)] = sigma_eff[a]
+            state.profile_stats[t, a, int(ProfileStatIdx.D)] = D[a]
+            state.profile_stats[t, a, int(ProfileStatIdx.DCLIP)] = Dclip[a]
+            state.profile_stats[t, a, int(ProfileStatIdx.A_AFFINITY)] = A_aff[a]
+            state.profile_stats[t, a, int(ProfileStatIdx.DELTA0)] = delta0[a]
+            state.profile_stats[t, a, int(ProfileStatIdx.DELTA_POC)] = delta_poc[a]
+            state.profile_stats[t, a, int(ProfileStatIdx.DELTA_EFF)] = delta_eff[a]
+            state.profile_stats[t, a, int(ProfileStatIdx.IPOC)] = ipoc[a].astype(np.float64)
+            state.profile_stats[t, a, int(ProfileStatIdx.IVAH)] = ivah[a].astype(np.float64)
+            state.profile_stats[t, a, int(ProfileStatIdx.IVAL)] = ival[a].astype(np.float64)
             computed_mask[t, a] = True
 
         if cfg.fail_on_non_finite_output:

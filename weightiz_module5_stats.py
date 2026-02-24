@@ -71,7 +71,9 @@ def validate_returns_2d(x: np.ndarray, name: str = "x", t_max: int = 10_000) -> 
 
 def norm_cdf(z: np.ndarray) -> np.ndarray:
     z64 = np.asarray(z, dtype=np.float64)
-    return 0.5 * (1.0 + np.erf(z64 / np.sqrt(2.0)))
+    # numpy does not expose erf on all builds; use stdlib math.erf in vectorized form.
+    erf_vec = np.vectorize(math.erf, otypes=[np.float64])
+    return 0.5 * (1.0 + erf_vec(z64 / np.sqrt(2.0)))
 
 
 def norm_ppf(p: np.ndarray) -> np.ndarray:
@@ -599,8 +601,7 @@ def model_confidence_set(
         tr_obs = float(np.max(t_obs))
 
         t_boot = np.abs(d_tilde / se[None, :, :])
-        b_idx = np.arange(t_boot.shape[0], dtype=np.int64)
-        t_boot[b_idx, np.arange(m), np.arange(m)] = 0.0
+        t_boot[:, np.arange(m), np.arange(m)] = 0.0
         tr_boot = np.max(t_boot, axis=(1, 2))
         p_value = float(np.mean(tr_boot >= tr_obs - float(eps)))
 

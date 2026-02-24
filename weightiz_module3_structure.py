@@ -489,12 +489,16 @@ def run_module3_structural_aggregation(state: TensorState, cfg: Module3Config) -
                 raise RuntimeError(
                     f"Missing previous VA for POC_VS_PREV_VA at session-local row={int(loc[0])}, a={int(loc[1])}"
                 )
+            no_prev_fill = np.nan
+        else:
+            # Deterministic neutral defaults keep downstream context finite on first valid block.
+            no_prev_fill = 0.0
 
-        # Drifts: if no previous valid block, structural state is undefined -> NaN (not 0.0).
-        pd = np.where(prev_exists, x_poc_s - prev_poc, np.nan)
-        vd_h = np.where(prev_exists, x_vah_s - prev_vah, np.nan)
-        vd_l = np.where(prev_exists, x_val_s - prev_val, np.nan)
-        dsh = np.where(prev_exists, de_s - prev_de, np.nan)
+        # Drifts: first valid block can use deterministic neutral default when strict mode is disabled.
+        pd = np.where(prev_exists, x_poc_s - prev_poc, no_prev_fill)
+        vd_h = np.where(prev_exists, x_vah_s - prev_vah, no_prev_fill)
+        vd_l = np.where(prev_exists, x_val_s - prev_val, no_prev_fill)
+        dsh = np.where(prev_exists, de_s - prev_de, no_prev_fill)
 
         pd = np.where(valid_s, pd, np.nan)
         vd_h = np.where(valid_s, vd_h, np.nan)
@@ -515,8 +519,8 @@ def run_module3_structural_aggregation(state: TensorState, cfg: Module3Config) -
             ),
         )
 
-        # If no previous valid VA, relation is undefined -> NaN (unless strict mode raises above).
-        rel = np.where(prev_exists, rel, np.nan)
+        # If no previous valid VA, strict mode raises above; otherwise use deterministic neutral default.
+        rel = np.where(prev_exists, rel, no_prev_fill)
         rel = np.where(valid_s, rel, np.nan)
 
         # IB from seq 0 / seq {0,1}
