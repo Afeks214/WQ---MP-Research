@@ -1,0 +1,271 @@
+# Weightiz V3.5 template
+# Run: python run_research.py --config ./configs/template.yaml
+
+run_name: "baseline_v35"
+
+# Universe to ingest and trade.
+symbols:
+  - SPY
+  - QQQ
+  - IWM
+  - TLT
+
+data:
+  # Folder with minute files.
+  root: "./data/minute"
+  format: "parquet"  # parquet | csv
+
+  # Optional explicit per-symbol file mapping.
+  path_by_symbol:
+    SPY: "SPY.parquet"
+    QQQ: "QQQ.parquet"
+    IWM: "IWM.parquet"
+    TLT: "TLT.parquet"
+
+  # If omitted, loader auto-detects: timestamp/ts/datetime/date/time
+  timestamp_column: "timestamp"
+
+  # Inclusive UTC date/time window; filtered fully in-memory.
+  start: "2024-01-02T00:00:00Z"
+  end: "2024-12-31T23:59:59Z"
+
+engine:
+  # Tensor/profile grid resolution.
+  B: 240
+  x_min: -6.0
+  dx: 0.05
+
+  # Session controls.
+  rth_open_minute: 570
+  warmup_minutes: 15
+  flat_time_minute: 945
+  gap_reset_minutes: 5.0
+
+  # Portfolio/risk envelope.
+  initial_cash: 1000000.0
+  intraday_leverage_max: 6.0
+  overnight_leverage: 2.0
+  overnight_positions_max: 1
+  daily_loss_limit_abs: 50000.0
+
+  # Numeric and determinism controls.
+  eps_pdf: 1.0e-12
+  eps_vol: 1.0e-12
+  seed: 17
+  fail_on_nan: true
+
+  # Tick size resolution.
+  tick_size_default: 0.01
+  tick_size_by_symbol:
+    SPY: 0.01
+    QQQ: 0.01
+    IWM: 0.01
+    TLT: 0.01
+
+module2_configs:
+  # Core profile engine candidate A.
+  - profile_window_bars: 60
+    profile_warmup_bars: 60
+    atr_span: 14
+    atr_alpha: null
+    atr_floor_mult_tick: 4.0
+    atr_floor_abs: 0.0
+    rvol_lookback_sessions: 20
+    rvol_policy: "neutral_one"
+    rvol_vol_eps_mult_tick: 1.0
+    rvol_vol_eps_abs: 1.0e-12
+    rvol_clip_min: 0.0
+    rvol_clip_max: 50.0
+    volume_cap_window_bars: 60
+    volume_cap_mad_mult: 5.0
+    volume_cap_min_mult: 0.25
+    mu1_clv_shift: 0.0
+    mu2_clv_shift: 0.35
+    sigma1_base: 0.18
+    sigma1_body_coeff: 0.22
+    sigma1_rvol_coeff: 0.06
+    sigma1_range_coeff: 0.08
+    sigma1_min: 0.05
+    sigma1_max: 1.5
+    sigma2_ratio_base: 1.8
+    sigma2_body_coeff: 0.6
+    sigma2_clv_coeff: 0.3
+    sigma2_min: 0.08
+    sigma2_max: 3.0
+    w1_base: 0.62
+    w1_body_coeff: 0.28
+    w1_rvol_coeff: 0.04
+    w1_clv_coeff: 0.12
+    w1_min: 0.05
+    w1_max: 0.95
+    ret_scale_window_bars: 60
+    ret_scale_min_periods: 10
+    ret_scale_min: 0.05
+    va_threshold: 0.70
+    poc_eq_atol: 0.0
+    d_clip: 6.0
+    break_bias: 1.0
+    reject_center: 2.0
+    rvol_trend_cutoff: 2.0
+    body_trend_cutoff: 0.60
+    delta_mad_lookback_bars: 180
+    delta_mad_min_periods: 10
+    sigma_delta_min: 0.05
+    delta_gate_threshold: 1.0
+    normal_concentration_threshold: 0.05
+    trend_spread_threshold_x: 2.5
+    trend_delta_confirm_z: 1.5
+    double_dist_min_sep_x: 1.0
+    double_dist_valley_frac: 0.35
+    fail_on_non_finite_output: true
+
+  # Candidate B (slower window).
+  - profile_window_bars: 90
+    profile_warmup_bars: 90
+    atr_span: 21
+    rvol_lookback_sessions: 20
+    fail_on_non_finite_output: true
+
+module3_configs:
+  - block_minutes: 30
+    phase_mask: [1, 2]
+    use_rth_minutes_only: true
+    rth_open_minute: 570
+    last_minute_inclusive: 945
+    include_partial_last_block: true
+    min_block_valid_bars: 12
+    min_block_valid_ratio: 0.70
+    ib_pop_frac: 0.01
+    context_mode: "ffill_last_complete"
+    fail_on_non_finite_input: true
+    fail_on_non_finite_output: true
+    fail_on_bad_indices: true
+    fail_on_missing_prev_va: false
+    eps: 1.0e-12
+
+module4_configs:
+  # Baseline execution policy.
+  - entry_threshold: 0.55  # Higher = stricter entries.
+    exit_threshold: 0.25   # Lower = longer hold.
+    top_k_intraday: 5
+    max_asset_cap_frac: 0.30
+    max_turnover_frac_per_bar: 0.35
+    overnight_min_conviction: 0.65
+    allow_cash_overnight: true
+    trend_spread_min: 0.05
+    trend_poc_drift_min_abs: 0.35
+    neutral_poc_drift_max_abs: 0.15
+    shape_skew_min_abs: 0.35
+    double_dist_sep_x: 1.0
+    double_dist_valley_frac: 0.35
+    commission_bps: 0.40
+    spread_tick_mult: 1.50
+    slippage_bps_low_rvol: 3.0
+    slippage_bps_mid_rvol: 2.0
+    slippage_bps_high_rvol: 1.5
+    stress_slippage_mult: 1.0
+    hard_kill_on_daily_loss_breach: true
+    fail_on_non_finite_input: true
+    fail_on_non_finite_output: true
+    eps: 1.0e-12
+
+  # Selective policy.
+  - entry_threshold: 0.62
+    exit_threshold: 0.30
+    top_k_intraday: 3
+    max_asset_cap_frac: 0.25
+    max_turnover_frac_per_bar: 0.30
+    overnight_min_conviction: 0.72
+    allow_cash_overnight: true
+    commission_bps: 0.40
+    spread_tick_mult: 1.50
+    slippage_bps_low_rvol: 3.0
+    slippage_bps_mid_rvol: 2.0
+    slippage_bps_high_rvol: 1.5
+    stress_slippage_mult: 1.0
+    hard_kill_on_daily_loss_breach: true
+    fail_on_non_finite_input: true
+    fail_on_non_finite_output: true
+    eps: 1.0e-12
+
+harness:
+  seed: 97
+  timezone: "America/New_York"
+  freq: "1min"
+
+  # Coverage + leakage controls.
+  min_asset_coverage: 0.80
+  purge_bars: 60      # Purge train bars before test blocks.
+  embargo_bars: 30    # Embargo at test edges.
+  enforce_lookahead_guard: true
+
+  # Split geometry.
+  wf_train_sessions: 60
+  wf_test_sessions: 20
+  wf_step_sessions: 20
+  cpcv_slices: 10
+  cpcv_k_test: 5
+
+  # Runtime controls.
+  parallel_backend: "process_pool"
+  parallel_workers: 4
+  max_ram_utilization_frac: 0.70
+
+  # Default built-in stress profile if stress_scenarios is omitted.
+  stress_profile: "baseline_mild_severe"
+
+  # Output root (run folders are created under this directory).
+  report_dir: "./artifacts"
+
+  fail_on_non_finite: true
+  daily_return_min_days: 60
+  benchmark_symbol: "SPY"
+
+  # Dashboard diagnostics exports.
+  export_micro_diagnostics: true
+  micro_diag_mode: "events_only"
+  micro_diag_symbols: []
+  micro_diag_session_ids: []
+  micro_diag_trade_window_pre: 90
+  micro_diag_trade_window_post: 180
+  micro_diag_export_block_profiles: true
+  micro_diag_export_funnel: true
+  micro_diag_max_rows: 5000000
+
+# Optional explicit stress scenarios. If provided, these override harness.stress_profile defaults.
+stress_scenarios:
+  - scenario_id: "baseline"
+    name: "baseline"
+    missing_burst_prob: 0.0
+    missing_burst_min: 0
+    missing_burst_max: 0
+    jitter_sigma_bps: 0.0   # Price jitter stdev in bps.
+    slippage_mult: 1.0
+    enabled: true
+  - scenario_id: "mild"
+    name: "mild"
+    missing_burst_prob: 0.0005
+    missing_burst_min: 2
+    missing_burst_max: 5
+    jitter_sigma_bps: 1.5
+    slippage_mult: 1.5
+    enabled: true
+  - scenario_id: "severe"
+    name: "severe"
+    missing_burst_prob: 0.0020
+    missing_burst_min: 5
+    missing_burst_max: 20
+    jitter_sigma_bps: 4.0
+    slippage_mult: 3.0
+    enabled: true
+
+candidates:
+  mode: "auto_grid"  # auto_grid | manual
+  specs: []
+  # Example manual spec:
+  # - candidate_id: "cand_manual_01"
+  #   m2_idx: 0
+  #   m3_idx: 0
+  #   m4_idx: 1
+  #   enabled_assets: "all"         # or [SPY, QQQ] or [true, true, false, false]
+  #   tags: ["pilot", "selective"]
