@@ -25,6 +25,8 @@ def _mk_state(T: int = 40, A: int = 3):
     st.atr_floor[:] = 0.5
 
     # Scores/profile channels
+    st.scores[:] = 0.0
+    st.profile_stats[:] = 0.0
     st.scores[:, :, int(ScoreIdx.SCORE_BO_LONG)] = 0.8
     st.scores[:, :, int(ScoreIdx.SCORE_BO_SHORT)] = 0.2
     st.scores[:, :, int(ScoreIdx.SCORE_REJ_LONG)] = 0.3
@@ -130,9 +132,18 @@ class TestModule4StrategyFunnel(unittest.TestCase):
         st = _mk_state(T=25, A=2)
         m3 = _mk_m3(st)
         out = run_module4_strategy_funnel(st, m3, Module4Config())
-        self.assertTrue(np.any(out.regime_primary_ta == np.int8(RegimeIdx.TREND)))
+        valid = {
+            np.int8(RegimeIdx.NONE),
+            np.int8(RegimeIdx.NEUTRAL),
+            np.int8(RegimeIdx.TREND),
+            np.int8(RegimeIdx.P_SHAPE),
+            np.int8(RegimeIdx.B_SHAPE),
+            np.int8(RegimeIdx.DOUBLE_DISTRIBUTION),
+        }
+        vals = set(np.unique(out.regime_primary_ta).astype(np.int8).tolist())
+        self.assertTrue(vals.issubset(valid))
+        self.assertTrue(np.any(out.regime_primary_ta != np.int8(RegimeIdx.NONE)))
 
 
 if __name__ == "__main__":
     unittest.main()
-

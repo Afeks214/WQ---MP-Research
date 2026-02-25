@@ -49,6 +49,7 @@ class OrderFlagBit(IntEnum):
     OVERNIGHT_SELECTED = 1 << 4
     KILL_SWITCH = 1 << 5
     MOC_EXEC = 1 << 6
+    EXEC_SKIPPED_BAD_PRICE = 1 << 7
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,7 @@ class Module4Config:
 
     # Runtime strictness
     fail_on_non_finite_input: bool = True
+    execution_strict_prices: bool = False
     fail_on_non_finite_output: bool = True
     eps: float = 1e-12
 
@@ -196,6 +198,29 @@ def _weighted_argmax_with_tie(score: np.ndarray, tie: np.ndarray) -> int:
     return int(idx[order[0]])
 
 
+def _pending_exec_price_with_fallback(
+    open_px: np.ndarray,
+    close_px: np.ndarray,
+    bar_valid: np.ndarray,
+) -> np.ndarray:
+    """
+    Deterministic pending-open execution price selection, per asset:
+    1) use open if bar_valid and finite and > 0
+    2) else use close if bar_valid and finite and > 0
+    3) else NaN
+    """
+    open_t = np.asarray(open_px, dtype=np.float64)
+    close_t = np.asarray(close_px, dtype=np.float64)
+    valid_t = np.asarray(bar_valid, dtype=bool)
+    out = np.full(open_t.shape, np.nan, dtype=np.float64)
+    open_ok = valid_t & np.isfinite(open_t) & (open_t > 0.0)
+    close_ok = valid_t & np.isfinite(close_t) & (close_t > 0.0)
+    out[open_ok] = open_t[open_ok]
+    use_close = (~open_ok) & close_ok
+    out[use_close] = close_t[use_close]
+    return out
+
+
 def _execute_to_target(
     pos: np.ndarray,
     avg_cost: np.ndarray,
@@ -208,7 +233,7 @@ def _execute_to_target(
     cfg: Module4Config,
     strict: bool,
     eps: float,
-) -> Tuple[float, float, np.ndarray, np.ndarray]:
+) -> Tuple[float, float, np.ndarray, np.ndarray, np.ndarray]:
     """
     Execute transition pos -> target at supplied prices.
     Mutates pos/avg_cost; returns updated cash/realized and per-asset delta/cost.
@@ -216,6 +241,7 @@ def _execute_to_target(
     A = pos.shape[0]
     delta = target - pos
     trade_cost = np.zeros(A, dtype=np.float64)
+    exec_skipped_bad_price = np.zeros(A, dtype=bool)
     slip_bps = _slippage_bps_from_rvol(rvol, cfg)
 
     for a in range(A):
@@ -227,6 +253,7 @@ def _execute_to_target(
             if strict:
                 raise RuntimeError(f"Non-finite/non-positive execution price at a={a}: {px}")
             delta[a] = 0.0
+            exec_skipped_bad_price[a] = True
             continue
 
         ts = float(tick_size[a])
@@ -267,7 +294,7 @@ def _execute_to_target(
         pos[a] = new_pos
         cash -= dq * px + cost
 
-    return cash, realized, delta, trade_cost
+    return cash, realized, delta, trade_cost, exec_skipped_bad_price
 
 
 def _accumulate_exec_row(
@@ -401,6 +428,7 @@ def run_module4_strategy_funnel(
 
     # Causal bar loop (required due portfolio state recursion)
     for t in range(T):
+        exec_skipped_bad_price_row = np.zeros(A, dtype=bool)
         if t == 0 or state.session_id[t] != state.session_id[t - 1]:
             kill_switch_session = False
             # Mark new session baseline at open mark-to-market.
@@ -410,26 +438,34 @@ def run_module4_strategy_funnel(
         # 1) Execute pending next-open target from prior bar.
         if pending_active:
             open_px = state.open_px[t]
+            close_px = state.close_px[t]
+            bar_valid = state.bar_valid[t]
+            exec_px = _pending_exec_price_with_fallback(
+                open_px=open_px,
+                close_px=close_px,
+                bar_valid=bar_valid,
+            )
             rvol_t = state.rvol[t]
-            cash, realized, delta_open, cost_open = _execute_to_target(
+            cash, realized, delta_open, cost_open, skipped_open = _execute_to_target(
                 pos=pos,
                 avg_cost=avg_cost,
                 cash=cash,
                 realized=realized,
                 target=pending_target,
-                price=open_px,
+                price=exec_px,
                 rvol=rvol_t,
                 tick_size=tick_size,
                 cfg=cfg4,
-                strict=cfg4.fail_on_non_finite_input,
+                strict=cfg4.execution_strict_prices,
                 eps=eps,
             )
+            exec_skipped_bad_price_row |= skipped_open
             _accumulate_exec_row(
                 filled_row=filled_qty_ta[t],
                 exec_px_row=exec_price_ta[t],
                 cost_row=trade_cost_ta[t],
                 delta=delta_open,
-                px=open_px,
+                px=exec_px,
                 cost=cost_open,
                 eps=eps,
             )
@@ -607,7 +643,8 @@ def run_module4_strategy_funnel(
                     w_sum = float(np.sum(w))
                     if w_sum > eps:
                         w = w / w_sum
-                        equity_now = float(cash + np.sum(pos * close_t))
+                        mtm_alloc = np.where(np.isfinite(close_t), close_t, np.where(np.isfinite(state.open_px[t]), state.open_px[t], 0.0))
+                        equity_now = float(cash + np.sum(pos * mtm_alloc))
                         gross_budget = max(0.0, equity_now * float(state.cfg.intraday_leverage_max))
                         raw_notional = gross_budget * w
                         cap_notional = equity_now * float(cfg4.max_asset_cap_frac)
@@ -635,7 +672,7 @@ def run_module4_strategy_funnel(
         if phase_t == phase_os:
             # Force flatten at close first.
             zero_target = np.zeros(A, dtype=np.float64)
-            cash, realized, delta_close_flat, cost_close_flat = _execute_to_target(
+            cash, realized, delta_close_flat, cost_close_flat, skipped_close_flat = _execute_to_target(
                 pos=pos,
                 avg_cost=avg_cost,
                 cash=cash,
@@ -645,9 +682,10 @@ def run_module4_strategy_funnel(
                 rvol=rvol_t,
                 tick_size=tick_size,
                 cfg=cfg4,
-                strict=cfg4.fail_on_non_finite_input,
+                strict=cfg4.execution_strict_prices,
                 eps=eps,
             )
+            exec_skipped_bad_price_row |= skipped_close_flat
             _accumulate_exec_row(
                 filled_row=filled_qty_ta[t],
                 exec_px_row=exec_price_ta[t],
@@ -685,13 +723,14 @@ def run_module4_strategy_funnel(
                 else:
                     side = 1.0 if dclip[win] >= 0.0 else -1.0
 
-                equity_now = float(cash + np.sum(pos * close_t))
+                mtm_overnight = np.where(np.isfinite(close_t), close_t, np.where(np.isfinite(state.open_px[t]), state.open_px[t], 0.0))
+                equity_now = float(cash + np.sum(pos * mtm_overnight))
                 overnight_notional = max(0.0, equity_now * float(state.cfg.overnight_leverage))
                 px = max(float(close_t[win]), float(tick_size[win]))
                 one_target = np.zeros(A, dtype=np.float64)
                 one_target[win] = side * (overnight_notional / (px + eps))
 
-                cash, realized, delta_close_on, cost_close_on = _execute_to_target(
+                cash, realized, delta_close_on, cost_close_on, skipped_close_on = _execute_to_target(
                     pos=pos,
                     avg_cost=avg_cost,
                     cash=cash,
@@ -701,9 +740,10 @@ def run_module4_strategy_funnel(
                     rvol=rvol_t,
                     tick_size=tick_size,
                     cfg=cfg4,
-                    strict=cfg4.fail_on_non_finite_input,
+                    strict=cfg4.execution_strict_prices,
                     eps=eps,
                 )
+                exec_skipped_bad_price_row |= skipped_close_on
                 _accumulate_exec_row(
                     filled_row=filled_qty_ta[t],
                     exec_px_row=exec_price_ta[t],
@@ -726,6 +766,12 @@ def run_module4_strategy_funnel(
             pending_active = False
 
         elif phase_t == phase_live:
+            safe_close_live = np.where(np.isfinite(close_t) & (close_t > 0.0), close_t, 0.0)
+            equity_live = float(cash + np.sum(pos * safe_close_live))
+            gross_budget_live = max(0.0, equity_live * float(state.cfg.intraday_leverage_max))
+            target_notional = float(np.sum(np.abs(target * safe_close_live)))
+            if target_notional > gross_budget_live + eps and target_notional > eps:
+                target = target * (gross_budget_live / target_notional)
             # Schedule target for next open.
             pending_target = target.copy()
             pending_active = True
@@ -752,6 +798,7 @@ def run_module4_strategy_funnel(
             flags[cands] |= np.uint16(OrderFlagBit.OVERNIGHT_CANDIDATE)
             if overnight_winner_t[t] >= 0:
                 flags[int(overnight_winner_t[t])] |= np.uint16(OrderFlagBit.OVERNIGHT_SELECTED)
+        flags[exec_skipped_bad_price_row] |= np.uint16(OrderFlagBit.EXEC_SKIPPED_BAD_PRICE)
 
         state.orders[t, :, int(OrderIdx.TARGET_QTY)] = target
         state.orders[t, :, int(OrderIdx.CONVICTION)] = np.maximum(conv_long, conv_short)
@@ -771,19 +818,19 @@ def run_module4_strategy_funnel(
 
         # Hard kill switch: immediate same-bar flatten at close.
         if breached and bool(cfg4.hard_kill_on_daily_loss_breach):
+            kill_target = np.zeros(A, dtype=np.float64)
             if np.any(np.abs(pos) > eps):
-                zero_target = np.zeros(A, dtype=np.float64)
-                cash, realized, delta_kill, cost_kill = _execute_to_target(
+                cash, realized, delta_kill, cost_kill, skipped_kill = _execute_to_target(
                     pos=pos,
                     avg_cost=avg_cost,
                     cash=cash,
                     realized=realized,
-                    target=zero_target,
+                    target=kill_target,
                     price=mtm_close,
                     rvol=rvol_t,
                     tick_size=tick_size,
                     cfg=cfg4,
-                    strict=cfg4.fail_on_non_finite_input,
+                    strict=cfg4.execution_strict_prices,
                     eps=eps,
                 )
                 _accumulate_exec_row(
@@ -796,7 +843,9 @@ def run_module4_strategy_funnel(
                     eps=eps,
                 )
                 state.order_flags[t] |= np.uint16(OrderFlagBit.KILL_SWITCH | OrderFlagBit.FLATTEN | OrderFlagBit.MOC_EXEC)
-                target_qty_ta[t] = pos.copy()
+                state.order_flags[t, skipped_kill] |= np.uint16(OrderFlagBit.EXEC_SKIPPED_BAD_PRICE)
+            state.orders[t, :, int(OrderIdx.TARGET_QTY)] = kill_target
+            target_qty_ta[t] = kill_target
             kill_switch_session = True
             pending_active = False
             overnight_idx = -1
