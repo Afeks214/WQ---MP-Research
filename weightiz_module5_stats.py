@@ -70,10 +70,29 @@ def validate_returns_2d(x: np.ndarray, name: str = "x", t_max: int = 10_000) -> 
 
 
 def norm_cdf(z: np.ndarray) -> np.ndarray:
+    """
+    Fast normal CDF approximation (Abramowitz-Stegun 7.1.26 style), vectorized.
+    """
     z64 = np.asarray(z, dtype=np.float64)
-    # numpy does not expose erf on all builds; use stdlib math.erf in vectorized form.
-    erf_vec = np.vectorize(math.erf, otypes=[np.float64])
-    return 0.5 * (1.0 + erf_vec(z64 / np.sqrt(2.0)))
+    x = np.clip(z64, -12.0, 12.0)
+
+    ax = np.abs(x)
+    t = 1.0 / (1.0 + 0.2316419 * ax)
+    poly = (
+        (
+            (
+                ((1.330274429 * t - 1.821255978) * t + 1.781477937) * t
+                - 0.356563782
+            )
+            * t
+            + 0.319381530
+        )
+        * t
+    )
+    phi = np.exp(-0.5 * ax * ax) / np.sqrt(2.0 * np.pi)
+    cdf_pos = 1.0 - phi * poly
+    out = np.where(x >= 0.0, cdf_pos, 1.0 - cdf_pos)
+    return np.asarray(np.clip(out, 0.0, 1.0), dtype=np.float64)
 
 
 def norm_ppf(p: np.ndarray) -> np.ndarray:
@@ -193,11 +212,20 @@ def effective_num_trials_from_corr(returns_matrix: np.ndarray, min_trials: int =
     corr = np.asarray(corr, dtype=np.float64)
     if corr.shape != (N, N):
         raise RuntimeError("Invalid correlation shape in effective_num_trials_from_corr")
-    corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
-    mask = ~np.eye(N, dtype=bool)
-    rho_abs = np.mean(np.abs(corr[mask])) if np.any(mask) else 0.0
-    n_eff = int(np.rint(1.0 + (N - 1) * (1.0 - rho_abs)))
-    n_eff = max(int(min_trials), min(N, n_eff))
+    corr = np.nan_to_num(corr, nan=1.0, posinf=1.0, neginf=-1.0)
+    corr = 0.5 * (corr + corr.T)
+    np.fill_diagonal(corr, 1.0)
+
+    eig = np.linalg.eigvalsh(corr).astype(np.float64, copy=False)
+    eig = np.clip(eig, 0.0, np.inf)
+    s1 = float(np.sum(eig))
+    s2 = float(np.sum(eig * eig))
+    if (not np.isfinite(s1)) or (not np.isfinite(s2)) or s1 <= 0.0:
+        return int(max(int(min_trials), 1))
+
+    pr = (s1 * s1) / (s2 + float(eps))
+    n_eff = int(np.rint(pr))
+    n_eff = max(int(min_trials), min(N, max(1, n_eff)))
     return int(n_eff)
 
 
@@ -205,11 +233,18 @@ def expected_max_z(n_trials: int) -> float:
     n = int(n_trials)
     if n <= 1:
         return 0.0
+    eps = 1e-12
     p1 = 1.0 - 1.0 / float(n)
-    p2 = 1.0 - math.e ** (-1.0) / float(n)
+    p2 = 1.0 - math.exp(-1.0) / float(n)
+    p1 = float(np.clip(p1, eps, 1.0 - eps))
+    p2 = float(np.clip(p2, eps, 1.0 - eps))
     z1 = float(norm_ppf(np.array([p1], dtype=np.float64))[0])
     z2 = float(norm_ppf(np.array([p2], dtype=np.float64))[0])
     return (1.0 - EULER_GAMMA) * z1 + EULER_GAMMA * z2
+
+
+def _psr_denom_sq(sr: np.ndarray, sk: np.ndarray, ke: np.ndarray) -> np.ndarray:
+    return 1.0 - sk * sr + ((ke + 2.0) / 4.0) * (sr * sr)
 
 
 def psr_against_threshold(
@@ -242,12 +277,14 @@ def psr_against_threshold(
     if n.shape != sr.shape:
         raise RuntimeError("psr_against_threshold n_obs shape mismatch")
 
-    denom_sq = 1.0 - sk * sr + ((ke + 2.0) / 4.0) * (sr * sr)
-    denom = np.sqrt(np.maximum(denom_sq, float(eps)))
-    z = (sr - sr_star) * np.sqrt(np.maximum(n - 1.0, 1.0)) / (denom + float(eps))
+    denom_sq = _psr_denom_sq(sr=sr, sk=sk, ke=ke)
+    bad = (denom_sq <= 0.0) | (~np.isfinite(denom_sq))
+    denom = np.sqrt(np.where(bad, 1.0, denom_sq))
+    z = (sr - sr_star) * np.sqrt(np.maximum(n - 1.0, 1.0)) / np.maximum(denom, float(eps))
     out = norm_cdf(z)
     out = np.clip(out, 0.0, 1.0)
-    return out
+    out = np.where(bad, 0.0, out)
+    return out.astype(np.float64, copy=False)
 
 
 def deflated_sharpe_ratio(
@@ -276,6 +313,8 @@ def deflated_sharpe_ratio(
     sr_mean = float(np.mean(sr_daily))
     sr_std = float(np.std(sr_daily, ddof=1)) if N > 1 else 0.0
     sr_star_daily = sr_mean + sr_std * emz
+    denom_sq = _psr_denom_sq(sr=sr_daily, sk=skew, ke=kurt_excess)
+    denom_bad = (denom_sq <= 0.0) | (~np.isfinite(denom_sq))
 
     dsr = psr_against_threshold(
         sr_daily=sr_daily,
@@ -295,6 +334,8 @@ def deflated_sharpe_ratio(
         "expected_max_z": float(emz),
         "sharpe_deflated_threshold_daily": float(sr_star_daily),
         "dsr": dsr,
+        "psr_denom_sq_min": float(np.min(denom_sq)),
+        "psr_denom_bad_count": int(np.sum(denom_bad)),
     }
 
 
@@ -357,6 +398,17 @@ def pbo_cscv(
             "k": int(k),
             "insufficient_candidates": True,
         }
+
+    s_int = int(S)
+    k_int = int(k)
+    try:
+        comb = int(math.comb(s_int, k_int))
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid PBO parameters S={s_int}, k={k_int}") from exc
+    if comb > 100_000:
+        raise RuntimeError("PBO combinatorial space too large (>100k). Reduce S or adjust k.")
+    if comb * s_int > 5_000_000:
+        raise RuntimeError("PBO incidence matrix too large (comb*S > 5,000,000). Reduce S or adjust k.")
 
     slices = build_cscv_slices(T=T, S=S)
     inc_test = build_cscv_incidence(S=S, k=k).astype(np.float64)  # (M,S)
@@ -435,6 +487,10 @@ def stationary_bootstrap_indices(
         raise RuntimeError("avg_block_len must be >=1")
     if t > 10_000:
         raise RuntimeError(f"T exceeds guard in stationary_bootstrap_indices: T={t} > 10000")
+    if b * t > 25_000_000:
+        raise RuntimeError(
+            "stationary_bootstrap_indices workload too large (B*T > 25,000,000). Reduce B or T."
+        )
 
     rng = np.random.default_rng(int(seed))
     p_restart = 1.0 / float(l)
@@ -491,13 +547,22 @@ def white_reality_check(
     d = r - bmk[:, None]
     mu = np.mean(d, axis=0)  # (N,)
     d_centered = d - mu[None, :]
+    if not np.all(np.isfinite(d_centered)):
+        raise RuntimeError("white_reality_check encountered non-finite centered differentials")
 
     t_obs = float(np.sqrt(float(T)) * np.max(mu))
+    if not np.isfinite(t_obs):
+        t_obs = np.inf
 
     idx = stationary_bootstrap_indices(T=T, B=B, avg_block_len=avg_block_len, seed=seed)
     mu_boot = bootstrap_means_2d(d_centered, idx)  # (B,N)
+    if not np.all(np.isfinite(mu_boot)):
+        raise RuntimeError("white_reality_check encountered non-finite bootstrap means")
     t_boot = np.sqrt(float(T)) * np.max(mu_boot, axis=1)
+    t_boot = np.where(np.isfinite(t_boot), t_boot, np.inf)
     p_value = float(np.mean(t_boot >= t_obs - float(eps)))
+    if not np.isfinite(p_value):
+        p_value = 1.0
 
     return {
         "t_obs": t_obs,
@@ -526,15 +591,24 @@ def spa_test(
     d = r - bmk[:, None]
     mu = np.mean(d, axis=0)
     sd = np.std(d, axis=0, ddof=1)
-    t_i_obs = np.sqrt(float(T)) * mu / (sd + float(eps))
+    sd_zero = sd <= float(eps)
+    sd_safe = np.where(sd_zero, float(eps), sd)
+    t_i_obs = np.sqrt(float(T)) * mu / sd_safe
+    t_i_obs = np.where(sd_zero & (mu == 0.0), 0.0, t_i_obs)
+    t_i_obs = np.where(np.isfinite(t_i_obs), t_i_obs, 0.0)
     t_obs = float(np.maximum(0.0, np.max(t_i_obs)))
 
     d_centered = d - mu[None, :]
     idx = stationary_bootstrap_indices(T=T, B=B, avg_block_len=avg_block_len, seed=seed)
     mu_boot = bootstrap_means_2d(d_centered, idx)
-    t_i_boot = np.sqrt(float(T)) * mu_boot / (sd[None, :] + float(eps))
+    t_i_boot = np.sqrt(float(T)) * mu_boot / sd_safe[None, :]
+    if np.any(sd_zero & (mu == 0.0)):
+        t_i_boot[:, sd_zero & (mu == 0.0)] = 0.0
+    t_i_boot = np.where(np.isfinite(t_i_boot), t_i_boot, 0.0)
     t_boot = np.maximum(0.0, np.max(t_i_boot, axis=1))
     p_value = float(np.mean(t_boot >= t_obs - float(eps)))
+    if not np.isfinite(p_value):
+        p_value = 1.0
 
     return {
         "t_obs": t_obs,
@@ -575,10 +649,14 @@ def model_confidence_set(
 
     step = 0
     while active.size > 1:
+        if active.size <= 1:
+            break
         m = int(active.size)
         X = L[:, active]  # (T,m)
         mu = np.mean(X, axis=0)  # (m,)
         d_bar = mu[:, None] - mu[None, :]  # (m,m)
+        if not np.all(np.isfinite(d_bar)):
+            raise RuntimeError("model_confidence_set encountered non-finite d_bar")
 
         # Hansen-style studentization:
         # se_ij is estimated from centered bootstrap mean-differentials
@@ -590,20 +668,32 @@ def model_confidence_set(
             seed=int(seed + 1009 * step),
         )
         mu_boot = bootstrap_means_2d(X, idx)  # (B,m) bootstrap means of losses
+        if not np.all(np.isfinite(mu_boot)):
+            raise RuntimeError("model_confidence_set encountered non-finite bootstrap means")
         d_boot = mu_boot[:, :, None] - mu_boot[:, None, :]  # (B,m,m)
         d_tilde = d_boot - d_bar[None, :, :]  # centered bootstrap mean-diffs
+        if not np.all(np.isfinite(d_tilde)):
+            raise RuntimeError("model_confidence_set encountered non-finite centered bootstrap diffs")
 
         se = np.std(d_tilde, axis=0, ddof=1)  # (m,m), se of mean-differentials
+        if not np.all(np.isfinite(se)):
+            raise RuntimeError("model_confidence_set encountered non-finite studentization scale")
         se = np.maximum(se, float(eps))
 
         t_obs = np.abs(d_bar) / se
+        if not np.all(np.isfinite(t_obs)):
+            raise RuntimeError("model_confidence_set encountered non-finite observed t-statistics")
         np.fill_diagonal(t_obs, 0.0)
         tr_obs = float(np.max(t_obs))
 
         t_boot = np.abs(d_tilde / se[None, :, :])
+        if not np.all(np.isfinite(t_boot)):
+            raise RuntimeError("model_confidence_set encountered non-finite bootstrap t-statistics")
         t_boot[:, np.arange(m), np.arange(m)] = 0.0
         tr_boot = np.max(t_boot, axis=(1, 2))
         p_value = float(np.mean(tr_boot >= tr_obs - float(eps)))
+        if not np.isfinite(p_value):
+            raise RuntimeError("model_confidence_set produced non-finite p-value")
 
         step_pvalues.append(p_value)
         step_stats.append(tr_obs)
@@ -626,6 +716,100 @@ def model_confidence_set(
         "step_stats": step_stats,
         "alpha": a,
         "insufficient_candidates": False,
+    }
+
+
+def run_full_stats(
+    returns_matrix: np.ndarray,
+    benchmark: np.ndarray,
+    losses: np.ndarray | None = None,
+    bootstrap_spec: BootstrapSpec | dict[str, Any] | None = None,
+    cpcv_params: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """
+    Convenience wrapper to run the full Module 5 statistical battery with one call.
+
+    Args:
+    - returns_matrix: (T,N) or (T,) returns.
+    - benchmark: (T,) benchmark returns.
+    - losses: (T,N) or (T,) losses; if None, defaults to -returns_matrix.
+    - bootstrap_spec: BootstrapSpec or dict(B, avg_block_len, seed).
+    - cpcv_params: dict(S, k).
+    """
+    r = np.asarray(returns_matrix, dtype=np.float64)
+    if r.ndim == 1:
+        r = r[:, None]
+    r = validate_returns_2d(r, name="returns_matrix")
+
+    bmk = validate_returns_1d(np.asarray(benchmark, dtype=np.float64), name="benchmark")
+    if bmk.shape[0] != r.shape[0]:
+        raise RuntimeError(
+            f"benchmark length mismatch: benchmark={bmk.shape[0]}, returns T={r.shape[0]}"
+        )
+
+    if losses is None:
+        L = -r
+    else:
+        L = np.asarray(losses, dtype=np.float64)
+        if L.ndim == 1:
+            L = L[:, None]
+        L = validate_returns_2d(L, name="losses")
+        if L.shape != r.shape:
+            raise RuntimeError(f"losses shape mismatch: got {L.shape}, expected {r.shape}")
+
+    if bootstrap_spec is None:
+        bs = BootstrapSpec()
+    elif isinstance(bootstrap_spec, BootstrapSpec):
+        bs = bootstrap_spec
+    elif isinstance(bootstrap_spec, dict):
+        bs = BootstrapSpec(
+            B=int(bootstrap_spec.get("B", 2000)),
+            avg_block_len=int(bootstrap_spec.get("avg_block_len", 20)),
+            seed=int(bootstrap_spec.get("seed", 47)),
+        )
+    else:
+        raise RuntimeError("bootstrap_spec must be None, BootstrapSpec, or dict")
+
+    cpcv = dict(cpcv_params or {})
+    S = int(cpcv.get("S", 10))
+    k = int(cpcv.get("k", 5))
+
+    dsr = deflated_sharpe_ratio(r)
+    pbo = pbo_cscv(r, S=S, k=k)
+    wrc = white_reality_check(
+        r,
+        bmk,
+        B=int(bs.B),
+        avg_block_len=int(bs.avg_block_len),
+        seed=int(bs.seed),
+    )
+    spa = spa_test(
+        r,
+        bmk,
+        B=int(bs.B),
+        avg_block_len=int(bs.avg_block_len),
+        seed=int(bs.seed + 1),
+    )
+    mcs = model_confidence_set(
+        L,
+        alpha=0.10,
+        B=int(bs.B),
+        avg_block_len=int(bs.avg_block_len),
+        seed=int(bs.seed + 2),
+    )
+
+    return {
+        "bootstrap_spec": {
+            "B": int(bs.B),
+            "avg_block_len": int(bs.avg_block_len),
+            "seed": int(bs.seed),
+        },
+        "cpcv_params": {"S": int(S), "k": int(k)},
+        "dsr": dsr,
+        "pbo": pbo,
+        "wrc": wrc,
+        "spa": spa,
+        "mcs": mcs,
     }
 
 
