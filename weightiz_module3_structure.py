@@ -151,11 +151,21 @@ def _build_block_map(
     m = state.minute_of_day.astype(np.int64) - int(cfg.rth_open_minute)
     block_seq = np.full(T, -1, dtype=np.int16)
     in_calc = in_scope & (m >= 0)
-    block_seq[in_calc] = (m[in_calc] // int(cfg.block_minutes)).astype(np.int16)
+    block_seq_i64 = np.full(T, -1, dtype=np.int64)
+    block_seq_i64[in_calc] = m[in_calc] // int(cfg.block_minutes)
+    bad_stride = in_calc & (block_seq_i64 >= np.int64(4096))
+    if np.any(bad_stride):
+        max_block_seq = int(np.max(block_seq_i64[in_calc]))
+        t_bad = int(np.flatnonzero(bad_stride)[0])
+        raise RuntimeError(
+            f"block_seq exceeds 4095 safety stride: max_block_seq={max_block_seq}, "
+            f"block_minutes={int(cfg.block_minutes)}, t={t_bad}"
+        )
+    block_seq[in_calc] = block_seq_i64[in_calc].astype(np.int16)
 
     block_id = np.full(T, -1, dtype=np.int64)
     # 4096 is an upper safety stride beyond any expected block_seq cardinality.
-    block_id[in_calc] = state.session_id[in_calc].astype(np.int64) * np.int64(4096) + block_seq[in_calc].astype(np.int64)
+    block_id[in_calc] = state.session_id[in_calc].astype(np.int64) * np.int64(4096) + block_seq_i64[in_calc]
 
     prev_id = np.r_[-2, block_id[:-1]]
     next_id = np.r_[block_id[1:], -3]
@@ -164,6 +174,34 @@ def _build_block_map(
     block_end = in_calc & (next_id != block_id)
 
     return in_scope, block_seq, block_id, block_start, block_end
+
+
+def _assert_block_start_end_integrity(
+    block_id_t: np.ndarray,
+    block_start_flag_t: np.ndarray,
+    block_end_flag_t: np.ndarray,
+    ts_idx: np.ndarray,
+    te_idx: np.ndarray,
+    prefix: str,
+) -> None:
+    if te_idx.size == 0:
+        return
+    same_block = block_id_t[ts_idx] == block_id_t[te_idx]
+    ordered = ts_idx <= te_idx
+    start_ok = block_start_flag_t[ts_idx]
+    end_ok = block_end_flag_t[te_idx]
+    ok = same_block & ordered & start_ok & end_ok
+    if np.all(ok):
+        return
+
+    e = int(np.flatnonzero(~ok)[0])
+    ts = int(ts_idx[e])
+    te = int(te_idx[e])
+    raise RuntimeError(
+        f"{prefix}: e={e}, ts={ts}, te={te}, "
+        f"block_id_ts={int(block_id_t[ts])}, block_id_te={int(block_id_t[te])}, "
+        f"ts_le_te={bool(ordered[e])}, start_flag_ts={bool(start_ok[e])}, end_flag_te={bool(end_ok[e])}"
+    )
 
 
 def _safe_int_index(idx_f: np.ndarray, B: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -280,17 +318,33 @@ def run_module3_structural_aggregation(state: TensorState, cfg: Module3Config) -
     if np.any(ts_lookup_pos < 0):
         raise RuntimeError("Block start lookup failed for some block_end indices")
     ts_idx = ts_candidates[ts_lookup_pos]
+    _assert_block_start_end_integrity(
+        block_id_t=block_id_t,
+        block_start_flag_t=block_start_flag_t,
+        block_end_flag_t=block_end_flag_t,
+        ts_idx=ts_idx,
+        te_idx=te_idx,
+        prefix="Block start/end integrity violation",
+    )
 
-    n_total_e = (te_idx - ts_idx + 1).astype(np.int64)
+    observed_len_e = (te_idx - ts_idx + 1).astype(np.int64)
 
     if not cfg.include_partial_last_block:
-        full = n_total_e == int(cfg.block_minutes)
+        full = observed_len_e == int(cfg.block_minutes)
         te_idx = te_idx[full]
         ts_idx = ts_idx[full]
-        n_total_e = n_total_e[full]
+        observed_len_e = observed_len_e[full]
 
         block_end_flag_t = np.zeros(T, dtype=bool)
         block_end_flag_t[te_idx] = True
+        _assert_block_start_end_integrity(
+            block_id_t=block_id_t,
+            block_start_flag_t=block_start_flag_t,
+            block_end_flag_t=block_end_flag_t,
+            ts_idx=ts_idx,
+            te_idx=te_idx,
+            prefix="Block start/end integrity violation after partial-block filter",
+        )
 
     E = int(te_idx.shape[0])
     if E == 0:
@@ -324,8 +378,28 @@ def run_module3_structural_aggregation(state: TensorState, cfg: Module3Config) -
     pref_bar = np.zeros((T + 1, A), dtype=np.int64)
     pref_bar[1:] = np.cumsum(bar_v, axis=0)
 
+    expected_len_e = np.full(E, int(cfg.block_minutes), dtype=np.int64)
+    if cfg.include_partial_last_block:
+        session_e = state.session_id[te_idx].astype(np.int64)
+        is_last_in_session = np.zeros(E, dtype=bool)
+        is_last_in_session[-1] = True
+        if E > 1:
+            is_last_in_session[:-1] = session_e[:-1] != session_e[1:]
+        expected_len_e[is_last_in_session] = np.minimum(
+            expected_len_e[is_last_in_session],
+            observed_len_e[is_last_in_session],
+        )
+    if np.any(expected_len_e <= 0):
+        e_bad = int(np.flatnonzero(expected_len_e <= 0)[0])
+        raise RuntimeError(
+            f"Non-positive expected block length at e={e_bad}: expected_len={int(expected_len_e[e_bad])}"
+        )
+
     n_valid_ea = pref_bar[te_idx + 1] - pref_bar[ts_idx]
-    valid_ratio_ea = n_valid_ea.astype(np.float64) / np.maximum(n_total_e[:, None].astype(np.float64), float(cfg.eps))
+    valid_ratio_ea = n_valid_ea.astype(np.float64) / np.maximum(
+        expected_len_e[:, None].astype(np.float64),
+        float(cfg.eps),
+    )
 
     # Segment features via prefix sums (vectorized)
     dclip_ta = state.profile_stats[:, :, int(ProfileStatIdx.DCLIP)]
@@ -696,6 +770,29 @@ def validate_module3_output(state: TensorState, out: Module3Output, cfg: Module3
         loc = np.argwhere(bad_future)[0]
         raise RuntimeError(
             f"Context source index is in the future at t={int(loc[0])}, a={int(loc[1])}"
+        )
+    bad_bounds = out.context_valid_ta & (
+        (out.context_source_t_index_ta < 0) | (out.context_source_t_index_ta >= np.int64(T))
+    )
+    if np.any(bad_bounds):
+        loc = np.argwhere(bad_bounds)[0]
+        raise RuntimeError(
+            f"Context source index out of bounds at t={int(loc[0])}, a={int(loc[1])}, "
+            f"src={int(out.context_source_t_index_ta[int(loc[0]), int(loc[1])])}, T={T}"
+        )
+
+    safe_src = np.where(out.context_valid_ta, out.context_source_t_index_ta, 0)
+    src_session = state.session_id[safe_src]
+    dst_session = state.session_id[:, None]
+    bad_cross_session = out.context_valid_ta & (src_session != dst_session)
+    if np.any(bad_cross_session):
+        loc = np.argwhere(bad_cross_session)[0]
+        t = int(loc[0])
+        a = int(loc[1])
+        src_t = int(out.context_source_t_index_ta[t, a])
+        raise RuntimeError(
+            f"Context source crosses session boundary at t={t}, a={a}, src_t={src_t}, "
+            f"src_session={int(state.session_id[src_t])}, dst_session={int(state.session_id[t])}"
         )
 
     # Session-local monotonic source index

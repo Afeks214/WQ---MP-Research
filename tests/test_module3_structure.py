@@ -1,7 +1,10 @@
 import unittest
+from unittest.mock import patch
+
 import numpy as np
 
 from weightiz_module1_core import EngineConfig, Phase, ProfileStatIdx, ScoreIdx, preallocate_state
+import weightiz_module3_structure as module3
 from weightiz_module3_structure import (
     ContextIdx,
     Module3Config,
@@ -10,13 +13,7 @@ from weightiz_module3_structure import (
 )
 
 
-def _make_state(T: int = 90, A: int = 1):
-    start_ns = np.datetime64("2025-01-06T14:30:00", "ns").astype(np.int64)
-    ts_ns = start_ns + np.arange(T, dtype=np.int64) * np.int64(60_000_000_000)
-    cfg = EngineConfig(T=T, A=A, B=240, tick_size=np.full(A, 0.01, dtype=np.float64))
-    symbols = tuple(f"A{i}" for i in range(A))
-    state = preallocate_state(ts_ns, cfg, symbols)
-
+def _fill_required_channels(state) -> None:
     state.phase[:] = np.int8(Phase.LIVE)
     state.bar_valid[:] = True
 
@@ -37,6 +34,48 @@ def _make_state(T: int = 90, A: int = 1):
     state.scores[:, :, int(ScoreIdx.SCORE_BO_SHORT)] = -0.1
     state.scores[:, :, int(ScoreIdx.SCORE_REJECT)] = 0.05
 
+
+def _make_state(T: int = 90, A: int = 1):
+    start_ns = np.datetime64("2025-01-06T14:30:00", "ns").astype(np.int64)
+    ts_ns = start_ns + np.arange(T, dtype=np.int64) * np.int64(60_000_000_000)
+    cfg = EngineConfig(T=T, A=A, B=240, tick_size=np.full(A, 0.01, dtype=np.float64))
+    symbols = tuple(f"A{i}" for i in range(A))
+    state = preallocate_state(ts_ns, cfg, symbols)
+    _fill_required_channels(state)
+    return state
+
+
+def _make_state_with_clock_override(minute_of_day: np.ndarray, session_id: np.ndarray, A: int = 1):
+    minute_of_day = np.asarray(minute_of_day, dtype=np.int16)
+    session_id = np.asarray(session_id, dtype=np.int64)
+    T = int(minute_of_day.shape[0])
+    if session_id.shape != (T,):
+        raise RuntimeError("session_id shape must match minute_of_day shape")
+
+    start_ns = np.datetime64("2025-01-06T14:30:00", "ns").astype(np.int64)
+    ts_ns = start_ns + np.arange(T, dtype=np.int64) * np.int64(60_000_000_000)
+    cfg = EngineConfig(T=T, A=A, B=240, tick_size=np.full(A, 0.01, dtype=np.float64))
+
+    tod = (minute_of_day.astype(np.int32) - int(cfg.rth_open_minute)).astype(np.int16)
+    gap_min = np.zeros(T, dtype=np.float64)
+    if T > 1:
+        gap_min[1:] = 1.0
+    reset_flag = np.zeros(T, dtype=np.int8)
+    reset_flag[0] = np.int8(1)
+    if T > 1:
+        reset_flag[1:] = (session_id[1:] != session_id[:-1]).astype(np.int8)
+    phase = np.full(T, np.int8(Phase.LIVE), dtype=np.int8)
+
+    clock = {
+        "minute_of_day": minute_of_day,
+        "tod": tod,
+        "session_id": session_id,
+        "gap_min": gap_min,
+        "reset_flag": reset_flag,
+        "phase": phase,
+    }
+    state = preallocate_state(ts_ns, cfg, tuple(f"A{i}" for i in range(A)), clock_override=clock)
+    _fill_required_channels(state)
     return state
 
 
@@ -47,6 +86,173 @@ def _set_vp_peak(state, t: int, a: int, bins, values):
 
 
 class TestModule3Structure(unittest.TestCase):
+    def test_block_start_end_integrity_same_block_id(self):
+        state = _make_state(T=20, A=1)
+        state.vp[:, :, 120] = 1.0
+
+        def _bad_block_map(_state, _cfg):
+            T = _state.cfg.T
+            in_scope = np.ones(T, dtype=bool)
+            block_seq = np.zeros(T, dtype=np.int16)
+            block_id = np.arange(T, dtype=np.int64)
+            block_start = np.zeros(T, dtype=bool)
+            block_end = np.zeros(T, dtype=bool)
+            block_start[0] = True
+            block_end[10] = True
+            return in_scope, block_seq, block_id, block_start, block_end
+
+        with patch.object(module3, "_build_block_map", side_effect=_bad_block_map):
+            with self.assertRaisesRegex(RuntimeError, "Block start/end integrity violation"):
+                run_module3_structural_aggregation(state, Module3Config(block_minutes=5))
+
+        with self.assertRaisesRegex(RuntimeError, "block_seq exceeds 4095 safety stride"):
+            run_module3_structural_aggregation(
+                state,
+                Module3Config(
+                    block_minutes=1,
+                    use_rth_minutes_only=False,
+                    rth_open_minute=-5000,
+                ),
+            )
+
+    def test_valid_ratio_uses_expected_minutes_not_observed_rows(self):
+        minute = np.array(
+            [
+                570,
+                571,
+                572,
+                573,
+                574,
+                576,
+                577,
+                578,
+                579,
+                580,
+                581,
+                582,
+                583,
+                584,
+                585,
+                586,
+                587,
+                588,
+                589,
+                590,
+                591,
+            ],
+            dtype=np.int16,
+        )
+        session = np.zeros(minute.shape[0], dtype=np.int64)
+        state = _make_state_with_clock_override(minute, session, A=1)
+        state.vp[:, :, 120] = 10.0
+        state.vp[:, :, 121] = 8.0
+
+        out = run_module3_structural_aggregation(
+            state,
+            Module3Config(
+                block_minutes=10,
+                include_partial_last_block=True,
+                min_block_valid_bars=1,
+                min_block_valid_ratio=0.0,
+            ),
+        )
+        te_idx = np.flatnonzero(out.block_end_flag_t)
+        self.assertGreaterEqual(int(te_idx.size), 3)
+
+        vr0 = float(out.block_features_tak[int(te_idx[0]), 0, int(Struct30mIdx.VALID_RATIO)])
+        self.assertAlmostEqual(vr0, 0.9, places=12)
+        vr_last = float(out.block_features_tak[int(te_idx[-1]), 0, int(Struct30mIdx.VALID_RATIO)])
+        self.assertAlmostEqual(vr_last, 1.0, places=12)
+
+    def test_context_forward_fill_is_session_safe_no_leak(self):
+        minute = np.array([570, 571, 572, 573, 570, 571, 572, 573], dtype=np.int16)
+        session = np.array([0, 0, 0, 0, 1, 1, 1, 1], dtype=np.int64)
+        state = _make_state_with_clock_override(minute, session, A=1)
+        state.vp[:, :, 120] = 10.0
+        state.vp[:, :, 121] = 8.0
+        cfg = Module3Config(
+            block_minutes=4,
+            include_partial_last_block=True,
+            min_block_valid_bars=1,
+            min_block_valid_ratio=0.0,
+        )
+        out = run_module3_structural_aggregation(state, cfg)
+
+        # Force a cross-session source leak and assert fail-closed validation.
+        out.context_valid_ta[4, 0] = True
+        out.context_source_t_index_ta[4, 0] = 3
+        out.context_tac[4, 0, :] = out.context_tac[3, 0, :]
+
+        with self.assertRaisesRegex(RuntimeError, "crosses session boundary"):
+            module3.validate_module3_output(state, out, cfg)
+
+    def test_prefix_invariance_module3_outputs(self):
+        st1 = _make_state(T=120, A=1)
+        st2 = _make_state(T=120, A=1)
+        st1.vp[:, :, 120] = 10.0
+        st1.vp[:, :, 118] = 8.0
+        st2.vp[:, :, 120] = 10.0
+        st2.vp[:, :, 118] = 8.0
+
+        t0 = 70
+        st2.vp[t0 + 1 :, 0, 120] *= 3.0
+        st2.vp[t0 + 1 :, 0, 118] *= 0.25
+        st2.profile_stats[t0 + 1 :, 0, int(ProfileStatIdx.DCLIP)] += 0.7
+        st2.profile_stats[t0 + 1 :, 0, int(ProfileStatIdx.A_AFFINITY)] -= 0.2
+        st2.scores[t0 + 1 :, 0, int(ScoreIdx.SCORE_BO_LONG)] -= 0.4
+        st2.bar_valid[t0 + 1 :, 0] = False
+
+        cfg = Module3Config(block_minutes=30, min_block_valid_bars=1, min_block_valid_ratio=0.0)
+        out1 = run_module3_structural_aggregation(st1, cfg)
+        out2 = run_module3_structural_aggregation(st2, cfg)
+
+        np.testing.assert_array_equal(out1.block_id_t[: t0 + 1], out2.block_id_t[: t0 + 1])
+        np.testing.assert_array_equal(out1.block_seq_t[: t0 + 1], out2.block_seq_t[: t0 + 1])
+        np.testing.assert_array_equal(out1.block_end_flag_t[: t0 + 1], out2.block_end_flag_t[: t0 + 1])
+        np.testing.assert_array_equal(out1.block_start_t_index_t[: t0 + 1], out2.block_start_t_index_t[: t0 + 1])
+        np.testing.assert_array_equal(out1.block_end_t_index_t[: t0 + 1], out2.block_end_t_index_t[: t0 + 1])
+        np.testing.assert_array_equal(out1.block_valid_ta[: t0 + 1], out2.block_valid_ta[: t0 + 1])
+        np.testing.assert_array_equal(out1.context_valid_ta[: t0 + 1], out2.context_valid_ta[: t0 + 1])
+        np.testing.assert_array_equal(
+            out1.context_source_t_index_ta[: t0 + 1],
+            out2.context_source_t_index_ta[: t0 + 1],
+        )
+        np.testing.assert_allclose(
+            out1.block_features_tak[: t0 + 1],
+            out2.block_features_tak[: t0 + 1],
+            atol=0.0,
+            rtol=0.0,
+            equal_nan=True,
+        )
+        np.testing.assert_allclose(
+            out1.context_tac[: t0 + 1],
+            out2.context_tac[: t0 + 1],
+            atol=0.0,
+            rtol=0.0,
+            equal_nan=True,
+        )
+
+    def test_ib_bounds_consistency(self):
+        state = _make_state(T=90, A=1)
+        for t in [29, 59, 89]:
+            _set_vp_peak(state, t, 0, bins=[110, 120], values=[10.0, 9.0])
+        cfg = Module3Config(min_block_valid_bars=1, min_block_valid_ratio=0.0)
+        out = run_module3_structural_aggregation(state, cfg)
+
+        ib_hi = out.block_features_tak[:, 0, int(Struct30mIdx.IB_HIGH_X)]
+        ib_lo = out.block_features_tak[:, 0, int(Struct30mIdx.IB_LOW_X)]
+        ib_mask = out.block_valid_ta[:, 0] & np.isfinite(ib_hi) & np.isfinite(ib_lo)
+        self.assertTrue(np.all(ib_lo[ib_mask] <= ib_hi[ib_mask]))
+
+        te_idx = np.flatnonzero(out.block_end_flag_t)
+        self.assertGreater(int(te_idx.size), 0)
+        t_bad = int(te_idx[0])
+        out.block_valid_ta[t_bad, 0] = True
+        out.block_features_tak[t_bad, 0, int(Struct30mIdx.IB_HIGH_X)] = 0.0
+        out.block_features_tak[t_bad, 0, int(Struct30mIdx.IB_LOW_X)] = 1.0
+        with self.assertRaisesRegex(RuntimeError, "IB bounds invalid"):
+            module3.validate_module3_output(state, out, cfg)
+
     def test_block_end_boundaries_and_context_causality(self):
         state = _make_state(T=120, A=2)
 
@@ -61,8 +267,13 @@ class TestModule3Structure(unittest.TestCase):
         got = np.flatnonzero(out.block_end_flag_t)
         self.assertTrue(np.array_equal(got, te_idx))
 
-        t_idx = np.arange(state.cfg.T, dtype=np.int64)[:, None]
-        self.assertTrue(np.all(out.context_source_t_index_ta[out.context_valid_ta] <= t_idx[out.context_valid_ta]))
+        t_idx = np.broadcast_to(
+            np.arange(state.cfg.T, dtype=np.int64)[:, None],
+            out.context_source_t_index_ta.shape,
+        )
+        self.assertTrue(
+            np.all(out.context_source_t_index_ta[out.context_valid_ta] <= t_idx[out.context_valid_ta])
+        )
 
     def test_ib_high_low_forward_logic(self):
         state = _make_state(T=90, A=1)
