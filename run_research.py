@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional, Union
@@ -62,6 +63,7 @@ class DataConfigModel(BaseModel):
 class EngineConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    mode: Literal["sealed", "research"] = "sealed"
     B: int = 240
     x_min: float = -6.0
     dx: float = 0.05
@@ -223,6 +225,11 @@ class HarnessConfigModel(BaseModel):
     micro_diag_export_block_profiles: bool = True
     micro_diag_export_funnel: bool = True
     micro_diag_max_rows: int = 5_000_000
+    failure_rate_abort_threshold: float = 0.02
+    failure_count_abort_threshold: int = 50
+    payload_pickle_threshold_bytes: int = 131_072
+    test_fail_task_ids: list[str] = Field(default_factory=list)
+    test_fail_ratio: float = 0.0
 
 
 class StressScenarioModel(BaseModel):
@@ -331,6 +338,7 @@ def _build_engine_config(cfg: RunConfigModel) -> EngineConfig:
     return EngineConfig(
         T=1,
         A=len(cfg.symbols),
+        mode=e.mode,
         tick_size=tick_size,
         B=e.B,
         x_min=e.x_min,
@@ -410,6 +418,11 @@ def _build_harness_config(cfg: RunConfigModel, project_root: Path) -> Module5Har
         micro_diag_export_block_profiles=h.micro_diag_export_block_profiles,
         micro_diag_export_funnel=h.micro_diag_export_funnel,
         micro_diag_max_rows=h.micro_diag_max_rows,
+        failure_rate_abort_threshold=h.failure_rate_abort_threshold,
+        failure_count_abort_threshold=h.failure_count_abort_threshold,
+        payload_pickle_threshold_bytes=h.payload_pickle_threshold_bytes,
+        test_fail_task_ids=tuple(str(x) for x in h.test_fail_task_ids),
+        test_fail_ratio=h.test_fail_ratio,
     )
 
 
@@ -491,7 +504,8 @@ def in_memory_date_filter_loader(data_cfg: DataConfigModel) -> Callable[[str, st
 
         out = pdx.DataFrame(
             {
-                "timestamp": ts[keep].dt.tz_convert(tz_name).dt.floor("min"),
+                # Keep canonical UTC timestamps at ingestion boundary.
+                "timestamp": ts[keep].dt.floor("min"),
                 "open": pdx.to_numeric(df.loc[keep, o_col], errors="coerce"),
                 "high": pdx.to_numeric(df.loc[keep, h_col], errors="coerce"),
                 "low": pdx.to_numeric(df.loc[keep, l_col], errors="coerce"),
@@ -576,6 +590,7 @@ def _append_run_registry(
     symbols: list[str],
     n_candidates: int,
     pass_count: int,
+    resolved_config_sha256: str,
 ) -> None:
     artifacts_root.mkdir(parents=True, exist_ok=True)
 
@@ -586,6 +601,7 @@ def _append_run_registry(
         "symbols": symbols,
         "n_candidates": int(n_candidates),
         "pass_count": int(pass_count),
+        "resolved_config_sha256": str(resolved_config_sha256),
     }
 
     index_path = artifacts_root / "run_index.jsonl"
@@ -594,6 +610,29 @@ def _append_run_registry(
 
     latest_path = artifacts_root / ".latest_run"
     latest_path.write_text(str(run_dir.resolve()) + "\n", encoding="utf-8")
+
+
+def _resolved_config_sha256(cfg: RunConfigModel) -> str:
+    payload = cfg.model_dump(mode="json")
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _ensure_dashboard_handoff(artifacts_root: Path, run_dir: Path) -> Path:
+    module5_root = artifacts_root / "module5_harness"
+    module5_root.mkdir(parents=True, exist_ok=True)
+    target = module5_root / run_dir.name
+    if target.resolve() == run_dir.resolve():
+        return target
+    if target.exists() or target.is_symlink():
+        return target
+    try:
+        target.symlink_to(run_dir.resolve(), target_is_directory=True)
+    except Exception:
+        # Fallback: create directory marker with absolute pointer.
+        target.mkdir(parents=True, exist_ok=True)
+        (target / ".run_path").write_text(str(run_dir.resolve()) + "\n", encoding="utf-8")
+    return target
 
 
 def _load_config(path: Path) -> RunConfigModel:
@@ -614,6 +653,7 @@ def main() -> None:
     project_root = Path(__file__).resolve().parent
     config_path = Path(args.config).expanduser().resolve()
     cfg = _load_config(config_path)
+    resolved_sha = _resolved_config_sha256(cfg)
 
     symbols = [s.strip().upper() for s in cfg.symbols]
     data_paths = _resolve_data_paths(cfg, project_root)
@@ -648,7 +688,9 @@ def main() -> None:
     leaderboard = out.stats_verdict.get("leaderboard", [])
     pass_count = int(sum(1 for row in leaderboard if bool(row.get("pass", False))))
 
-    artifacts_root = Path(harness_cfg.report_dir).resolve()
+    report_root = Path(harness_cfg.report_dir).resolve()
+    artifacts_root = report_root.parent if report_root.name == "module5_harness" else report_root
+    _ensure_dashboard_handoff(artifacts_root, run_dir)
     _append_run_registry(
         artifacts_root=artifacts_root,
         run_id=run_id,
@@ -656,13 +698,23 @@ def main() -> None:
         symbols=symbols,
         n_candidates=int(out.run_manifest.get("n_candidates", len(out.candidate_results))),
         pass_count=pass_count,
+        resolved_config_sha256=resolved_sha,
     )
 
     summary = {
         "run_id": run_id,
         "run_dir": str(run_dir),
-        "n_candidate_results": len(out.candidate_results),
+        "n_candidate_results": int(out.run_manifest.get("n_candidates", len(out.candidate_results))),
         "pass_count": pass_count,
+        "aborted": bool(out.run_manifest.get("aborted", False)),
+        "abort_reason": str(out.run_manifest.get("abort_reason", "")),
+        "failure_count": int(out.run_manifest.get("failure_count", 0)),
+        "failure_rate": float(out.run_manifest.get("failure_rate", 0.0)),
+        "parallel_backend": str(out.run_manifest.get("parallel_backend", harness_cfg.parallel_backend)),
+        "parallel_workers_effective": int(out.run_manifest.get("parallel_workers_effective", 1)),
+        "payload_safe": bool(out.run_manifest.get("payload_safe", True)),
+        "large_payload_passing_avoided": bool(out.run_manifest.get("large_payload_passing_avoided", True)),
+        "resolved_config_sha256": resolved_sha,
         "run_index": str((artifacts_root / "run_index.jsonl").resolve()),
         "latest_run": str((artifacts_root / ".latest_run").resolve()),
     }

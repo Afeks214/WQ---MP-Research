@@ -11,8 +11,8 @@ symbols:
   - TLT
 
 data:
-  # Folder with minute files.
-  root: "./data/minute"
+  # Folder with cleaned canonical minute files from Alpaca ingestion.
+  root: "./data/alpaca/clean"
   format: "parquet"  # parquet | csv
 
   # Optional explicit per-symbol file mapping.
@@ -30,6 +30,8 @@ data:
   end: "2024-12-31T23:59:59Z"
 
 engine:
+  # Kernel mode: "sealed" (spec-true locked formulas) | "research" (legacy/tunable).
+  mode: "sealed"
   # Tensor/profile grid resolution.
   B: 240
   x_min: -6.0
