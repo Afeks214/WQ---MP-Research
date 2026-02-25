@@ -22,10 +22,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 import datetime as dt
 import hashlib
 import numpy as np
+from zoneinfo import ZoneInfo
 
 
 # -----------------------------------------------------------------------------
@@ -34,6 +35,7 @@ import numpy as np
 
 NS_PER_SEC: int = 1_000_000_000
 NS_PER_MIN: int = 60 * NS_PER_SEC
+NS_PER_HOUR: int = 60 * NS_PER_MIN
 NS_PER_DAY: int = 24 * 60 * NS_PER_MIN
 
 
@@ -136,6 +138,8 @@ class EngineConfig:
     # Determinism
     seed: int = 17
     fail_on_nan: bool = True
+    mode: str = "research"  # "research" | "sealed"
+    timezone: str = "America/New_York"
 
 
 @dataclass
@@ -233,10 +237,6 @@ def _assert_monotonic_ts_ns(ts_ns: np.ndarray) -> None:
         raise RuntimeError(f"Non-monotonic timestamps at idx={idx}, delta_ns={int(diff[idx])}")
 
 
-def _set_deterministic(seed: int) -> None:
-    np.random.seed(seed)
-
-
 # -----------------------------------------------------------------------------
 # Config normalization and typed eps construction
 # -----------------------------------------------------------------------------
@@ -256,6 +256,9 @@ def _validate_config(cfg: EngineConfig, symbols: Sequence[str]) -> np.ndarray:
         raise RuntimeError("Strict rule: overnight_positions_max must be exactly 1")
     if cfg.daily_loss_limit_abs <= 0:
         raise RuntimeError("daily_loss_limit_abs must be > 0")
+    mode = str(cfg.mode).strip().lower()
+    if mode not in {"research", "sealed"}:
+        raise RuntimeError(f"engine.mode must be 'research' or 'sealed', got {cfg.mode!r}")
 
     tick = np.asarray(cfg.tick_size, dtype=np.float64)
     _assert_shape("tick_size", tick, (cfg.A,))
@@ -297,86 +300,73 @@ def build_x_grid(cfg: EngineConfig) -> np.ndarray:
     return x_grid
 
 
-# -----------------------------------------------------------------------------
-# Vectorized DST-aware US/Eastern session clock
-# -----------------------------------------------------------------------------
-
-def _first_weekday_day(year: int, month: int, weekday: int) -> int:
-    d0 = dt.date(year, month, 1)
-    return 1 + ((weekday - d0.weekday()) % 7)
-
-
-def _nth_weekday_day(year: int, month: int, weekday: int, n: int) -> int:
-    return _first_weekday_day(year, month, weekday) + 7 * (n - 1)
+def _offset_seconds_at_ns(ns: int, tz_local: ZoneInfo, tz_utc: ZoneInfo) -> int:
+    sec = int(ns // NS_PER_SEC)
+    nsec = int(ns % NS_PER_SEC)
+    dt_utc = dt.datetime.fromtimestamp(sec, tz=tz_utc).replace(microsecond=int(nsec // 1000))
+    offset = dt_utc.astimezone(tz_local).utcoffset()
+    if offset is None:
+        raise RuntimeError(f"Timezone offset unavailable for ns={ns}")
+    return int(offset.total_seconds())
 
 
-def _us_eastern_dst_bounds_utc_ns(year_min: int, year_max: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _derive_offset_segments_utc(
+    ts_ns: np.ndarray,
+    tz_local: ZoneInfo,
+    tz_utc: ZoneInfo,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    US DST rules (since 2007):
-    - Start: second Sunday in March, 02:00 local EST = 07:00 UTC
-    - End  : first Sunday in November, 02:00 local EDT = 06:00 UTC
-    """
-    years = np.arange(year_min, year_max + 1, dtype=np.int32)
-    n = years.size
-
-    start_ns = np.empty(n, dtype=np.int64)
-    end_ns = np.empty(n, dtype=np.int64)
-
-    # Year-level loop only (small, deterministic, no per-bar loop)
-    for i, y in enumerate(years.tolist()):
-        march_day = _nth_weekday_day(y, 3, 6, 2)  # Sunday=6
-        nov_day = _nth_weekday_day(y, 11, 6, 1)
-
-        s = np.datetime64(f"{y:04d}-03-{march_day:02d}T07:00:00", "ns")
-        e = np.datetime64(f"{y:04d}-11-{nov_day:02d}T06:00:00", "ns")
-
-        start_ns[i] = s.astype(np.int64)
-        end_ns[i] = e.astype(np.int64)
-
-    return years, start_ns, end_ns
-
-
-def build_session_clock_vectorized(ts_ns: np.ndarray, cfg: EngineConfig) -> Dict[str, np.ndarray]:
-    """
-    Fully vectorized clock path for all t:
-    - UTC ns -> ET ns using vectorized DST mask
-    - minute_of_day, tod, session_id, gap_min, reset_flag, phase
+    Derive UTC offset segments [start_ns, next_start_ns) for the timestamp domain.
+    Sampling is hourly with deterministic transition refinement by binary search.
     """
     _assert_monotonic_ts_ns(ts_ns)
-    T = ts_ns.shape[0]
+    if ts_ns.size == 0:
+        raise RuntimeError("Cannot derive offset segments for empty ts_ns")
 
-    ts_dt64 = ts_ns.astype("datetime64[ns]")
-    years = (ts_dt64.astype("datetime64[Y]").astype(np.int64) + 1970).astype(np.int32)
-    year_min = int(years.min())
-    year_max = int(years.max())
+    start_day = (int(ts_ns[0]) // NS_PER_DAY) * NS_PER_DAY
+    end_day = ((int(ts_ns[-1]) // NS_PER_DAY) + 1) * NS_PER_DAY
+    pad = 48 * NS_PER_HOUR
+    scan_start = start_day - pad
+    scan_end = end_day + pad
 
-    year_table, dst_start_ns, dst_end_ns = _us_eastern_dst_bounds_utc_ns(year_min, year_max)
-    y_idx = years - year_table[0]
+    sample_ns = np.arange(scan_start, scan_end + NS_PER_HOUR, NS_PER_HOUR, dtype=np.int64)
+    sample_offsets = np.empty(sample_ns.shape[0], dtype=np.int32)
+    for i in range(sample_ns.shape[0]):
+        sample_offsets[i] = np.int32(_offset_seconds_at_ns(int(sample_ns[i]), tz_local, tz_utc))
 
-    start_for_t = dst_start_ns[y_idx]
-    end_for_t = dst_end_ns[y_idx]
-    in_dst = (ts_ns >= start_for_t) & (ts_ns < end_for_t)
+    change_idx = np.flatnonzero(sample_offsets[1:] != sample_offsets[:-1])
+    seg_starts: list[int] = [int(scan_start)]
+    seg_offsets: list[int] = [int(sample_offsets[0])]
+    for j in change_idx.tolist():
+        left_ns = int(sample_ns[j])
+        right_ns = int(sample_ns[j + 1])
+        left_offset = int(sample_offsets[j])
+        right_offset = int(sample_offsets[j + 1])
 
-    # ET offset minutes: -5h (EST) or -4h (EDT)
-    offset_min_et = np.where(in_dst, -4 * 60, -5 * 60).astype(np.int16)
-    et_ns = ts_ns + offset_min_et.astype(np.int64) * np.int64(NS_PER_MIN)
+        lo = left_ns
+        hi = right_ns
+        while hi - lo > 1:
+            mid = lo + ((hi - lo) // 2)
+            if _offset_seconds_at_ns(mid, tz_local, tz_utc) == left_offset:
+                lo = mid
+            else:
+                hi = mid
+        transition_ns = hi
 
-    et_min_index = np.floor_divide(et_ns, np.int64(NS_PER_MIN))
-    et_day_index = np.floor_divide(et_ns, np.int64(NS_PER_DAY)).astype(np.int64)
+        if seg_starts[-1] == transition_ns:
+            seg_offsets[-1] = right_offset
+        else:
+            seg_starts.append(transition_ns)
+            seg_offsets.append(right_offset)
 
-    minute_of_day = np.mod(et_min_index, np.int64(1440)).astype(np.int16)
-    tod = (minute_of_day.astype(np.int32) - int(cfg.rth_open_minute)).astype(np.int16)
+    return (
+        np.asarray(seg_starts, dtype=np.int64),
+        np.asarray(seg_offsets, dtype=np.int32),
+    )
 
-    session_change = np.empty(T, dtype=bool)
-    session_change[0] = True
-    session_change[1:] = et_day_index[1:] != et_day_index[:-1]
-    session_id = np.cumsum(session_change, dtype=np.int64) - 1
 
-    gap_min = np.zeros(T, dtype=np.float64)
-    gap_min[1:] = (ts_ns[1:] - ts_ns[:-1]) / float(NS_PER_MIN)
-    reset_flag = ((gap_min > float(cfg.gap_reset_minutes)) | session_change).astype(np.int8)
-
-    phase = np.full(T, np.int8(Phase.WARMUP), dtype=np.int8)
+def _compute_phase(minute_of_day: np.ndarray, tod: np.ndarray, cfg: EngineConfig) -> np.ndarray:
+    phase = np.full(minute_of_day.shape[0], np.int8(Phase.WARMUP), dtype=np.int8)
     is_live = (tod >= int(cfg.warmup_minutes)) & (minute_of_day < int(cfg.flat_time_minute))
     phase[is_live] = np.int8(Phase.LIVE)
 
@@ -385,7 +375,47 @@ def build_session_clock_vectorized(ts_ns: np.ndarray, cfg: EngineConfig) -> Dict
 
     is_flatten = minute_of_day > int(cfg.flat_time_minute)
     phase[is_flatten] = np.int8(Phase.FLATTEN)
+    return phase
 
+
+def _build_session_clock_reference(
+    ts_ns: np.ndarray,
+    cfg: EngineConfig,
+    tz_name: Optional[str] = None,
+) -> Dict[str, np.ndarray]:
+    """
+    Reference DST-safe clock path using per-row zoneinfo conversion.
+    Kept for audit and equivalence testing against the fast path.
+    """
+    _assert_monotonic_ts_ns(ts_ns)
+    T = ts_ns.shape[0]
+
+    tz_local = ZoneInfo(str(tz_name) if tz_name is not None else str(cfg.timezone))
+    tz_utc = ZoneInfo("UTC")
+
+    minute_of_day = np.empty(T, dtype=np.int16)
+    local_day_index = np.empty(T, dtype=np.int64)
+    for i in range(T):
+        ns = int(ts_ns[i])
+        sec = ns // NS_PER_SEC
+        nsec = ns % NS_PER_SEC
+        dt_utc = dt.datetime.fromtimestamp(sec, tz=tz_utc).replace(microsecond=int(nsec // 1000))
+        dt_loc = dt_utc.astimezone(tz_local)
+        minute_of_day[i] = np.int16(int(dt_loc.hour) * 60 + int(dt_loc.minute))
+        local_day_index[i] = np.int64(int(dt_loc.date().toordinal()))
+
+    tod = (minute_of_day.astype(np.int32) - int(cfg.rth_open_minute)).astype(np.int16)
+    session_change = np.empty(T, dtype=bool)
+    session_change[0] = True
+    session_change[1:] = local_day_index[1:] != local_day_index[:-1]
+    session_id = np.cumsum(session_change, dtype=np.int64) - 1
+
+    gap_min = np.zeros(T, dtype=np.float64)
+    gap_min[1:] = (ts_ns[1:] - ts_ns[:-1]) / float(NS_PER_MIN)
+    reset_flag = ((gap_min > float(cfg.gap_reset_minutes)) | session_change).astype(np.int8)
+    reset_flag[0] = np.int8(1)
+
+    phase = _compute_phase(minute_of_day, tod, cfg)
     return {
         "minute_of_day": minute_of_day,
         "tod": tod,
@@ -393,8 +423,143 @@ def build_session_clock_vectorized(ts_ns: np.ndarray, cfg: EngineConfig) -> Dict
         "gap_min": gap_min,
         "reset_flag": reset_flag,
         "phase": phase,
-        "offset_min_et": offset_min_et,
     }
+
+
+def build_session_clock_vectorized(
+    ts_ns: np.ndarray,
+    cfg: EngineConfig,
+    tz_name: Optional[str] = None,
+) -> Dict[str, np.ndarray]:
+    """
+    Fast DST-safe clock path:
+    - derives UTC offset segments deterministically from zoneinfo,
+    - computes local minute/day features using numpy arithmetic.
+    """
+    _assert_monotonic_ts_ns(ts_ns)
+    T = ts_ns.shape[0]
+
+    tz_local = ZoneInfo(str(tz_name) if tz_name is not None else str(cfg.timezone))
+    tz_utc = ZoneInfo("UTC")
+
+    seg_starts, seg_offsets = _derive_offset_segments_utc(ts_ns, tz_local, tz_utc)
+    seg_idx = np.searchsorted(seg_starts, ts_ns, side="right") - 1
+    if np.any(seg_idx < 0):
+        raise RuntimeError("Offset segment assignment failed for clock build")
+
+    offset_sec = seg_offsets[seg_idx].astype(np.int64)
+    local_ns = ts_ns + offset_sec * np.int64(NS_PER_SEC)
+
+    local_minute_index = np.floor_divide(local_ns, np.int64(NS_PER_MIN))
+    minute_of_day = np.remainder(local_minute_index, np.int64(24 * 60)).astype(np.int16)
+    tod = (minute_of_day.astype(np.int32) - int(cfg.rth_open_minute)).astype(np.int16)
+
+    local_day_index = np.floor_divide(local_ns, np.int64(NS_PER_DAY)).astype(np.int64)
+    session_change = np.empty(T, dtype=bool)
+    session_change[0] = True
+    session_change[1:] = local_day_index[1:] != local_day_index[:-1]
+    session_id = np.cumsum(session_change, dtype=np.int64) - 1
+
+    gap_min = np.zeros(T, dtype=np.float64)
+    gap_min[1:] = (ts_ns[1:] - ts_ns[:-1]) / float(NS_PER_MIN)
+    reset_flag = ((gap_min > float(cfg.gap_reset_minutes)) | session_change).astype(np.int8)
+    reset_flag[0] = np.int8(1)
+
+    phase = _compute_phase(minute_of_day, tod, cfg)
+    return {
+        "minute_of_day": minute_of_day,
+        "tod": tod,
+        "session_id": session_id,
+        "gap_min": gap_min,
+        "reset_flag": reset_flag,
+        "phase": phase,
+    }
+
+
+def _validate_clock_override(clock: Dict[str, np.ndarray], T: int) -> None:
+    expected = ("minute_of_day", "tod", "session_id", "gap_min", "reset_flag", "phase")
+    if not isinstance(clock, dict):
+        raise RuntimeError(f"clock_override must be dict[str, np.ndarray], got {type(clock)!r}")
+
+    expected_keys = set(expected)
+    got_keys = set(clock.keys())
+    if got_keys != expected_keys:
+        missing = sorted(expected_keys - got_keys)
+        extra = sorted(got_keys - expected_keys)
+        raise RuntimeError(
+            f"clock_override keys mismatch: missing={missing}, extra={extra}, expected={list(expected)}"
+        )
+
+    expected_dtype = {
+        "minute_of_day": np.dtype(np.int16),
+        "tod": np.dtype(np.int16),
+        "session_id": np.dtype(np.int64),
+        "gap_min": np.dtype(np.float64),
+        "reset_flag": np.dtype(np.int8),
+        "phase": np.dtype(np.int8),
+    }
+    for key in expected:
+        arr = clock[key]
+        if not isinstance(arr, np.ndarray):
+            raise RuntimeError(f"clock_override[{key!r}] must be np.ndarray, got {type(arr)!r}")
+        if arr.shape != (T,):
+            raise RuntimeError(
+                f"clock_override[{key!r}] shape mismatch: got {arr.shape}, expected {(T,)}"
+            )
+        if arr.dtype != expected_dtype[key]:
+            raise RuntimeError(
+                f"clock_override[{key!r}] dtype mismatch: got {arr.dtype}, expected {expected_dtype[key]}"
+            )
+
+    minute_of_day = clock["minute_of_day"]
+    if np.any((minute_of_day < 0) | (minute_of_day > 1439)):
+        idx = int(np.where((minute_of_day < 0) | (minute_of_day > 1439))[0][0])
+        raise RuntimeError(
+            f"clock_override['minute_of_day'] out of range at t={idx}: {int(minute_of_day[idx])}"
+        )
+
+    session_id = clock["session_id"]
+    if int(session_id[0]) != 0:
+        raise RuntimeError(f"clock_override['session_id'][0] must be 0, got {int(session_id[0])}")
+    sid_diff = np.diff(session_id)
+    if np.any(sid_diff < 0):
+        idx = int(np.where(sid_diff < 0)[0][0])
+        raise RuntimeError(
+            f"clock_override['session_id'] must be nondecreasing: "
+            f"t={idx}->{idx + 1}, values={int(session_id[idx])}->{int(session_id[idx + 1])}"
+        )
+
+    gap_min = clock["gap_min"]
+    if not np.all(np.isfinite(gap_min)):
+        idx = int(np.where(~np.isfinite(gap_min))[0][0])
+        raise RuntimeError(f"clock_override['gap_min'] non-finite at t={idx}: {gap_min[idx]!r}")
+    if float(gap_min[0]) != 0.0:
+        raise RuntimeError(f"clock_override['gap_min'][0] must be 0.0, got {float(gap_min[0])}")
+    if np.any(gap_min < 0.0):
+        idx = int(np.where(gap_min < 0.0)[0][0])
+        raise RuntimeError(
+            f"clock_override['gap_min'] must be non-negative at t={idx}: {float(gap_min[idx])}"
+        )
+
+    reset_flag = clock["reset_flag"]
+    valid_reset = np.isin(reset_flag, np.array([0, 1], dtype=np.int8))
+    if not np.all(valid_reset):
+        idx = int(np.where(~valid_reset)[0][0])
+        raise RuntimeError(
+            f"clock_override['reset_flag'] must be in {{0,1}} at t={idx}: {int(reset_flag[idx])}"
+        )
+    if int(reset_flag[0]) != 1:
+        raise RuntimeError(f"clock_override['reset_flag'][0] must be 1, got {int(reset_flag[0])}")
+
+    phase = clock["phase"]
+    valid_phase_values = np.array(
+        [np.int8(Phase.WARMUP), np.int8(Phase.LIVE), np.int8(Phase.OVERNIGHT_SELECT), np.int8(Phase.FLATTEN)],
+        dtype=np.int8,
+    )
+    valid_phase = np.isin(phase, valid_phase_values)
+    if not np.all(valid_phase):
+        idx = int(np.where(~valid_phase)[0][0])
+        raise RuntimeError(f"clock_override['phase'] invalid code at t={idx}: {int(phase[idx])}")
 
 
 # -----------------------------------------------------------------------------
@@ -437,9 +602,12 @@ def _init_portfolio_vectors(cfg: EngineConfig, phase: np.ndarray) -> Dict[str, n
 # State pre-allocation
 # -----------------------------------------------------------------------------
 
-def preallocate_state(ts_ns: np.ndarray, cfg: EngineConfig, symbols: Sequence[str]) -> TensorState:
-    _set_deterministic(cfg.seed)
-
+def preallocate_state(
+    ts_ns: np.ndarray,
+    cfg: EngineConfig,
+    symbols: Sequence[str],
+    clock_override: Optional[Dict[str, np.ndarray]] = None,
+) -> TensorState:
     tick_size = _validate_config(cfg, symbols)
     eps = _build_typed_eps(cfg, tick_size)
 
@@ -447,7 +615,11 @@ def preallocate_state(ts_ns: np.ndarray, cfg: EngineConfig, symbols: Sequence[st
     _assert_shape("ts_ns", ts_ns, (cfg.T,))
 
     x_grid = build_x_grid(cfg)
-    clk = build_session_clock_vectorized(ts_ns, cfg)
+    if clock_override is not None:
+        _validate_clock_override(clock_override, cfg.T)
+        clk = clock_override
+    else:
+        clk = build_session_clock_vectorized(ts_ns, cfg)
 
     shape_ta = (cfg.T, cfg.A)
     shape_tab = (cfg.T, cfg.A, cfg.B)
@@ -650,6 +822,18 @@ def validate_state_hard(state: TensorState) -> None:
     # Dtypes
     if state.ts_ns.dtype != np.int64:
         raise RuntimeError("ts_ns must be int64")
+    if state.minute_of_day.dtype != np.int16:
+        raise RuntimeError("minute_of_day must be int16")
+    if state.tod.dtype != np.int16:
+        raise RuntimeError("tod must be int16")
+    if state.session_id.dtype != np.int64:
+        raise RuntimeError("session_id must be int64")
+    if state.gap_min.dtype != np.float64:
+        raise RuntimeError("gap_min must be float64")
+    if state.reset_flag.dtype != np.int8:
+        raise RuntimeError("reset_flag must be int8")
+    if state.phase.dtype != np.int8:
+        raise RuntimeError("phase must be int8")
     if state.order_side.dtype != np.int8:
         raise RuntimeError("order_side must be int8")
     if state.order_flags.dtype != np.uint16:
@@ -685,6 +869,42 @@ def validate_state_hard(state: TensorState) -> None:
         ("leverage_limit", state.leverage_limit),
     ]:
         _assert_finite(name, arr)
+
+    if np.any((state.minute_of_day < 0) | (state.minute_of_day > 1439)):
+        idx = int(np.where((state.minute_of_day < 0) | (state.minute_of_day > 1439))[0][0])
+        raise RuntimeError(f"minute_of_day out of range at t={idx}: {int(state.minute_of_day[idx])}")
+
+    if int(state.session_id[0]) != 0:
+        raise RuntimeError(f"session_id[0] must be 0, got {int(state.session_id[0])}")
+    sid_diff = np.diff(state.session_id)
+    if np.any(sid_diff < 0):
+        idx = int(np.where(sid_diff < 0)[0][0])
+        raise RuntimeError(
+            f"session_id must be nondecreasing: "
+            f"t={idx}->{idx + 1}, values={int(state.session_id[idx])}->{int(state.session_id[idx + 1])}"
+        )
+
+    valid_reset_flag = np.isin(state.reset_flag, np.array([0, 1], dtype=np.int8))
+    if not np.all(valid_reset_flag):
+        idx = int(np.where(~valid_reset_flag)[0][0])
+        raise RuntimeError(f"reset_flag must be in {{0,1}} at t={idx}: {int(state.reset_flag[idx])}")
+    if int(state.reset_flag[0]) != 1:
+        raise RuntimeError(f"reset_flag[0] must be 1, got {int(state.reset_flag[0])}")
+
+    if float(state.gap_min[0]) != 0.0:
+        raise RuntimeError(f"gap_min[0] must be 0.0, got {float(state.gap_min[0])}")
+    if np.any(state.gap_min < 0.0):
+        idx = int(np.where(state.gap_min < 0.0)[0][0])
+        raise RuntimeError(f"gap_min must be non-negative at t={idx}: {float(state.gap_min[idx])}")
+
+    expected_tod = state.minute_of_day.astype(np.int32) - int(cfg.rth_open_minute)
+    tod_i32 = state.tod.astype(np.int32)
+    if not np.array_equal(tod_i32, expected_tod):
+        idx = int(np.where(tod_i32 != expected_tod)[0][0])
+        raise RuntimeError(
+            f"tod mismatch at t={idx}: got={int(tod_i32[idx])}, "
+            f"expected={int(expected_tod[idx])}"
+        )
 
     valid_phase = np.isin(
         state.phase,
