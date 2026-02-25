@@ -1,0 +1,241 @@
+run_name: "strategy_factory_20x100"
+
+symbols:
+  - SPY
+  - QQQ
+  - IWM
+  - TLT
+  - GLD
+  - XLF
+  - XLK
+  - XLE
+  - XLI
+  - XLP
+  - XLU
+  - XLV
+  - XLY
+  - XLB
+  - XLC
+  - DIA
+  - VTI
+  - EEM
+  - HYG
+  - LQD
+
+data:
+  root: "./data/alpaca/clean"
+  format: "parquet"
+  path_by_symbol:
+    SPY: "SPY.parquet"
+    QQQ: "QQQ.parquet"
+    IWM: "IWM.parquet"
+    TLT: "TLT.parquet"
+    GLD: "GLD.parquet"
+    XLF: "XLF.parquet"
+    XLK: "XLK.parquet"
+    XLE: "XLE.parquet"
+    XLI: "XLI.parquet"
+    XLP: "XLP.parquet"
+    XLU: "XLU.parquet"
+    XLV: "XLV.parquet"
+    XLY: "XLY.parquet"
+    XLB: "XLB.parquet"
+    XLC: "XLC.parquet"
+    DIA: "DIA.parquet"
+    VTI: "VTI.parquet"
+    EEM: "EEM.parquet"
+    HYG: "HYG.parquet"
+    LQD: "LQD.parquet"
+  timestamp_column: "timestamp"
+  start: "2024-01-02T00:00:00Z"
+  end: "2024-12-31T23:59:59Z"
+
+engine:
+  mode: "sealed"
+  B: 240
+  x_min: -6.0
+  dx: 0.05
+  initial_cash: 1000000.0
+  intraday_leverage_max: 6.0
+  overnight_leverage: 2.0
+  overnight_positions_max: 1
+  daily_loss_limit_abs: 50000.0
+  seed: 17
+  fail_on_nan: true
+  tick_size_default: 0.01
+
+module2_configs:
+  - profile_window_bars: 60
+    profile_warmup_bars: 60
+    atr_span: 14
+    atr_alpha: null
+    rvol_lookback_sessions: 20
+    va_threshold: 0.70
+    fail_on_non_finite_output: true
+
+module3_configs:
+  - block_minutes: 15
+    include_partial_last_block: true
+    min_block_valid_ratio: 0.65
+    ib_pop_frac: 0.008
+  - block_minutes: 15
+    include_partial_last_block: false
+    min_block_valid_ratio: 0.70
+    ib_pop_frac: 0.010
+  - block_minutes: 20
+    include_partial_last_block: true
+    min_block_valid_ratio: 0.68
+    ib_pop_frac: 0.009
+  - block_minutes: 20
+    include_partial_last_block: false
+    min_block_valid_ratio: 0.72
+    ib_pop_frac: 0.011
+  - block_minutes: 30
+    include_partial_last_block: true
+    min_block_valid_ratio: 0.70
+    ib_pop_frac: 0.010
+  - block_minutes: 30
+    include_partial_last_block: false
+    min_block_valid_ratio: 0.75
+    ib_pop_frac: 0.012
+  - block_minutes: 40
+    include_partial_last_block: true
+    min_block_valid_ratio: 0.74
+    ib_pop_frac: 0.010
+  - block_minutes: 40
+    include_partial_last_block: false
+    min_block_valid_ratio: 0.78
+    ib_pop_frac: 0.012
+  - block_minutes: 20
+    include_partial_last_block: true
+    min_block_valid_ratio: 0.80
+    ib_pop_frac: 0.014
+  - block_minutes: 30
+    include_partial_last_block: true
+    min_block_valid_ratio: 0.76
+    ib_pop_frac: 0.013
+
+module4_configs:
+  - entry_threshold: 0.52
+    exit_threshold: 0.20
+    top_k_intraday: 6
+    max_asset_cap_frac: 0.35
+    max_turnover_frac_per_bar: 0.40
+    overnight_min_conviction: 0.60
+    hard_kill_on_daily_loss_breach: true
+  - entry_threshold: 0.54
+    exit_threshold: 0.22
+    top_k_intraday: 6
+    max_asset_cap_frac: 0.33
+    max_turnover_frac_per_bar: 0.38
+    overnight_min_conviction: 0.62
+    hard_kill_on_daily_loss_breach: true
+  - entry_threshold: 0.56
+    exit_threshold: 0.24
+    top_k_intraday: 5
+    max_asset_cap_frac: 0.31
+    max_turnover_frac_per_bar: 0.36
+    overnight_min_conviction: 0.64
+    hard_kill_on_daily_loss_breach: true
+  - entry_threshold: 0.58
+    exit_threshold: 0.26
+    top_k_intraday: 5
+    max_asset_cap_frac: 0.30
+    max_turnover_frac_per_bar: 0.34
+    overnight_min_conviction: 0.66
+    hard_kill_on_daily_loss_breach: true
+  - entry_threshold: 0.60
+    exit_threshold: 0.28
+    top_k_intraday: 4
+    max_asset_cap_frac: 0.28
+    max_turnover_frac_per_bar: 0.32
+    overnight_min_conviction: 0.68
+    hard_kill_on_daily_loss_breach: true
+  - entry_threshold: 0.62
+    exit_threshold: 0.30
+    top_k_intraday: 4
+    max_asset_cap_frac: 0.27
+    max_turnover_frac_per_bar: 0.30
+    overnight_min_conviction: 0.70
+    hard_kill_on_daily_loss_breach: true
+  - entry_threshold: 0.64
+    exit_threshold: 0.31
+    top_k_intraday: 3
+    max_asset_cap_frac: 0.25
+    max_turnover_frac_per_bar: 0.28
+    overnight_min_conviction: 0.72
+    hard_kill_on_daily_loss_breach: true
+  - entry_threshold: 0.66
+    exit_threshold: 0.33
+    top_k_intraday: 3
+    max_asset_cap_frac: 0.24
+    max_turnover_frac_per_bar: 0.26
+    overnight_min_conviction: 0.75
+    hard_kill_on_daily_loss_breach: true
+  - entry_threshold: 0.67
+    exit_threshold: 0.34
+    top_k_intraday: 2
+    max_asset_cap_frac: 0.22
+    max_turnover_frac_per_bar: 0.24
+    overnight_min_conviction: 0.78
+    hard_kill_on_daily_loss_breach: true
+  - entry_threshold: 0.68
+    exit_threshold: 0.35
+    top_k_intraday: 2
+    max_asset_cap_frac: 0.20
+    max_turnover_frac_per_bar: 0.20
+    overnight_min_conviction: 0.80
+    hard_kill_on_daily_loss_breach: true
+
+harness:
+  seed: 97
+  timezone: "America/New_York"
+  freq: "1min"
+  min_asset_coverage: 0.80
+  purge_bars: 60
+  embargo_bars: 30
+  wf_train_sessions: 90
+  wf_test_sessions: 21
+  wf_step_sessions: 21
+  cpcv_slices: 6
+  cpcv_k_test: 3
+  parallel_backend: "process_pool"
+  parallel_workers: 4
+  stress_profile: "baseline_mild_severe"
+  max_ram_utilization_frac: 0.70
+  enforce_lookahead_guard: true
+  report_dir: "./artifacts/module5_harness"
+  fail_on_non_finite: true
+  daily_return_min_days: 60
+  benchmark_symbol: "SPY"
+  export_micro_diagnostics: false
+
+stress_scenarios:
+  - scenario_id: "baseline"
+    name: "baseline"
+    missing_burst_prob: 0.0
+    missing_burst_min: 0
+    missing_burst_max: 0
+    jitter_sigma_bps: 0.0
+    slippage_mult: 1.0
+    enabled: true
+  - scenario_id: "mild"
+    name: "mild"
+    missing_burst_prob: 0.0005
+    missing_burst_min: 2
+    missing_burst_max: 5
+    jitter_sigma_bps: 1.5
+    slippage_mult: 1.5
+    enabled: true
+  - scenario_id: "severe"
+    name: "severe"
+    missing_burst_prob: 0.0010
+    missing_burst_min: 3
+    missing_burst_max: 8
+    jitter_sigma_bps: 3.0
+    slippage_mult: 2.0
+    enabled: true
+
+candidates:
+  mode: "auto_grid"
+  specs: []
