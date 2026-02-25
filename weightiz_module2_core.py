@@ -192,6 +192,13 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x64))
 
 
+def _engine_mode(state: TensorState) -> str:
+    mode = str(getattr(state.cfg, "mode", "research")).strip().lower()
+    if mode not in {"research", "sealed"}:
+        raise RuntimeError(f"Unsupported engine.mode={mode!r}; expected 'research' or 'sealed'")
+    return mode
+
+
 def _ema_causal(arr_ta: np.ndarray, alpha: float) -> np.ndarray:
     """
     Causal EMA over t, vectorized over assets.
@@ -205,6 +212,45 @@ def _ema_causal(arr_ta: np.ndarray, alpha: float) -> np.ndarray:
     for t in range(1, T):
         out[t] = alpha * arr_ta[t] + one_minus * out[t - 1]
     return out
+
+
+def _build_canonical_use_arrays(
+    state: TensorState,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build deterministic OHLCV arrays for downstream math.
+
+    Invalid bars (bar_valid=False) use forward-filled close for prices and 0.0 for volume.
+    """
+    T = state.cfg.T
+    A = state.cfg.A
+    valid = state.bar_valid.astype(bool)
+
+    close_px = np.asarray(state.close_px, dtype=np.float64)
+    open_px = np.asarray(state.open_px, dtype=np.float64)
+    high_px = np.asarray(state.high_px, dtype=np.float64)
+    low_px = np.asarray(state.low_px, dtype=np.float64)
+    volume = np.asarray(state.volume, dtype=np.float64)
+
+    close_ff = np.zeros((T, A), dtype=np.float64)
+    close_ff[0] = np.where(valid[0] & np.isfinite(close_px[0]), close_px[0], 0.0)
+    for t in range(1, T):
+        close_raw = np.where(valid[t], close_px[t], close_ff[t - 1])
+        close_ff[t] = np.where(np.isfinite(close_raw), close_raw, close_ff[t - 1])
+
+    open_use = np.where(valid, open_px, close_ff)
+    high_use = np.where(valid, high_px, close_ff)
+    low_use = np.where(valid, low_px, close_ff)
+    close_use = np.where(valid, close_px, close_ff)
+    vol_use = np.where(valid, volume, 0.0)
+
+    open_use = np.where(np.isfinite(open_use), open_use, close_ff)
+    high_use = np.where(np.isfinite(high_use), high_use, close_ff)
+    low_use = np.where(np.isfinite(low_use), low_use, close_ff)
+    close_use = np.where(np.isfinite(close_use), close_use, close_ff)
+    vol_use = np.maximum(np.where(np.isfinite(vol_use), vol_use, 0.0), 0.0)
+
+    return close_ff, open_use, high_use, low_use, close_use, vol_use, valid
 
 
 def _rolling_median_mad_causal(
@@ -271,6 +317,71 @@ def _session_starts(session_id: np.ndarray) -> np.ndarray:
     return out
 
 
+def _rvol_baseline_ringbuffer(
+    cumvol_ta: np.ndarray,
+    session_id_t: np.ndarray,
+    minute_of_day_t: np.ndarray,
+    lookback_sessions: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Memory-safe causal RVOL baseline:
+    median cumulative volume at same ToD over last K sessions, excluding today.
+    """
+    cumvol = np.asarray(cumvol_ta, dtype=np.float64)
+    sid = np.asarray(session_id_t, dtype=np.int64)
+    minute = np.asarray(minute_of_day_t, dtype=np.int64)
+    T, A = cumvol.shape
+    K = int(lookback_sessions)
+    if K <= 0:
+        raise RuntimeError("lookback_sessions must be > 0")
+
+    starts = np.where(np.r_[True, sid[1:] != sid[:-1]])[0]
+    ends = np.r_[starts[1:], T]
+
+    ring = np.full((1440, A, K), np.nan, dtype=np.float64)
+    ring_count = np.zeros((1440, A), dtype=np.int16)
+    ring_ptr = np.zeros((1440, A), dtype=np.int16)
+
+    baseline = np.full((T, A), np.nan, dtype=np.float64)
+    eligible = np.zeros((T, A), dtype=bool)
+
+    for s0, s1 in zip(starts.tolist(), ends.tolist()):
+        # Baseline for this session uses only previous sessions.
+        for t in range(s0, s1):
+            m = int(minute[t])
+            if m < 0 or m >= 1440:
+                raise RuntimeError(f"minute_of_day out of range at t={t}: {m}")
+            cnt = ring_count[m].astype(np.int64)
+            for a in range(A):
+                c = int(cnt[a])
+                if c <= 0:
+                    continue
+                if c < K:
+                    vals = ring[m, a, :c]
+                else:
+                    vals = ring[m, a, :]
+                vals = vals[np.isfinite(vals)]
+                if vals.size == 0:
+                    continue
+                baseline[t, a] = float(np.nanmedian(vals))
+                eligible[t, a] = baseline[t, a] > 0.0
+
+        # After baseline assignment, append this session into ring.
+        for t in range(s0, s1):
+            m = int(minute[t])
+            for a in range(A):
+                v = float(cumvol[t, a])
+                if not np.isfinite(v):
+                    continue
+                ptr = int(ring_ptr[m, a])
+                ring[m, a, ptr] = v
+                if int(ring_count[m, a]) < K:
+                    ring_count[m, a] = np.int16(int(ring_count[m, a]) + 1)
+                ring_ptr[m, a] = np.int16((ptr + 1) % K)
+
+    return baseline, eligible
+
+
 def _build_poc_rank(x_grid: np.ndarray) -> np.ndarray:
     """
     Rank bins by strict tie-break order:
@@ -299,52 +410,79 @@ def _make_va_offsets(B: int) -> np.ndarray:
     return offs
 
 
-def _compute_value_area_idx_offsetscan(
+def compute_value_area_greedy(
     vp_ab: np.ndarray,
     ipoc_a: np.ndarray,
+    x_grid: np.ndarray,
     va_threshold: float,
-    offsets_b: np.ndarray,
+    eps_vol: float,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Deterministic Value Area extraction via offset scan around POC.
-
-    Inputs:
-    - vp_ab: (A, B)
-    - ipoc_a: (A,)
-
-    Returns:
-    - ipoc, ivah, ival each shape (A,)
+    Sealed-spec deterministic value-area expansion (§12.2):
+    - Start at S={ipoc}
+    - Expand one side per step by larger neighboring mass
+    - If one side is OOB, select in-bounds side
+    - Ties: smaller |x| (closer to 0), then left
     """
-    A, B = vp_ab.shape
+    vp = np.asarray(vp_ab, dtype=np.float64)
     ipoc = np.asarray(ipoc_a, dtype=np.int64)
+    x = np.asarray(x_grid, dtype=np.float64)
+    A, B = vp.shape
+    if x.shape != (B,):
+        raise RuntimeError(f"x_grid shape mismatch for VA: got {x.shape}, expected {(B,)}")
 
-    total = np.sum(vp_ab, axis=1)
-    target = total * float(va_threshold)
+    total = np.sum(vp, axis=1)
+    target = float(va_threshold) * total
 
-    idx = ipoc[:, None] + offsets_b[None, :]
-    valid = (idx >= 0) & (idx < B)
-    idx_clip = np.clip(idx, 0, B - 1)
+    ival = ipoc.copy()
+    ivah = ipoc.copy()
+    covered = vp[np.arange(A, dtype=np.int64), ipoc].copy()
 
-    scanned = np.take_along_axis(vp_ab, idx_clip, axis=1)
-    scanned = np.where(valid, scanned, 0.0)
+    for a in range(A):
+        if not np.isfinite(total[a]) or total[a] <= float(eps_vol):
+            ival[a] = ipoc[a]
+            ivah[a] = ipoc[a]
+            continue
 
-    csum = np.cumsum(scanned, axis=1)
-    reached = csum >= target[:, None]
-    k = np.argmax(reached, axis=1).astype(np.int64)
-    empty = total <= 0.0
-    k = np.where(empty, 0, k)
+        left = int(ipoc[a])
+        right = int(ipoc[a])
+        mass = float(covered[a])
+        tgt = float(target[a])
+        while mass < tgt:
+            li = left - 1
+            ri = right + 1
+            if li < 0 and ri >= B:
+                break
+            if li < 0:
+                choose_left = False
+            elif ri >= B:
+                choose_left = True
+            else:
+                m_left = float(vp[a, li])
+                m_right = float(vp[a, ri])
+                if m_left > m_right:
+                    choose_left = True
+                elif m_right > m_left:
+                    choose_left = False
+                else:
+                    dist_left = abs(float(x[li]))
+                    dist_right = abs(float(x[ri]))
+                    if dist_left < dist_right:
+                        choose_left = True
+                    elif dist_right < dist_left:
+                        choose_left = False
+                    else:
+                        choose_left = True  # final deterministic tie-break: left
 
-    j = np.arange(B, dtype=np.int64)[None, :]
-    included = j <= k[:, None]
-    idx_included = np.where(included & valid, idx, -1)
+            if choose_left:
+                left = li
+                mass += float(vp[a, left])
+            else:
+                right = ri
+                mass += float(vp[a, right])
 
-    ivah = np.max(idx_included, axis=1)
-    big = np.int64(B + 10)
-    tmp = np.where(idx_included >= 0, idx_included, big)
-    ival = np.min(tmp, axis=1)
-
-    ivah = np.where(ivah < 0, ipoc, ivah)
-    ival = np.where((ival >= big) | (ival < 0), ipoc, ival)
+        ival[a] = np.int64(left)
+        ivah[a] = np.int64(right)
 
     return ipoc, ivah, ival
 
@@ -434,23 +572,14 @@ def precompute_market_physics(state: TensorState, cfg: Module2Config) -> MarketP
     - RVOL baseline at (session d, minute m) uses only prior sessions d' < d.
     """
     _validate_stage_a_inputs(state, cfg)
+    mode = _engine_mode(state)
+    sealed = mode == "sealed"
 
     T = state.cfg.T
     A = state.cfg.A
     tick = np.asarray(state.eps.eps_div, dtype=np.float64)
 
-    valid = state.bar_valid.astype(bool)
-
-    # Forward-filled close for deterministic handling of invalid bars.
-    close_ff = np.zeros((T, A), dtype=np.float64)
-    close_ff[0] = np.where(valid[0], state.close_px[0], 0.0)
-    for t in range(1, T):
-        close_ff[t] = np.where(valid[t], state.close_px[t], close_ff[t - 1])
-
-    open_use = np.where(valid, state.open_px, close_ff)
-    high_use = np.where(valid, state.high_px, close_ff)
-    low_use = np.where(valid, state.low_px, close_ff)
-    close_use = np.where(valid, state.close_px, close_ff)
+    close_ff, open_use, high_use, low_use, close_use, vol_use, valid = _build_canonical_use_arrays(state)
 
     # 1) True range and ATR EMA (causal)
     prev_close = np.empty((T, A), dtype=np.float64)
@@ -467,14 +596,20 @@ def precompute_market_physics(state: TensorState, cfg: Module2Config) -> MarketP
         raise RuntimeError(f"Invalid ATR alpha={alpha}; must be in (0,1]")
     atr_raw = _ema_causal(tr, alpha)
 
-    # 2) ATR hard floor and effective ATR
-    atr_floor_abs = _as_asset_vector("atr_floor_abs", cfg.atr_floor_abs, A)
-    floor_asset = np.maximum(float(cfg.atr_floor_mult_tick) * tick, atr_floor_abs)
-    atr_floor = np.broadcast_to(floor_asset[None, :], (T, A)).astype(np.float64, copy=True)
-    atr_eff = np.maximum(atr_raw, atr_floor)
+    # 2) ATR floor and effective ATR
+    if sealed:
+        floor_tick = 4.0 * tick[None, :]
+        floor_pct = 0.0002 * np.maximum(close_use, 0.0)
+        atr_floor = np.maximum(np.maximum(atr_raw, floor_tick), floor_pct)
+        atr_eff = atr_floor.copy()
+    else:
+        atr_floor_abs = _as_asset_vector("atr_floor_abs", cfg.atr_floor_abs, A)
+        floor_asset = np.maximum(float(cfg.atr_floor_mult_tick) * tick, atr_floor_abs)
+        atr_floor = np.broadcast_to(floor_asset[None, :], (T, A)).astype(np.float64, copy=True)
+        atr_eff = np.maximum(atr_raw, atr_floor)
 
     # 3) Cumulative per-session volume
-    vol_clean = np.where(valid, state.volume, 0.0)
+    vol_clean = vol_use
     cumvol = np.zeros((T, A), dtype=np.float64)
     cumvol[0] = vol_clean[0]
     for t in range(1, T):
@@ -484,58 +619,70 @@ def precompute_market_physics(state: TensorState, cfg: Module2Config) -> MarketP
             cumvol[t] = cumvol[t - 1] + vol_clean[t]
 
     # 3b) Robust volume cap statistics (Section 9.2 style)
-    cap_window = int(cfg.volume_cap_window_bars)
+    cap_window = 60 if sealed else int(cfg.volume_cap_window_bars)
     if cap_window <= 0:
         raise RuntimeError("volume_cap_window_bars must be > 0")
-    vol_for_stats = np.where(valid, state.volume, np.nan)
+    vol_for_stats = np.where(valid, vol_use, np.nan)
     med_v, mad_v = _rolling_median_mad_causal(vol_for_stats, window=cap_window, min_periods=1)
     med_v = np.where(np.isfinite(med_v), med_v, 0.0)
     mad_v = np.where(np.isfinite(mad_v), mad_v, 0.0)
     mad_v_scaled = 1.4826 * mad_v
-    cap_v_base = med_v + float(cfg.volume_cap_mad_mult) * mad_v_scaled
-    cap_min = float(cfg.volume_cap_min_mult) * np.where(np.isfinite(med_v), med_v, 0.0)
+    lambda_v = 5.0 if sealed else float(cfg.volume_cap_mad_mult)
+    # Sealed spec uses raw MAD in cap(t)=median(V)+lambda*MAD(V).
+    cap_v_base = med_v + lambda_v * (mad_v if sealed else mad_v_scaled)
+    cap_min = np.zeros_like(cap_v_base) if sealed else float(cfg.volume_cap_min_mult) * np.where(np.isfinite(med_v), med_v, 0.0)
 
     # 4) RVOL via causal ToD baseline median over prior sessions
-    sid_rel = (state.session_id - np.min(state.session_id)).astype(np.int64)
-    S = int(np.max(sid_rel)) + 1
-
     minute = state.minute_of_day.astype(np.int64)
     if np.any((minute < 0) | (minute >= 1440)):
         bad = int(np.where((minute < 0) | (minute >= 1440))[0][0])
         raise RuntimeError(f"minute_of_day out of range at t={bad}: {int(minute[bad])}")
 
-    M = 1440
-    cumvol_cube = np.full((S, M, A), np.nan, dtype=np.float64)
-    cumvol_cube[sid_rel, minute, :] = cumvol
+    if sealed:
+        baseline_ta, rvol_eligible = _rvol_baseline_ringbuffer(
+            cumvol_ta=cumvol,
+            session_id_t=state.session_id,
+            minute_of_day_t=minute,
+            lookback_sessions=20,
+        )
+    else:
+        sid_rel = (state.session_id - np.min(state.session_id)).astype(np.int64)
+        S = int(np.max(sid_rel)) + 1
+        M = 1440
+        cumvol_cube = np.full((S, M, A), np.nan, dtype=np.float64)
+        cumvol_cube[sid_rel, minute, :] = cumvol
 
-    baseline_cube = np.full((S, M, A), np.nan, dtype=np.float64)
-    used_minutes = np.unique(minute)
-    L = int(cfg.rvol_lookback_sessions)
+        baseline_cube = np.full((S, M, A), np.nan, dtype=np.float64)
+        used_minutes = np.unique(minute)
+        L = int(cfg.rvol_lookback_sessions)
 
-    for m in used_minutes.tolist():
-        vals = cumvol_cube[:, m, :]  # (S, A)
-        vals_prev = np.empty_like(vals)
-        vals_prev[0] = np.nan
-        vals_prev[1:] = vals[:-1]
+        for m in used_minutes.tolist():
+            vals = cumvol_cube[:, m, :]  # (S, A)
+            vals_prev = np.empty_like(vals)
+            vals_prev[0] = np.nan
+            vals_prev[1:] = vals[:-1]
 
-        baseline = np.full((S, A), np.nan, dtype=np.float64)
-        if S >= L:
-            windows = sliding_window_view(vals_prev, window_shape=L, axis=0)  # (S-L+1, A, L)
-            baseline[L - 1 :] = np.nanmedian(windows, axis=-1)
-            prefix = min(L - 1, S)
-        else:
-            prefix = S
+            baseline = np.full((S, A), np.nan, dtype=np.float64)
+            if S >= L:
+                windows = sliding_window_view(vals_prev, window_shape=L, axis=0)  # (S-L+1, A, L)
+                baseline[L - 1 :] = np.nanmedian(windows, axis=-1)
+                prefix = min(L - 1, S)
+            else:
+                prefix = S
 
-        for d in range(prefix):
-            baseline[d] = np.nanmedian(vals_prev[: d + 1], axis=0)
+            for d in range(prefix):
+                baseline[d] = np.nanmedian(vals_prev[: d + 1], axis=0)
 
-        baseline_cube[:, m, :] = baseline
+            baseline_cube[:, m, :] = baseline
 
-    baseline_ta = baseline_cube[sid_rel, minute, :]  # (T, A)
-    rvol_eligible = np.isfinite(baseline_ta) & (baseline_ta > 0.0)
+        baseline_ta = baseline_cube[sid_rel, minute, :]  # (T, A)
+        rvol_eligible = np.isfinite(baseline_ta) & (baseline_ta > 0.0)
 
-    vol_eps_abs = _as_asset_vector("rvol_vol_eps_abs", cfg.rvol_vol_eps_abs, A)
-    vol_eps = np.maximum(float(cfg.rvol_vol_eps_mult_tick) * tick[None, :], vol_eps_abs[None, :])
+    if sealed:
+        vol_eps = np.full((T, A), float(state.eps.eps_vol), dtype=np.float64)
+    else:
+        vol_eps_abs = _as_asset_vector("rvol_vol_eps_abs", cfg.rvol_vol_eps_abs, A)
+        vol_eps = np.maximum(float(cfg.rvol_vol_eps_mult_tick) * tick[None, :], vol_eps_abs[None, :])
 
     denom = np.maximum(np.where(np.isfinite(baseline_ta), baseline_ta, np.nan), vol_eps)
     rvol = np.divide(cumvol, denom, out=np.full((T, A), np.nan, dtype=np.float64), where=np.isfinite(denom))
@@ -577,42 +724,56 @@ def precompute_market_physics(state: TensorState, cfg: Module2Config) -> MarketP
 
     # 5) Candle micro-physics precompute over full (T, A)
     range_ = np.maximum(high_use - low_use, state.eps.eps_range[None, :])
-    body_pct = np.abs(close_use - open_use) / (range_ + state.eps.eps_range[None, :])
+    body_pct = np.abs(close_use - open_use) / (range_ + state.eps.eps_div[None, :])
     body_pct = np.clip(body_pct, 0.0, 1.0)
 
-    clv = ((close_use - low_use) - (high_use - close_use)) / (range_ + state.eps.eps_range[None, :])
+    clv = ((close_use - low_use) - (high_use - close_use)) / (range_ + state.eps.eps_div[None, :])
     clv = np.clip(clv, -1.0, 1.0)
 
-    range_ratio = np.clip(range_ / (atr_eff + state.eps.eps_div[None, :]), 0.0, 10.0)
-    rvol_log = np.log1p(np.maximum(rvol, 0.0))
+    if sealed:
+        w_rvol = np.maximum(rvol, 0.0) / (1.0 + np.maximum(rvol, 0.0))
+        range_eff = w_rvol * range_ + (1.0 - w_rvol) * atr_eff
+        sigma_base = range_eff / (4.0 * (atr_eff + state.eps.eps_div[None, :]))
+        sigma1 = sigma_base / (1.0 + np.log1p(np.maximum(rvol, 0.0)))
+        sigma2 = sigma_base
+        sigma_min = float(state.cfg.dx)
+        sigma1 = np.maximum(np.where(np.isfinite(sigma1), sigma1, sigma_min), sigma_min)
+        sigma2 = np.maximum(np.where(np.isfinite(sigma2), sigma2, sigma_min), sigma_min)
+        w1 = np.clip(body_pct, 0.0, 1.0)
+        w2 = 1.0 - w1
+    else:
+        range_ratio = np.clip(range_ / (atr_eff + state.eps.eps_div[None, :]), 0.0, 10.0)
+        rvol_log = np.log1p(np.maximum(rvol, 0.0))
 
-    sigma1 = (
-        float(cfg.sigma1_base)
-        + float(cfg.sigma1_body_coeff) * (1.0 - body_pct)
-        + float(cfg.sigma1_rvol_coeff) * rvol_log
-        + float(cfg.sigma1_range_coeff) * range_ratio
-    )
-    sigma1 = np.clip(sigma1, float(cfg.sigma1_min), float(cfg.sigma1_max))
+        sigma1 = (
+            float(cfg.sigma1_base)
+            + float(cfg.sigma1_body_coeff) * (1.0 - body_pct)
+            + float(cfg.sigma1_rvol_coeff) * rvol_log
+            + float(cfg.sigma1_range_coeff) * range_ratio
+        )
+        sigma1 = np.clip(sigma1, float(cfg.sigma1_min), float(cfg.sigma1_max))
 
-    sigma2 = sigma1 * (
-        float(cfg.sigma2_ratio_base)
-        + float(cfg.sigma2_body_coeff) * body_pct
-        + float(cfg.sigma2_clv_coeff) * np.abs(clv)
-    )
-    sigma2 = np.clip(sigma2, float(cfg.sigma2_min), float(cfg.sigma2_max))
+        sigma2 = sigma1 * (
+            float(cfg.sigma2_ratio_base)
+            + float(cfg.sigma2_body_coeff) * body_pct
+            + float(cfg.sigma2_clv_coeff) * np.abs(clv)
+        )
+        sigma2 = np.clip(sigma2, float(cfg.sigma2_min), float(cfg.sigma2_max))
 
-    w1 = (
-        float(cfg.w1_base)
-        + float(cfg.w1_body_coeff) * body_pct
-        + float(cfg.w1_rvol_coeff) * rvol_log
-        - float(cfg.w1_clv_coeff) * np.abs(clv)
-    )
-    w1 = np.clip(w1, float(cfg.w1_min), float(cfg.w1_max))
-    w2 = 1.0 - w1
+        w1 = (
+            float(cfg.w1_base)
+            + float(cfg.w1_body_coeff) * body_pct
+            + float(cfg.w1_rvol_coeff) * rvol_log
+            - float(cfg.w1_clv_coeff) * np.abs(clv)
+        )
+        w1 = np.clip(w1, float(cfg.w1_min), float(cfg.w1_max))
+        w2 = 1.0 - w1
 
     # Deterministic neutral defaults on invalid bars
-    sigma1 = np.where(valid, sigma1, float(cfg.sigma1_base))
-    sigma2 = np.where(valid, sigma2, float(cfg.sigma2_min))
+    sigma1_default = float(state.cfg.dx) if sealed else float(cfg.sigma1_base)
+    sigma2_default = float(state.cfg.dx) if sealed else float(cfg.sigma2_min)
+    sigma1 = np.where(valid, sigma1, sigma1_default)
+    sigma2 = np.where(valid, sigma2, sigma2_default)
     w1 = np.where(valid, w1, 1.0)
     w2 = np.where(valid, w2, 0.0)
     body_pct = np.where(valid, body_pct, 0.0)
@@ -647,6 +808,20 @@ def precompute_market_physics(state: TensorState, cfg: Module2Config) -> MarketP
     if np.any(sigma2 <= 0.0):
         idx = np.argwhere(sigma2 <= 0.0)[0]
         raise RuntimeError(f"sigma2 <= 0 at t={int(idx[0])}, a={int(idx[1])}")
+    if sealed:
+        dx_floor = float(state.cfg.dx)
+        if np.any(sigma1 < dx_floor):
+            idx = np.argwhere(sigma1 < dx_floor)[0]
+            raise RuntimeError(
+                f"sealed sigma1 < DX at t={int(idx[0])}, a={int(idx[1])}, "
+                f"val={float(sigma1[idx[0], idx[1]]):.6g}, DX={dx_floor:.6g}"
+            )
+        if np.any(sigma2 < dx_floor):
+            idx = np.argwhere(sigma2 < dx_floor)[0]
+            raise RuntimeError(
+                f"sealed sigma2 < DX at t={int(idx[0])}, a={int(idx[1])}, "
+                f"val={float(sigma2[idx[0], idx[1]]):.6g}, DX={dx_floor:.6g}"
+            )
 
     if not np.allclose(w1 + w2, 1.0, atol=1e-12, rtol=0.0):
         max_err = float(np.max(np.abs((w1 + w2) - 1.0)))
@@ -685,6 +860,9 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
     - state.rvol and state.atr_floor (effective ATR denominator)
     - state.vp, state.vp_delta
     - state.profile_stats, state.scores
+
+    Invalid bars are neutralized deterministically at finalize:
+    vp/vp_delta/scores = 0, profile_stats = 0 with IPOC/IVAH/IVAL anchored to x=0 bin.
     """
     _validate_stage_a_inputs(state, cfg)
 
@@ -700,6 +878,7 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
     idx_zero = int(np.argmin(np.abs(x)))
 
     physics = precompute_market_physics(state, cfg)
+    _, open_use, _, _, close_use, vol_use, valid = _build_canonical_use_arrays(state)
 
     # Persist computed physics channels required downstream.
     state.rvol[:, :] = physics.rvol
@@ -716,11 +895,13 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
     state.profile_stats[:, :, int(ProfileStatIdx.IVAL)] = float(idx_zero)
 
     # Precompute windows once (no per-window reconstruction).
-    close_w = sliding_window_view(np.asarray(state.close_px, dtype=np.float64), window_shape=W, axis=0)
-    vol_w = sliding_window_view(np.asarray(state.volume, dtype=np.float64), window_shape=W, axis=0)
-    valid_w = sliding_window_view(state.bar_valid.astype(bool), window_shape=W, axis=0)
+    open_w = sliding_window_view(open_use, window_shape=W, axis=0)
+    close_w = sliding_window_view(close_use, window_shape=W, axis=0)
+    vol_w = sliding_window_view(vol_use, window_shape=W, axis=0)
+    valid_w = sliding_window_view(valid, window_shape=W, axis=0)
 
     clv_w = sliding_window_view(physics.clv, window_shape=W, axis=0)
+    range_w = sliding_window_view(physics.range_, window_shape=W, axis=0)
     sig1_w = sliding_window_view(physics.sigma1, window_shape=W, axis=0)
     sig2_w = sliding_window_view(physics.sigma2, window_shape=W, axis=0)
     w1_w = sliding_window_view(physics.w1, window_shape=W, axis=0)
@@ -736,10 +917,12 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
         raise RuntimeError("Unexpected window count from sliding_window_view")
     expected_win_shape = (T - W + 1, A, W)
     for name, arr in [
+        ("open_w", open_w),
         ("close_w", close_w),
         ("vol_w", vol_w),
         ("valid_w", valid_w),
         ("clv_w", clv_w),
+        ("range_w", range_w),
         ("sig1_w", sig1_w),
         ("sig2_w", sig2_w),
         ("w1_w", w1_w),
@@ -756,7 +939,7 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
             )
 
     poc_rank = _build_poc_rank(x)
-    va_offsets = _make_va_offsets(B)
+    mode = _engine_mode(state)
     computed_mask = np.zeros((T, A), dtype=bool)
 
     # Causal loop over t; vectorized over A/B/W.
@@ -766,16 +949,14 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
         if t < int(cfg.profile_warmup_bars - 1):
             continue
 
-        # Optional phase-based eligibility (WARMUP bars should remain non-tradable).
-        if state.phase[t] == np.int8(Phase.WARMUP):
-            continue
-
         # sliding_window_view over axis=0 yields (A, W); transpose to canonical (W, A).
+        open_win = open_w[win_idx].T
         close_win = close_w[win_idx].T
-        vol_win = np.maximum(vol_w[win_idx].T, 0.0)
+        vol_win = vol_w[win_idx].T
         valid_win = valid_w[win_idx].T
 
         clv_win = clv_w[win_idx].T
+        range_win = range_w[win_idx].T
         sig1_win = sig1_w[win_idx].T
         sig2_win = sig2_w[win_idx].T
         w1_win = w1_w[win_idx].T
@@ -790,7 +971,7 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
                 f"Window orientation mismatch at win_idx={win_idx}: got {close_win.shape}, expected {(W, A)}"
             )
 
-        close_t = state.close_px[t]
+        close_t = close_use[t]
         atr_t = physics.atr_eff[t]
 
         tradable_t = (
@@ -804,54 +985,105 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
             continue
 
         # Coordinate reprojection to x-space.
-        mu = (close_win - close_t[None, :]) / (atr_t[None, :] + state.eps.eps_div[None, :])
-        mu1 = mu + float(cfg.mu1_clv_shift) * clv_win
-        mu2 = mu + float(cfg.mu2_clv_shift) * clv_win
+        if mode == "sealed":
+            mid_win = 0.5 * (open_win + close_win)
+            mu = (mid_win - close_t[None, :]) / (atr_t[None, :] + state.eps.eps_div[None, :])
+            mu1 = mu
+            mu2 = mu
+            # Sealed sigma path is decision-time anchored (§8.2/§8.3):
+            # uses ATR_floor_t and RVOL_t for the whole k->t window.
+            rvol_t = np.maximum(physics.rvol[t], 0.0)
+            w_rvol_t = rvol_t / (1.0 + rvol_t)
+            range_eff = w_rvol_t[None, :] * range_win + (1.0 - w_rvol_t)[None, :] * atr_t[None, :]
+            sigma_base = range_eff / (4.0 * (atr_t[None, :] + state.eps.eps_div[None, :]))
+            sigma1_win = sigma_base / (1.0 + np.log1p(rvol_t))[None, :]
+            sigma2_win = sigma_base
+            sigma1_win = np.maximum(np.where(np.isfinite(sigma1_win), sigma1_win, dx), dx)
+            sigma2_win = np.maximum(np.where(np.isfinite(sigma2_win), sigma2_win, dx), dx)
+            w1_win = np.clip(body_pct_win, 0.0, 1.0)
+            w2_win = 1.0 - w1_win
+            # Sealed cap path is decision-time anchored (§9.2/§9.2.1).
+            vol_for_cap = np.where(valid_win, vol_win, np.nan)
+            med_cap = np.nanmedian(vol_for_cap, axis=0)
+            mad_cap = np.nanmedian(np.abs(vol_for_cap - med_cap[None, :]), axis=0)
+            cap_t = np.where(np.isfinite(med_cap), med_cap, 0.0) + 5.0 * np.where(np.isfinite(mad_cap), mad_cap, 0.0)
+            cap_eff_t = cap_t * (1.0 + np.log(np.maximum(1.0, rvol_t)))
+            cap_eff_t = np.where(np.isfinite(cap_eff_t), np.maximum(cap_eff_t, 0.0), 0.0)
+            cap_win_eff = np.broadcast_to(cap_eff_t[None, :], vol_win.shape)
+        else:
+            mu = (close_win - close_t[None, :]) / (atr_t[None, :] + state.eps.eps_div[None, :])
+            mu1 = mu + float(cfg.mu1_clv_shift) * clv_win
+            mu2 = mu + float(cfg.mu2_clv_shift) * clv_win
+            sigma1_win = sig1_win
+            sigma2_win = sig2_win
+            cap_win_eff = np.maximum(cap_win, 0.0)
 
         # Gaussian mixture injection
-        sig1_safe = np.maximum(sig1_win, state.eps.eps_range[None, :])
-        sig2_safe = np.maximum(sig2_win, state.eps.eps_range[None, :])
+        sig_floor = dx if mode == "sealed" else state.eps.eps_range[None, :]
+        sig1_safe = np.maximum(sig1_win, sig_floor)
+        sig2_safe = np.maximum(sig2_win, sig_floor)
 
         z1 = (x[None, None, :] - mu1[:, :, None]) / sig1_safe[:, :, None]
         z2 = (x[None, None, :] - mu2[:, :, None]) / sig2_safe[:, :, None]
 
         pdf1 = np.exp(-0.5 * z1 * z1) / (sig1_safe[:, :, None] * SQRT_2PI)
         pdf2 = np.exp(-0.5 * z2 * z2) / (sig2_safe[:, :, None] * SQRT_2PI)
+        pdf1 = np.where(np.isfinite(pdf1), pdf1, 0.0)
+        pdf2 = np.where(np.isfinite(pdf2), pdf2, 0.0)
 
         mix = w1_win[:, :, None] * pdf1 + w2_win[:, :, None] * pdf2
+        mix = np.where(np.isfinite(mix), mix, 0.0)
 
         # Normalize each candle-injection over x-grid (mass conservation).
         mix_sum = np.sum(mix, axis=2) * dx
+        mix_sum = np.where(np.isfinite(mix_sum), mix_sum, 0.0)
         mix = np.divide(
             mix,
             mix_sum[:, :, None] + state.eps.eps_pdf,
             out=np.zeros_like(mix),
             where=(mix_sum[:, :, None] > 0.0),
         )
+        mix = np.where(np.isfinite(mix), mix, 0.0)
 
         # Robust capped profile volume (Section 9.2): V_prof = min(V, cap_eff)
-        vprof_win = np.minimum(vol_win, np.maximum(cap_win, 0.0))
-        vol_weight = vprof_win * np.maximum(rvol_win, 0.0)
+        vprof_win = np.minimum(vol_win, cap_win_eff)
+        vol_weight = np.where(valid_win, vprof_win * np.maximum(rvol_win, 0.0), 0.0)
         mass = vol_weight[:, :, None] * mix
 
         # Apply bar validity mask.
         mass = np.where(valid_win[:, :, None], mass, 0.0)
+        mass = np.where(np.isfinite(mass), mass, 0.0)
 
         vp_t = np.sum(mass, axis=0)  # (A, B)
+        vp_t = np.where(np.isfinite(vp_t), vp_t, 0.0)
 
         # Hybrid Delta (Section 10.1/10.2 paper constants):
         # pSR_buy = sigmoid(ln(9) * r_norm / s_r), pCLV_buy = sigmoid(6 * CLV)
         # p_buy = w_trend * pSR_buy + (1-w_trend) * pCLV_buy, w_trend=body_pct
         # signed blend = 2*p_buy - 1
-        p_sr_buy = _sigmoid(
-            float(np.log(9.0)) * ret_norm_win / (s_r_win + state.eps.eps_div[None, :])
-        )
+        if mode == "sealed":
+            r_k = np.zeros_like(close_win, dtype=np.float64)
+            valid_ret = valid_win[1:] & valid_win[:-1] & np.isfinite(close_win[1:]) & np.isfinite(close_win[:-1])
+            numer = close_win[1:] - close_win[:-1]
+            denom_r = atr_t[None, :] + state.eps.eps_div[None, :]
+            r_k[1:] = np.where(valid_ret, numer / denom_r, 0.0)
+            med_r = np.nanmedian(np.where(valid_win, r_k, np.nan), axis=0)
+            sr = 1.4826 * np.nanmedian(np.abs(np.where(valid_win, r_k, np.nan) - med_r[None, :]), axis=0)
+            s_eff_r = np.maximum(np.where(np.isfinite(sr), sr, 0.0), 0.5 * dx)
+            k_r = float(np.log(9.0)) / (s_eff_r + state.eps.eps_pdf)
+            p_sr_buy = _sigmoid(k_r[None, :] * r_k)
+        else:
+            p_sr_buy = _sigmoid(
+                float(np.log(9.0)) * ret_norm_win / (s_r_win + state.eps.eps_div[None, :])
+            )
         p_clv_buy = _sigmoid(6.0 * clv_win)
         w_trend = np.clip(body_pct_win, 0.0, 1.0)
         p_buy = w_trend * p_sr_buy + (1.0 - w_trend) * p_clv_buy
         p_buy = np.clip(p_buy, 0.0, 1.0)
         signed_blend = 2.0 * p_buy - 1.0
+        signed_blend = np.where(np.isfinite(signed_blend), signed_blend, 0.0)
         vpd_t = np.sum(mass * signed_blend[:, :, None], axis=0)
+        vpd_t = np.where(np.isfinite(vpd_t), vpd_t, 0.0)
 
         # Force non-tradable assets to zero profile at this t.
         vp_t[~tradable_t] = 0.0
@@ -889,11 +1121,12 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
         wpoc = 1.0 - A_aff
         delta_eff = wpoc * delta_poc + (1.0 - wpoc) * delta0
 
-        ipoc, ivah, ival = _compute_value_area_idx_offsetscan(
+        ipoc, ivah, ival = compute_value_area_greedy(
             vp_ab=vp_t,
             ipoc_a=ipoc,
+            x_grid=x,
             va_threshold=float(cfg.va_threshold),
-            offsets_b=va_offsets,
+            eps_vol=float(state.eps.eps_vol),
         )
 
         # Write channels for tradable assets only.
@@ -952,7 +1185,7 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
         mask_t = computed_mask[t]
         if not np.any(mask_t):
             continue
-        if t == 0 or state.reset_flag[t] == 1:
+        if t == 0 or state.reset_flag[t] == 1 or state.session_id[t] != state.session_id[t - 1]:
             d_delta[t, mask_t] = 0.0
         else:
             prev = delta_eff_all[t - 1]
@@ -963,7 +1196,7 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
 
     sigma_delta = np.full((T, A), np.nan, dtype=np.float64)
     sid = state.session_id
-    starts = np.where(np.r_[True, sid[1:] != sid[:-1]])[0]
+    starts = np.where(np.r_[True, (sid[1:] != sid[:-1]) | (state.reset_flag[1:] == 1)])[0]
     ends = np.r_[starts[1:], T]
 
     for s, e in zip(starts.tolist(), ends.tolist()):
@@ -1040,6 +1273,10 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
     sc_rej_l[valid_post] = score_rej_long[valid_post]
     sc_rej_s[valid_post] = score_rej_short[valid_post]
 
+    warmup_rows = state.phase == np.int8(Phase.WARMUP)
+    if np.any(warmup_rows):
+        state.scores[warmup_rows] = 0.0
+
     if cfg.fail_on_non_finite_output:
         arr_sc = state.scores[valid_post]
         if arr_sc.size and not np.all(np.isfinite(arr_sc)):
@@ -1052,6 +1289,17 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
         # Keep outputs NaN where RVOL baseline was unavailable.
         state.profile_stats[bad_mask] = np.nan
         state.scores[bad_mask] = np.nan
+
+    # Deterministic neutralization for invalid source bars.
+    invalid_mask = ~state.bar_valid
+    if np.any(invalid_mask):
+        state.vp[invalid_mask] = 0.0
+        state.vp_delta[invalid_mask] = 0.0
+        state.scores[invalid_mask] = 0.0
+        state.profile_stats[invalid_mask] = 0.0
+        state.profile_stats[invalid_mask, int(ProfileStatIdx.IPOC)] = float(idx_zero)
+        state.profile_stats[invalid_mask, int(ProfileStatIdx.IVAH)] = float(idx_zero)
+        state.profile_stats[invalid_mask, int(ProfileStatIdx.IVAL)] = float(idx_zero)
 
     # Final hard checks.
     _assert_finite("vp", state.vp)
