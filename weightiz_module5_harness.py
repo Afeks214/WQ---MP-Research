@@ -21,17 +21,22 @@ Architecture map:
 
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 import copy
 import hashlib
 import itertools
 import json
+import multiprocessing as mp
 import os
 from pathlib import Path
+import signal
 import subprocess
+import sys
+import time
 import traceback
+import warnings
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -53,7 +58,14 @@ from weightiz_module1_core import (
     validate_state_hard,
 )
 from weightiz_module2_core import Module2Config, run_weightiz_profile_engine
-from weightiz_module3_structure import ContextIdx, Module3Config, Module3Output, run_module3_structural_aggregation
+from weightiz_module3_structure import (
+    IB_MISSING_POLICY,
+    IB_POLICY_NO_TRADE,
+    ContextIdx,
+    Module3Config,
+    Module3Output,
+    run_module3_structural_aggregation,
+)
 from weightiz_module4_strategy_funnel import Module4Config, Module4Output, RegimeIdx, run_module4_strategy_funnel
 from weightiz_module5_stats import (
     deflated_sharpe_ratio,
@@ -63,6 +75,8 @@ from weightiz_module5_stats import (
     spa_test,
     white_reality_check,
 )
+from weightiz_dq import DQ_ACCEPT, DQ_DEGRADE, DQ_REJECT, dq_apply, dq_validate
+from weightiz_invariants import assert_or_flag_finite
 
 
 ROBUSTNESS_CAPS: dict[str, float] = {
@@ -171,6 +185,62 @@ class _GroupTask:
 _WORKER_CONTEXT: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class _QuickRunSettings:
+    enabled: bool
+    task_timeout_sec: int
+    progress_every_groups: int
+    baseline_only: bool
+    disable_cpcv: bool
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return bool(default)
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "t", "on"}
+
+
+def _quick_run_settings_from_env() -> _QuickRunSettings:
+    enabled = _env_flag("QUICK_RUN", default=False)
+    timeout_raw = str(os.environ.get("QUICK_RUN_TASK_TIMEOUT_SEC", "120")).strip()
+    progress_raw = str(os.environ.get("QUICK_RUN_PROGRESS_EVERY", "1")).strip()
+    try:
+        timeout_sec = max(1, int(timeout_raw))
+    except Exception:
+        timeout_sec = 120
+    try:
+        progress_every = max(1, int(progress_raw))
+    except Exception:
+        progress_every = 1
+    return _QuickRunSettings(
+        enabled=bool(enabled),
+        task_timeout_sec=int(timeout_sec),
+        progress_every_groups=int(progress_every),
+        baseline_only=True,
+        disable_cpcv=True,
+    )
+
+
+def _run_with_timeout_alarm(seconds: int, fn: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    sec = int(max(0, seconds))
+    if sec <= 0 or not hasattr(signal, "setitimer"):
+        return fn()
+
+    old_handler = signal.getsignal(signal.SIGALRM)
+
+    def _handler(_signum: int, _frame: Any) -> None:
+        raise TimeoutError(f"quick_run_task_timeout>{sec}s")
+
+    signal.signal(signal.SIGALRM, _handler)
+    signal.setitimer(signal.ITIMER_REAL, float(sec))
+    try:
+        return fn()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
 def _require_pandas() -> Any:
     if pd is None:
         raise RuntimeError("pandas is required for Module 5 harness IO/export boundary")
@@ -231,6 +301,8 @@ def _record_deadletter(path: Path, row: dict[str, Any]) -> None:
         "error_hash": str(row.get("error_hash", "")),
         "error_msg": str(row.get("error", "")),
         "traceback_preview": str(row.get("traceback", ""))[:800],
+        "exception_signature": str(row.get("exception_signature", "")),
+        "reason_codes": sorted([str(x) for x in row.get("quality_reason_codes", [])]),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
@@ -253,6 +325,94 @@ def _should_abort_run(
     return False, ""
 
 
+def _normalized_top_frame(traceback_text: str) -> str:
+    tb = str(traceback_text or "")
+    lines = [ln.strip() for ln in tb.splitlines() if ln.strip()]
+    frame_lines = [ln for ln in lines if ln.startswith('File "') and ", line " in ln and ", in " in ln]
+    if not frame_lines:
+        return "unknown:0:unknown"
+    ln = frame_lines[-1]
+    # Format: File "...", line N, in FUNC
+    try:
+        p1 = ln.split('File "', 1)[1]
+        path_part, rest = p1.split('", line ', 1)
+        line_part, func_part = rest.split(", in ", 1)
+        base = os.path.basename(path_part)
+        lineno = int(line_part.strip())
+        fn = func_part.strip()
+        return f"{base}:{lineno}:{fn}"
+    except Exception:
+        return "unknown:0:unknown"
+
+
+def _exception_signature(row: dict[str, Any]) -> tuple[str, str]:
+    et = str(row.get("error_type", "")).strip() or "RuntimeError"
+    top = str(row.get("top_frame", "")).strip()
+    if not top:
+        top = _normalized_top_frame(str(row.get("traceback", "")))
+    return (et, top)
+
+
+def _is_localized_reason_codes(reason_codes: list[str]) -> bool:
+    rc = [str(x) for x in reason_codes]
+    return any(
+        c.startswith("DQ_")
+        or c.startswith("INVARIANT_")
+        or ("IB_MISSING" in c)
+        or c == "TIMEOUT"
+        for c in rc
+    )
+
+
+def _is_high_suspicion_exception(error_type: str) -> bool:
+    return str(error_type) in {"ImportError", "TypeError", "KeyError", "IndexError"}
+
+
+def _update_failure_tracker(
+    tracker: dict[tuple[str, str], dict[str, set[str] | bool]],
+    row: dict[str, Any],
+) -> tuple[tuple[str, str], dict[str, set[str] | bool]]:
+    sig = _exception_signature(row)
+    rec = tracker.setdefault(
+        sig,
+        {
+            "units": set(),
+            "assets": set(),
+            "candidates": set(),
+            "high_suspicion": _is_high_suspicion_exception(sig[0]),
+        },
+    )
+    rec["units"].add(str(row.get("task_id", "")))
+    rec["candidates"].add(str(row.get("candidate_id", "")))
+    assets = [str(x) for x in row.get("asset_keys", [])]
+    for a in assets:
+        rec["assets"].add(a)
+    return sig, rec
+
+
+def _should_abort_systemic(
+    tracker: dict[tuple[str, str], dict[str, set[str] | bool]],
+    row: dict[str, Any],
+) -> tuple[bool, str]:
+    if _is_localized_reason_codes([str(x) for x in row.get("quality_reason_codes", [])]):
+        return False, ""
+    sig = _exception_signature(row)
+    rec = tracker.get(sig)
+    if rec is None:
+        return False, ""
+    n_units = len(rec["units"])
+    n_assets = len(rec["assets"])
+    n_candidates = len(rec["candidates"])
+    if n_units >= 3 and n_assets >= 2 and n_candidates >= 2:
+        suspicion = "high" if bool(rec.get("high_suspicion", False)) else "standard"
+        reason = (
+            f"systemic_exception signature={sig[0]}|{sig[1]} "
+            f"units={n_units} assets={n_assets} candidates={n_candidates} suspicion={suspicion}"
+        )
+        return True, reason
+    return False, ""
+
+
 def _is_large_payload_safe(tasks: list[_GroupTask], threshold_bytes: int) -> tuple[bool, int]:
     import pickle
 
@@ -262,6 +422,22 @@ def _is_large_payload_safe(tasks: list[_GroupTask], threshold_bytes: int) -> tup
     sizes = [len(pickle.dumps(t, protocol=pickle.HIGHEST_PROTOCOL)) for t in sample]
     mx = int(max(sizes))
     return bool(mx <= int(threshold_bytes)), mx
+
+
+def _resolve_mp_context() -> tuple[Any, str]:
+    """
+    Deterministic process start policy:
+    - honor WEIGHTIZ_MP_START_METHOD when explicitly set to spawn|fork|forkserver
+    - default to fork on macOS to avoid large spawn bootstrap stalls
+    - otherwise use interpreter default
+    """
+    forced = str(os.environ.get("WEIGHTIZ_MP_START_METHOD", "")).strip().lower()
+    if forced in {"spawn", "fork", "forkserver"}:
+        return mp.get_context(forced), forced
+    if sys.platform == "darwin":
+        return mp.get_context("fork"), "fork"
+    default_method = str(mp.get_start_method(allow_none=True) or "spawn")
+    return mp.get_context(default_method), default_method
 
 
 def _safe_execute_task(
@@ -281,6 +457,11 @@ def _safe_execute_task(
         err_msg = str(exc)
         err_hash = _error_hash(err_type, err_msg)
         tb = traceback.format_exc()
+        top_frame = _normalized_top_frame(tb)
+        sig = f"{err_type}|{top_frame}"
+        reason_codes: list[str] = []
+        if isinstance(exc, TimeoutError):
+            reason_codes.append("TIMEOUT")
         out: list[dict[str, Any]] = []
         for ci in group.candidate_indices:
             c = candidates[int(ci)]
@@ -297,6 +478,8 @@ def _safe_execute_task(
                     "error_hash": err_hash,
                     "error": f"{err_type}: {err_msg}",
                     "traceback": tb,
+                    "top_frame": top_frame,
+                    "exception_signature": sig,
                     "session_ids": np.zeros(0, dtype=np.int64),
                     "daily_returns": np.zeros(0, dtype=np.float64),
                     "equity_payload": None,
@@ -311,6 +494,10 @@ def _safe_execute_task(
                     "tags": list(c.tags),
                     "test_days": 0,
                     "task_seed": int(t_seed),
+                    "asset_keys": [],
+                    "quality_reason_codes": sorted(reason_codes),
+                    "dqs_min": 0.0,
+                    "dqs_median": 0.0,
                 }
             )
         return out
@@ -327,6 +514,15 @@ def _init_worker_context(
     harness_cfg: Module5HarnessConfig,
 ) -> None:
     global _WORKER_CONTEXT
+    repo_root = str(Path(__file__).resolve().parent)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    # Keep worker BLAS/Arrow threading deterministic and avoid nested oversubscription.
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("ARROW_NUM_THREADS", "1")
     _WORKER_CONTEXT = {
         "base_state": base_state,
         "candidates": candidates,
@@ -378,6 +574,7 @@ def _clone_m3(m3: Module3Output) -> Module3Output:
         context_tac=m3.context_tac.copy(),
         context_valid_ta=m3.context_valid_ta.copy(),
         context_source_t_index_ta=m3.context_source_t_index_ta.copy(),
+        ib_defined_ta=None if m3.ib_defined_ta is None else m3.ib_defined_ta.copy(),
     )
 
 
@@ -419,22 +616,33 @@ def _load_asset_frame(path: str, tz_name: str) -> Any:
     else:
         df = pdx.read_csv(p)
 
-    ts_col = _find_col(df, ("timestamp", "ts", "datetime", "date", "time"), "timestamp")
+    ts_col = None
+    cols = {str(c).strip().lower(): str(c) for c in df.columns}
+    for cand in ("timestamp", "ts", "datetime", "date", "time"):
+        if cand in cols:
+            ts_col = cols[cand]
+            break
     o_col = _find_col(df, ("open", "o"), "open")
     h_col = _find_col(df, ("high", "h"), "high")
     l_col = _find_col(df, ("low", "l"), "low")
     c_col = _find_col(df, ("close", "c"), "close")
     v_col = _find_col(df, ("volume", "vol", "v"), "volume")
 
-    ts = pdx.to_datetime(df[ts_col], utc=True, errors="coerce")
-    keep = ts.notna().to_numpy(dtype=bool)
+    if ts_col is not None:
+        ts_raw = pdx.to_datetime(df[ts_col], utc=True, errors="coerce")
+    elif isinstance(df.index, pdx.DatetimeIndex):
+        ts_raw = pdx.to_datetime(df.index, utc=True, errors="coerce")
+    else:
+        raise RuntimeError(f"Missing required column 'timestamp' in input file and index is not DatetimeIndex: {path}")
+    ts_idx = pdx.DatetimeIndex(ts_raw)
+    keep = np.asarray(ts_idx.notna(), dtype=bool)
     if not np.any(keep):
         raise RuntimeError(f"No parseable timestamps in {path}")
 
     out = pdx.DataFrame(
         {
             # Keep canonical UTC time on the IO boundary.
-            "timestamp": ts[keep].dt.floor("min"),
+            "timestamp": ts_idx[keep].floor("min"),
             "open": pdx.to_numeric(df.loc[keep, o_col], errors="coerce"),
             "high": pdx.to_numeric(df.loc[keep, h_col], errors="coerce"),
             "low": pdx.to_numeric(df.loc[keep, l_col], errors="coerce"),
@@ -587,7 +795,7 @@ def _ingest_master_aligned(
     engine_cfg: EngineConfig,
     harness_cfg: Module5HarnessConfig,
     data_loader_func: Callable[[str, str], Any] | None = None,
-) -> tuple[TensorState, np.ndarray, list[str], np.ndarray, dict[str, Any], np.ndarray]:
+) -> tuple[TensorState, np.ndarray, list[str], np.ndarray, dict[str, Any], np.ndarray, dict[str, Any]]:
     if len(data_paths) != len(symbols):
         raise RuntimeError("data_paths and symbols lengths must match")
 
@@ -596,10 +804,30 @@ def _ingest_master_aligned(
     loader = data_loader_func if data_loader_func is not None else _load_asset_frame
 
     raw_frames: list[Any] = []
+    dq_day_reports: list[dict[str, Any]] = []
+    dq_bar_flags_rows: list[dict[str, Any]] = []
     for a, p in enumerate(data_paths):
         fr = loader(p, harness_cfg.timezone)
-        idx_utc = _validate_utc_minute_index(fr.index, f"asset={symbols[a]} path={p}")
-        fr2 = fr.copy()
+        dq_reports = dq_validate(
+            df=fr,
+            symbol=str(symbols[a]),
+            tz_name=str(harness_cfg.timezone),
+            session_open_minute=int(engine_cfg.rth_open_minute),
+            session_close_minute=int(engine_cfg.flat_time_minute),
+            timeframe_min=None,
+        )
+        fr_repaired, dq_reports_out, dq_bar_flags = dq_apply(
+            df=fr,
+            reports=dq_reports,
+            tz_name=str(harness_cfg.timezone),
+        )
+
+        dq_day_reports.extend([r.to_row() for r in dq_reports_out])
+        if dq_bar_flags.shape[0] > 0:
+            dq_bar_flags_rows.extend(dq_bar_flags.to_dict(orient="records"))
+
+        idx_utc = _validate_utc_minute_index(fr_repaired.index, f"asset={symbols[a]} path={p}")
+        fr2 = fr_repaired.copy()
         fr2.index = idx_utc
         raw_frames.append(fr2)
 
@@ -616,6 +844,7 @@ def _ingest_master_aligned(
     low_ta = np.full((T, A0), np.nan, dtype=np.float64)
     close_ta = np.full((T, A0), np.nan, dtype=np.float64)
     vol_ta = np.full((T, A0), np.nan, dtype=np.float64)
+    dqs_ta = np.full((T, A0), 1.0, dtype=np.float64)
 
     for a, fr in enumerate(raw_frames):
         re = fr.reindex(master_idx)
@@ -624,6 +853,9 @@ def _ingest_master_aligned(
         low_ta[:, a] = re["low"].to_numpy(dtype=np.float64)
         close_ta[:, a] = re["close"].to_numpy(dtype=np.float64)
         vol_ta[:, a] = re["volume"].to_numpy(dtype=np.float64)
+        if "dqs_day" in re.columns:
+            dqs_col = pdx.to_numeric(re["dqs_day"], errors="coerce").to_numpy(dtype=np.float64)
+            dqs_ta[:, a] = np.where(np.isfinite(dqs_col), dqs_col, 1.0)
 
     bar_valid_ta = _compute_bar_valid(open_ta, high_ta, low_ta, close_ta, vol_ta)
     coverage = np.mean(bar_valid_ta, axis=0)
@@ -648,6 +880,7 @@ def _ingest_master_aligned(
     low_keep = low_ta[:, keep_idx]
     close_keep = close_ta[:, keep_idx]
     vol_keep = vol_ta[:, keep_idx]
+    dqs_keep = dqs_ta[:, keep_idx]
     bar_keep = bar_valid_ta[:, keep_idx]
     tick_keep = tick[keep_idx]
 
@@ -674,6 +907,7 @@ def _ingest_master_aligned(
     state.close_px[:, :] = close_keep
     state.volume[:, :] = vol_keep
     state.bar_valid[:, :] = bar_keep
+    state.dqs_day_ta = dqs_keep.copy()
 
     # Required finite placeholders for Module 1 slice validation; Module 2 overwrites causally.
     atr0 = np.maximum(4.0 * tick_keep[None, :], 1e-12)
@@ -689,9 +923,20 @@ def _ingest_master_aligned(
         "assets_kept": int(keep_idx.size),
         "coverage": coverage.tolist(),
         "symbols_kept": keep_symbols,
+        "dq_counts": {
+            "accept": int(sum(1 for r in dq_day_reports if str(r.get("decision")) == DQ_ACCEPT)),
+            "degrade": int(sum(1 for r in dq_day_reports if str(r.get("decision")) == DQ_DEGRADE)),
+            "reject": int(sum(1 for r in dq_day_reports if str(r.get("decision")) == DQ_REJECT)),
+            "n_days_total": int(len(dq_day_reports)),
+        },
     }
 
-    return state, keep_idx, keep_symbols, master_idx.asi8.astype(np.int64), ingest_meta, tick_keep
+    dq_bundle = {
+        "day_reports": dq_day_reports,
+        "bar_flags_rows": dq_bar_flags_rows,
+    }
+
+    return state, keep_idx, keep_symbols, master_idx.asi8.astype(np.int64), ingest_meta, tick_keep, dq_bundle
 
 
 def _session_bounds(session_id: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -861,6 +1106,40 @@ def _generate_cpcv_splits(state: TensorState, cfg: Module5HarnessConfig) -> list
         )
 
     return out
+
+
+def _generate_quick_fallback_split(state: TensorState, cfg: Module5HarnessConfig) -> list[SplitSpec]:
+    T = int(state.cfg.T)
+    if T < 2:
+        return []
+    cut = int(max(1, min(T - 1, T // 2)))
+    tr_idx = np.arange(0, cut, dtype=np.int64)
+    te_idx = np.arange(cut, T, dtype=np.int64)
+    tr_idx, te_idx, purge_idx, embargo_idx = _apply_purge_embargo(
+        tr_idx,
+        te_idx,
+        T,
+        int(max(0, cfg.purge_bars)),
+        int(max(0, cfg.embargo_bars)),
+    )
+    if tr_idx.size == 0 or te_idx.size == 0:
+        return []
+    sid = state.session_id.astype(np.int64)
+    return [
+        SplitSpec(
+            split_id="wf_quick_000",
+            mode="wf",
+            train_idx=tr_idx,
+            test_idx=te_idx,
+            purge_idx=purge_idx,
+            embargo_idx=embargo_idx,
+            session_train_bounds=(int(np.min(sid[tr_idx])), int(np.max(sid[tr_idx]))),
+            session_test_bounds=(int(np.min(sid[te_idx])), int(np.max(sid[te_idx]))),
+            purge_bars=int(max(0, cfg.purge_bars)),
+            embargo_bars=int(max(0, cfg.embargo_bars)),
+            total_bars=T,
+        )
+    ]
 
 
 def _validate_split(spec: SplitSpec, enforce_guard: bool) -> None:
@@ -1077,8 +1356,10 @@ def _apply_jitter(
 
     # Re-enforce OHLC ordering after noise.
     stacked = np.stack([state.open_px, state.high_px, state.low_px, state.close_px], axis=2)
-    hi = np.nanmax(stacked, axis=2)
-    lo = np.nanmin(stacked, axis=2)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="All-NaN slice encountered", category=RuntimeWarning)
+        hi = np.nanmax(stacked, axis=2)
+        lo = np.nanmin(stacked, axis=2)
     state.high_px = np.where(mask, hi, state.high_px)
     state.low_px = np.where(mask, lo, state.low_px)
 
@@ -1129,6 +1410,96 @@ def _assert_placeholder_consistency(state: TensorState) -> None:
         raise RuntimeError(
             f"atr_floor must be NaN on invalid bars; first_offending_index={[int(bad[0]), int(bad[1])]}"
         )
+
+
+def _apply_post_m2_invariants(state: TensorState, active_t: np.ndarray) -> list[str]:
+    scope = np.asarray(active_t, dtype=bool)[:, None] & np.asarray(state.bar_valid, dtype=bool)
+    updated, flags = assert_or_flag_finite(
+        features={
+            "profile_stats": np.asarray(state.profile_stats, dtype=np.float64),
+            "scores": np.asarray(state.scores, dtype=np.float64),
+        },
+        valid_mask=scope,
+        context="post_m2",
+    )
+    state.bar_valid[:, :] = np.where(scope, updated, state.bar_valid)
+    _set_placeholders_from_bar_valid(state)
+    return ["INVARIANT_POST_M2_NONFINITE"] if int(flags.get("invalid_count", 0)) > 0 else []
+
+
+def _apply_post_m3_invariants(m3: Module3Output) -> list[str]:
+    reasons: list[str] = []
+    block_updated, block_flags = assert_or_flag_finite(
+        features={"block_features_tak": np.asarray(m3.block_features_tak, dtype=np.float64)},
+        valid_mask=np.asarray(m3.block_valid_ta, dtype=bool),
+        context="post_m3_block",
+    )
+    m3.block_valid_ta[:, :] = block_updated
+    if int(block_flags.get("invalid_count", 0)) > 0:
+        reasons.append("INVARIANT_POST_M3_BLOCK_NONFINITE")
+
+    ctx_updated, ctx_flags = assert_or_flag_finite(
+        features={"context_tac": np.asarray(m3.context_tac, dtype=np.float64)},
+        valid_mask=np.asarray(m3.context_valid_ta, dtype=bool),
+        context="post_m3_context",
+    )
+    m3.context_valid_ta[:, :] = ctx_updated
+    m3.context_source_t_index_ta[:, :] = np.where(m3.context_valid_ta, m3.context_source_t_index_ta, -1)
+    m3.context_tac[:, :, :] = np.where(m3.context_valid_ta[:, :, None], m3.context_tac, np.nan)
+    if int(ctx_flags.get("invalid_count", 0)) > 0:
+        reasons.append("INVARIANT_POST_M3_CONTEXT_NONFINITE")
+
+    if (m3.ib_defined_ta is not None) and (str(IB_MISSING_POLICY).upper().strip() == str(IB_POLICY_NO_TRADE)):
+        ib_ok = np.asarray(m3.ib_defined_ta, dtype=bool)
+        before = np.asarray(m3.block_valid_ta, dtype=bool)
+        after = before & ib_ok
+        if int(np.sum(before & (~after))) > 0:
+            reasons.append("IB_MISSING_NO_TRADE")
+        m3.block_valid_ta[:, :] = after
+
+    return sorted(set(reasons))
+
+
+def _apply_pre_m4_invariants(state: TensorState, m3: Module3Output) -> list[str]:
+    reasons: list[str] = []
+    updated_bar, bar_flags = assert_or_flag_finite(
+        features={
+            "open_px": np.asarray(state.open_px, dtype=np.float64),
+            "high_px": np.asarray(state.high_px, dtype=np.float64),
+            "low_px": np.asarray(state.low_px, dtype=np.float64),
+            "close_px": np.asarray(state.close_px, dtype=np.float64),
+            "volume": np.asarray(state.volume, dtype=np.float64),
+            "profile_stats": np.asarray(state.profile_stats, dtype=np.float64),
+            "scores": np.asarray(state.scores, dtype=np.float64),
+        },
+        valid_mask=np.asarray(state.bar_valid, dtype=bool),
+        context="pre_m4_state",
+    )
+    if int(bar_flags.get("invalid_count", 0)) > 0:
+        reasons.append("INVARIANT_PRE_M4_STATE_NONFINITE")
+    state.bar_valid[:, :] = updated_bar
+    _set_placeholders_from_bar_valid(state)
+
+    updated_ctx, ctx_flags = assert_or_flag_finite(
+        features={"context_tac": np.asarray(m3.context_tac, dtype=np.float64)},
+        valid_mask=np.asarray(m3.context_valid_ta, dtype=bool),
+        context="pre_m4_context",
+    )
+    if int(ctx_flags.get("invalid_count", 0)) > 0:
+        reasons.append("INVARIANT_PRE_M4_CONTEXT_NONFINITE")
+    m3.context_valid_ta[:, :] = updated_ctx
+    m3.context_source_t_index_ta[:, :] = np.where(m3.context_valid_ta, m3.context_source_t_index_ta, -1)
+    m3.context_tac[:, :, :] = np.where(m3.context_valid_ta[:, :, None], m3.context_tac, np.nan)
+
+    if (m3.ib_defined_ta is not None) and (str(IB_MISSING_POLICY).upper().strip() == str(IB_POLICY_NO_TRADE)):
+        ib_ok = np.asarray(m3.ib_defined_ta, dtype=bool)
+        before = np.asarray(m3.block_valid_ta, dtype=bool)
+        after = before & ib_ok
+        if int(np.sum(before & (~after))) > 0:
+            reasons.append("IB_MISSING_NO_TRADE")
+        m3.block_valid_ta[:, :] = after
+
+    return sorted(set(reasons))
 
 
 def _assert_active_domain_ohlc(state: TensorState, active_t: np.ndarray) -> None:
@@ -1206,6 +1577,8 @@ def _apply_enabled_assets(state: TensorState, m3: Module3Output, enabled_mask: n
     m3.context_tac[:, off, :] = np.nan
     m3.context_valid_ta[:, off] = False
     m3.context_source_t_index_ta[:, off] = -1
+    if m3.ib_defined_ta is not None:
+        m3.ib_defined_ta[:, off] = False
 
 
 def _candidate_daily_returns_close_to_close(
@@ -1443,6 +1816,37 @@ def _build_group_tasks(
                 candidate_indices=cand_idx,
             )
         )
+    return out
+
+
+def _split_group_tasks_by_candidate(
+    group_tasks: list[_GroupTask],
+    chunk_size: int = 1,
+) -> list[_GroupTask]:
+    """
+    Deterministic process-pool chunking:
+    split large grouped candidate batches into fixed-size chunks so
+    progress/checkpoints advance earlier under heavy compute.
+    """
+    n = int(max(1, chunk_size))
+    out: list[_GroupTask] = []
+    for g in group_tasks:
+        cand = tuple(sorted(int(x) for x in g.candidate_indices))
+        if len(cand) <= n:
+            out.append(g)
+            continue
+        for i in range(0, len(cand), n):
+            part = tuple(cand[i : i + n])
+            out.append(
+                _GroupTask(
+                    group_id=f"{g.group_id}_p{i // n:03d}",
+                    split_idx=int(g.split_idx),
+                    scenario_idx=int(g.scenario_idx),
+                    m2_idx=int(g.m2_idx),
+                    m3_idx=int(g.m3_idx),
+                    candidate_indices=part,
+                )
+            )
     return out
 
 
@@ -1826,7 +2230,9 @@ def _run_group_task(
         _validate_loaded_market_slice_active_domain(cached_state, active_t)
 
     run_weightiz_profile_engine(cached_state, m2_configs[group.m2_idx])
+    post_m2_reasons = _apply_post_m2_invariants(cached_state, active_t)
     m3_out_cached = run_module3_structural_aggregation(cached_state, m3_configs[group.m3_idx])
+    post_m3_reasons = _apply_post_m3_invariants(m3_out_cached)
 
     outputs: list[dict[str, Any]] = []
 
@@ -1846,6 +2252,20 @@ def _run_group_task(
             st = _clone_state(cached_state)
             m3c = _clone_m3(m3_out_cached)
             _apply_enabled_assets(st, m3c, c.enabled_assets_mask)
+            pre_m4_reasons = _apply_pre_m4_invariants(st, m3c)
+            quality_reason_codes = sorted(set(post_m2_reasons + post_m3_reasons + pre_m4_reasons))
+            dqs_mat = np.asarray(getattr(st, "dqs_day_ta", np.ones((st.cfg.T, st.cfg.A), dtype=np.float64)), dtype=np.float64)
+            if dqs_mat.shape != (st.cfg.T, st.cfg.A):
+                raise RuntimeError(f"dqs_day_ta shape mismatch: got {dqs_mat.shape}, expected {(st.cfg.T, st.cfg.A)}")
+            dqs_scope = dqs_mat[np.asarray(st.bar_valid, dtype=bool)]
+            if dqs_scope.size <= 0:
+                dqs_scope = np.asarray([1.0], dtype=np.float64)
+            dqs_min = float(np.min(dqs_scope))
+            dqs_median = float(np.median(dqs_scope))
+            if dqs_min < 1.0:
+                quality_reason_codes = sorted(set(quality_reason_codes + ["DQ_DEGRADED_INPUT"]))
+            if dqs_min <= 0.0:
+                quality_reason_codes = sorted(set(quality_reason_codes + ["DQ_REJECTED_INPUT"]))
 
             m4_cfg = replace(
                 m4_configs[c.m4_idx],
@@ -1914,11 +2334,20 @@ def _run_group_task(
                     "tags": list(c.tags),
                     "test_days": int(daily_ret.shape[0]),
                     "task_seed": int(task_seed),
+                    "quality_reason_codes": quality_reason_codes,
+                    "asset_keys": [st.symbols[i] for i in np.flatnonzero(c.enabled_assets_mask).tolist()],
+                    "exception_signature": "",
+                    "dqs_min": dqs_min,
+                    "dqs_median": dqs_median,
                 }
             )
         except Exception as exc:
             err_type = type(exc).__name__
             err_msg = str(exc)
+            tb = traceback.format_exc()
+            top_frame = _normalized_top_frame(tb)
+            sig = f"{err_type}|{top_frame}"
+            asset_keys = [base_state.symbols[i] for i in np.flatnonzero(c.enabled_assets_mask).tolist()]
             outputs.append(
                 {
                     "task_id": task_id,
@@ -1929,7 +2358,9 @@ def _run_group_task(
                     "error_type": err_type,
                     "error_hash": _error_hash(err_type, err_msg),
                     "error": f"{err_type}: {err_msg}",
-                    "traceback": traceback.format_exc(),
+                    "traceback": tb,
+                    "top_frame": top_frame,
+                    "exception_signature": sig,
                     "session_ids": np.zeros(0, dtype=np.int64),
                     "daily_returns": np.zeros(0, dtype=np.float64),
                     "equity_payload": None,
@@ -1944,6 +2375,10 @@ def _run_group_task(
                     "tags": list(c.tags),
                     "test_days": 0,
                     "task_seed": int(task_seed),
+                    "quality_reason_codes": sorted(set(post_m2_reasons + post_m3_reasons)),
+                    "asset_keys": asset_keys,
+                    "dqs_min": 0.0,
+                    "dqs_median": 0.0,
                 }
             )
 
@@ -2189,14 +2624,13 @@ def _aggregate_candidate_baseline_matrix(
     if not baseline_candidate_ids:
         raise RuntimeError("No candidates have baseline daily returns for candidate-level stats")
 
-    common = set(bench_map.keys())
-    for cid in baseline_candidate_ids:
-        common &= set(scenario_series[cid]["baseline"].keys())
-
-    if not common:
-        raise RuntimeError("No common sessions across candidate baselines and benchmark")
-
-    common_sorted = np.asarray(sorted(common), dtype=np.int64)
+    # Institutional deterministic policy:
+    # build candidate daily matrix on the full post-DQ session domain (benchmark sessions),
+    # and fill missing candidate session observations with neutral 0.0 daily return.
+    # This prevents dropping valid no-trade days from the alignment matrix.
+    common_sorted = np.asarray(sorted(bench_map.keys()), dtype=np.int64)
+    if common_sorted.size <= 0:
+        raise RuntimeError("No benchmark sessions available for candidate alignment")
     D = int(common_sorted.size)
     C = int(len(baseline_candidate_ids))
     if D < int(min_days):
@@ -2205,7 +2639,7 @@ def _aggregate_candidate_baseline_matrix(
     mat = np.empty((D, C), dtype=np.float64)
     for j, cid in enumerate(baseline_candidate_ids):
         mp = scenario_series[cid]["baseline"]
-        mat[:, j] = np.asarray([mp[int(s)] for s in common_sorted.tolist()], dtype=np.float64)
+        mat[:, j] = np.asarray([float(mp.get(int(s), 0.0)) for s in common_sorted.tolist()], dtype=np.float64)
     bmk = np.asarray([bench_map[int(s)] for s in common_sorted.tolist()], dtype=np.float64)
 
     _assert_finite("candidate_daily_returns_matrix", mat)
@@ -2374,6 +2808,29 @@ def _build_candidate_artifacts(
             baseline_fail_reasons.append(
                 f"{str(er.get('split_id', ''))}:{str(er.get('error_type', 'error'))}"
             )
+        dqs_row_median = np.asarray(
+            [float(r.get("dqs_median", np.nan)) for r in rows_all],
+            dtype=np.float64,
+        )
+        dqs_row_min = np.asarray(
+            [float(r.get("dqs_min", np.nan)) for r in rows_all],
+            dtype=np.float64,
+        )
+        dqs_vals_med = dqs_row_median[np.isfinite(dqs_row_median)]
+        dqs_vals_min = dqs_row_min[np.isfinite(dqs_row_min)]
+        dqs_median = float(np.median(dqs_vals_med)) if dqs_vals_med.size > 0 else 1.0
+        dqs_min = float(np.min(dqs_vals_min)) if dqs_vals_min.size > 0 else 1.0
+        reason_codes_flat: list[str] = []
+        for rr in rows_all:
+            reason_codes_flat.extend([str(x) for x in rr.get("quality_reason_codes", [])])
+        dq_degrade_count = int(sum(1 for rr in rows_all if "DQ_DEGRADED_INPUT" in [str(x) for x in rr.get("quality_reason_codes", [])]))
+        dq_reject_count = int(sum(1 for rr in rows_all if "DQ_REJECTED_INPUT" in [str(x) for x in rr.get("quality_reason_codes", [])]))
+        if reason_codes_flat:
+            uniq = sorted(set(reason_codes_flat))
+            freq = {k: int(reason_codes_flat.count(k)) for k in uniq}
+            dq_reason_top = sorted(freq.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))[0][0]
+        else:
+            dq_reason_top = ""
         failed_candidate = len(baseline_fail_reasons) > 0
         for r in (rows_base if rows_base else rows):
             tr = np.asarray(r.get("daily_returns", np.zeros(0, dtype=np.float64)), dtype=np.float64)
@@ -2580,6 +3037,13 @@ def _build_candidate_artifacts(
                 "global_session_count": int(common_sessions.shape[0]),
                 "observed_baseline_session_count": int(len(baseline_map)),
             },
+            "dq_summary": {
+                "dq_min": float(dqs_min),
+                "dq_median": float(dqs_median),
+                "dq_degrade_count": int(dq_degrade_count),
+                "dq_reject_count": int(dq_reject_count),
+                "dq_reason_top": str(dq_reason_top),
+            },
         }
         _write_json(cdir / "candidate_metrics.json", candidate_metrics)
 
@@ -2603,6 +3067,11 @@ def _build_candidate_artifacts(
                 "robustness_score": robustness_score,
                 "failed": bool(failed_candidate),
                 "failure_reasons": "|".join(sorted(set(baseline_fail_reasons))),
+                "dq_min": float(dqs_min),
+                "dq_median": float(dqs_median),
+                "dq_degrade_count": int(dq_degrade_count),
+                "dq_reject_count": int(dq_reject_count),
+                "dq_reason_top": str(dq_reason_top),
                 "in_mcs": bool(verdict_row.get("in_mcs", False)),
                 "pass": bool(verdict_row.get("pass", False)),
                 "wrc_p": float(verdict_row.get("wrc_p", np.nan)) if verdict_row else np.nan,
@@ -2688,8 +3157,9 @@ def run_weightiz_harness(
     report_root = Path(harness_cfg.report_dir).resolve() / run_id
     report_root.mkdir(parents=True, exist_ok=True)
     deadletter_path = report_root / "deadletter_tasks.jsonl"
+    run_status_path = report_root / "run_status.json"
 
-    base_state, keep_idx, keep_symbols, master_ts_ns, ingest_meta, tick_keep = _ingest_master_aligned(
+    base_state, keep_idx, keep_symbols, master_ts_ns, ingest_meta, tick_keep, dq_bundle = _ingest_master_aligned(
         data_paths=data_paths,
         symbols=symbols,
         engine_cfg=engine_cfg,
@@ -2706,8 +3176,15 @@ def run_weightiz_harness(
         candidates = _normalize_candidate_specs(candidate_specs, keep_idx, A_filtered, A_input)
 
     candidates = sorted(candidates, key=lambda c: c.candidate_id)
+    quick_settings = _quick_run_settings_from_env()
 
-    splits = _generate_wf_splits(base_state, harness_cfg) + _generate_cpcv_splits(base_state, harness_cfg)
+    wf_splits = _generate_wf_splits(base_state, harness_cfg)
+    cpcv_splits = [] if quick_settings.disable_cpcv else _generate_cpcv_splits(base_state, harness_cfg)
+    splits = wf_splits + cpcv_splits
+    if quick_settings.enabled and wf_splits:
+        splits = [wf_splits[0]]
+    if quick_settings.enabled and not splits:
+        splits = _generate_quick_fallback_split(base_state, harness_cfg)
     if not splits:
         raise RuntimeError("No WF/CPCV splits generated; adjust harness split parameters")
 
@@ -2716,12 +3193,14 @@ def run_weightiz_harness(
 
     source_scenarios = stress_scenarios if stress_scenarios is not None else _default_stress_scenarios(harness_cfg)
     scenarios = [s for s in source_scenarios if s.enabled]
+    if quick_settings.enabled and quick_settings.baseline_only:
+        baseline = [s for s in scenarios if str(s.scenario_id) == "baseline"]
+        if baseline:
+            scenarios = [baseline[0]]
+        elif scenarios:
+            scenarios = [sorted(scenarios, key=lambda x: str(x.scenario_id))[0]]
     if not scenarios:
         raise RuntimeError("No enabled stress scenarios")
-
-    group_tasks = _build_group_tasks(candidates, splits, scenarios)
-    if not group_tasks:
-        raise RuntimeError("No group tasks generated")
 
     # RAM policy: reduce worker count if projected footprint is too high.
     avail = _available_memory_bytes()
@@ -2734,6 +3213,14 @@ def run_weightiz_harness(
         max_workers = max(1, budget // max(est_state, 1))
     max_workers = max(1, max_workers)
     process_pool_requested = bool(harness_cfg.parallel_backend == "process_pool" and requested_workers > 1)
+    if quick_settings.enabled:
+        process_pool_requested = False
+
+    group_tasks = _build_group_tasks(candidates, splits, scenarios)
+    if process_pool_requested:
+        group_tasks = _split_group_tasks_by_candidate(group_tasks, chunk_size=1)
+    if not group_tasks:
+        raise RuntimeError("No group tasks generated")
 
     all_results: list[dict[str, Any]] = []
     tasks_submitted = int(sum(len(g.candidate_indices) for g in group_tasks))
@@ -2745,6 +3232,28 @@ def run_weightiz_harness(
     first_exception_class = ""
     first_exception_message = ""
     first_exception_hash = ""
+    failure_tracker: dict[tuple[str, str], dict[str, set[str] | bool]] = {}
+    run_t0 = time.perf_counter()
+    checkpoint_every_groups = 10
+    pool_heartbeat_seconds = 5.0
+
+    def _write_run_status_checkpoint(phase: str, execution_mode_now: str) -> None:
+        elapsed = float(time.perf_counter() - run_t0)
+        _write_json(
+            run_status_path,
+            {
+                "run_id": run_id,
+                "phase": str(phase),
+                "execution_mode": str(execution_mode_now),
+                "groups_done": int(groups_completed),
+                "groups_total": int(len(group_tasks)),
+                "tasks_done": int(tasks_completed),
+                "tasks_total": int(tasks_submitted),
+                "failures_so_far": int(failure_count),
+                "elapsed_seconds": float(elapsed),
+                "updated_utc": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
     payload_safe, payload_arg_max_bytes = _is_large_payload_safe(
         group_tasks,
@@ -2753,7 +3262,9 @@ def run_weightiz_harness(
     ram_forces_serial = bool(process_pool_requested and max_workers <= 1)
     payload_forces_serial = bool(process_pool_requested and (not payload_safe))
 
-    if process_pool_requested and (not payload_forces_serial) and (not ram_forces_serial):
+    if quick_settings.enabled:
+        execution_mode = "serial_quick_run"
+    elif process_pool_requested and (not payload_forces_serial) and (not ram_forces_serial):
         execution_mode = "process_pool"
     elif payload_forces_serial:
         execution_mode = "serial_forced_payload"
@@ -2763,6 +3274,7 @@ def run_weightiz_harness(
     use_process_pool = execution_mode == "process_pool"
     effective_workers = int(max_workers if use_process_pool else 1)
     large_payload_passing_avoided = bool((not use_process_pool) or payload_safe)
+    _write_run_status_checkpoint("running", execution_mode)
 
     def _capture_first_exception(row: dict[str, Any]) -> None:
         nonlocal first_exception_class, first_exception_message, first_exception_hash
@@ -2777,9 +3289,12 @@ def run_weightiz_harness(
         first_exception_message = em or et
         first_exception_hash = eh or _error_hash(first_exception_class, first_exception_message)
 
+    mp_start_method = ""
     if use_process_pool:
+        mp_ctx, mp_start_method = _resolve_mp_context()
         with ProcessPoolExecutor(
             max_workers=effective_workers,
+            mp_context=mp_ctx,
             initializer=_init_worker_context,
             initargs=(
                 base_state,
@@ -2796,50 +3311,66 @@ def run_weightiz_harness(
             for g in group_tasks:
                 fut = ex.submit(_run_group_task_from_context, g)
                 futs[fut] = g
-            for fut in as_completed(list(futs.keys())):
-                g = futs[fut]
-                rows = _safe_execute_task(
-                    g,
-                    lambda _g: fut.result(),
-                    candidates=candidates,
-                    splits=splits,
-                    scenarios=scenarios,
-                    harness_cfg=harness_cfg,
+            pending = set(futs.keys())
+            while pending:
+                done, pending = wait(
+                    pending,
+                    timeout=float(pool_heartbeat_seconds),
+                    return_when=FIRST_COMPLETED,
                 )
-                all_results.extend(rows)
-                tasks_completed += int(len(rows))
-                groups_completed += 1
-                err_rows = [r for r in rows if str(r.get("status", "")) != "ok"]
-                failure_count += int(len(err_rows))
-                for er in err_rows:
-                    _capture_first_exception(er)
-                    _record_deadletter(deadletter_path, er)
-                abort_now, reason_now = _should_abort_run(
-                    failure_count=failure_count,
-                    total_tasks=tasks_completed,
-                    failure_rate_threshold=float(harness_cfg.failure_rate_abort_threshold),
-                    failure_count_threshold=int(harness_cfg.failure_count_abort_threshold),
-                )
-                if abort_now:
-                    aborted = True
-                    abort_reason = reason_now
-                    for rem in futs.keys():
-                        rem.cancel()
+                if not done:
+                    _write_run_status_checkpoint("running", execution_mode)
+                    continue
+                for fut in sorted(done, key=lambda f: str(futs[f].group_id)):
+                    g = futs[fut]
+                    rows = _safe_execute_task(
+                        g,
+                        lambda _g: fut.result(),
+                        candidates=candidates,
+                        splits=splits,
+                        scenarios=scenarios,
+                        harness_cfg=harness_cfg,
+                    )
+                    all_results.extend(rows)
+                    tasks_completed += int(len(rows))
+                    groups_completed += 1
+                    err_rows = [r for r in rows if str(r.get("status", "")) != "ok"]
+                    failure_count += int(len(err_rows))
+                    for er in err_rows:
+                        _capture_first_exception(er)
+                        _update_failure_tracker(failure_tracker, er)
+                        _record_deadletter(deadletter_path, er)
+                        abort_now, reason_now = _should_abort_systemic(failure_tracker, er)
+                        if abort_now:
+                            aborted = True
+                            abort_reason = reason_now
+                            for rem in pending:
+                                rem.cancel()
+                            break
+                    if (groups_completed % int(checkpoint_every_groups) == 0) or (groups_completed == len(group_tasks)):
+                        _write_run_status_checkpoint("running", execution_mode)
+                    if aborted:
+                        break
+                if aborted:
                     break
     else:
         for g in group_tasks:
+            timeout_sec = int(quick_settings.task_timeout_sec) if quick_settings.enabled else 0
             rows = _safe_execute_task(
                 g,
-                lambda _g: _run_group_task(
-                    _g,
-                    base_state,
-                    candidates,
-                    splits,
-                    scenarios,
-                    m2_configs,
-                    m3_configs,
-                    m4_configs,
-                    harness_cfg,
+                lambda _g: _run_with_timeout_alarm(
+                    timeout_sec,
+                    lambda: _run_group_task(
+                        _g,
+                        base_state,
+                        candidates,
+                        splits,
+                        scenarios,
+                        m2_configs,
+                        m3_configs,
+                        m4_configs,
+                        harness_cfg,
+                    ),
                 ),
                 candidates=candidates,
                 splits=splits,
@@ -2853,16 +3384,26 @@ def run_weightiz_harness(
             failure_count += int(len(err_rows))
             for er in err_rows:
                 _capture_first_exception(er)
+                _update_failure_tracker(failure_tracker, er)
                 _record_deadletter(deadletter_path, er)
-            abort_now, reason_now = _should_abort_run(
-                failure_count=failure_count,
-                total_tasks=tasks_completed,
-                failure_rate_threshold=float(harness_cfg.failure_rate_abort_threshold),
-                failure_count_threshold=int(harness_cfg.failure_count_abort_threshold),
-            )
-            if abort_now:
-                aborted = True
-                abort_reason = reason_now
+                abort_now, reason_now = _should_abort_systemic(failure_tracker, er)
+                if abort_now:
+                    aborted = True
+                    abort_reason = reason_now
+                    break
+            if quick_settings.enabled:
+                if (groups_completed % int(quick_settings.progress_every_groups) == 0) or (groups_completed == len(group_tasks)):
+                    elapsed = time.perf_counter() - run_t0
+                    print(
+                        "QUICK_RUN_PROGRESS "
+                        f"completed_groups={groups_completed}/{len(group_tasks)} "
+                        f"completed_tasks={tasks_completed}/{tasks_submitted} "
+                        f"failures={failure_count} elapsed_sec={elapsed:.1f}",
+                        flush=True,
+                    )
+            if (groups_completed % int(checkpoint_every_groups) == 0) or (groups_completed == len(group_tasks)):
+                _write_run_status_checkpoint("running", execution_mode)
+            if aborted:
                 break
 
     aborted_early = bool(aborted and tasks_completed < tasks_submitted)
@@ -2890,33 +3431,58 @@ def run_weightiz_harness(
         )
         stats_verdict = _compute_stats_verdict(daily_mat, daily_bmk, baseline_candidate_ids, harness_cfg)
     except Exception as exc:
-        if not aborted:
+        if quick_settings.enabled:
+            common_sessions = np.zeros(0, dtype=np.int64)
+            daily_mat = np.zeros((0, 0), dtype=np.float64)
+            daily_bmk = np.zeros(0, dtype=np.float64)
+            baseline_candidate_ids = []
+            candidate_scenario_series = {}
+            stats_verdict = {
+                "leaderboard": [
+                    {
+                        "candidate_id": str(c.candidate_id),
+                        "dsr": float("nan"),
+                        "in_mcs": False,
+                        "wrc_p": float("nan"),
+                        "spa_p": float("nan"),
+                        "pbo": None,
+                        "pass": False,
+                    }
+                    for c in sorted(candidates, key=lambda x: str(x.candidate_id))
+                ],
+                "aborted": False,
+                "abort_reason": "",
+                "quick_run_stats_fallback": True,
+                "quick_run_stats_error": f"{type(exc).__name__}: {exc}",
+            }
+        elif not aborted:
             raise
-        if not first_exception_class:
-            first_exception_class = type(exc).__name__
-            first_exception_message = str(exc)
-            first_exception_hash = _error_hash(first_exception_class, first_exception_message)
-        common_sessions = np.zeros(0, dtype=np.int64)
-        daily_mat = np.zeros((0, 0), dtype=np.float64)
-        daily_bmk = np.zeros(0, dtype=np.float64)
-        baseline_candidate_ids = []
-        candidate_scenario_series = {}
-        stats_verdict = {
-            "leaderboard": [
-                {
-                    "candidate_id": str(c.candidate_id),
-                    "dsr": float("nan"),
-                    "in_mcs": False,
-                    "wrc_p": float("nan"),
-                    "spa_p": float("nan"),
-                    "pbo": None,
-                    "pass": False,
-                }
-                for c in sorted(candidates, key=lambda x: str(x.candidate_id))
-            ],
-            "aborted": True,
-            "abort_reason": str(exc),
-        }
+        else:
+            if not first_exception_class:
+                first_exception_class = type(exc).__name__
+                first_exception_message = str(exc)
+                first_exception_hash = _error_hash(first_exception_class, first_exception_message)
+            common_sessions = np.zeros(0, dtype=np.int64)
+            daily_mat = np.zeros((0, 0), dtype=np.float64)
+            daily_bmk = np.zeros(0, dtype=np.float64)
+            baseline_candidate_ids = []
+            candidate_scenario_series = {}
+            stats_verdict = {
+                "leaderboard": [
+                    {
+                        "candidate_id": str(c.candidate_id),
+                        "dsr": float("nan"),
+                        "in_mcs": False,
+                        "wrc_p": float("nan"),
+                        "spa_p": float("nan"),
+                        "pbo": None,
+                        "pass": False,
+                    }
+                    for c in sorted(candidates, key=lambda x: str(x.candidate_id))
+                ],
+                "aborted": True,
+                "abort_reason": str(exc),
+            }
     candidate_verdict = {
         str(x.get("candidate_id", "")): x
         for x in stats_verdict.get("leaderboard", [])
@@ -2937,6 +3503,9 @@ def run_weightiz_harness(
             "m4_idx": r.get("m4_idx"),
             "tags": r.get("tags", []),
             "test_days": int(r.get("test_days", 0)),
+            "quality_reason_codes": sorted([str(x) for x in r.get("quality_reason_codes", [])]),
+            "dqs_min": float(r.get("dqs_min", np.nan)),
+            "dqs_median": float(r.get("dqs_median", np.nan)),
         }
         lb = candidate_verdict.get(str(r.get("candidate_id", "")))
         if lb is not None:
@@ -2972,10 +3541,11 @@ def run_weightiz_harness(
     verdict_path = report_root / "verdict.json"
     stats_raw_path = report_root / "stats_raw.json"
     manifest_path = report_root / "run_manifest.json"
-    run_status_path = report_root / "run_status.json"
     micro_diag_path = report_root / "micro_diagnostics.parquet"
     micro_profile_blocks_path = report_root / "micro_profile_blocks.parquet"
     funnel_1545_path = report_root / "funnel_1545.parquet"
+    dq_report_path = report_root / "dq_report.csv"
+    dq_bar_flags_path = report_root / "dq_bar_flags.parquet"
 
     eq_df.to_parquet(equity_path, index=False)
     tr_df.to_parquet(trade_path, index=False)
@@ -3002,6 +3572,17 @@ def run_weightiz_harness(
             profile_df.to_parquet(micro_profile_blocks_path, index=False)
         if bool(harness_cfg.micro_diag_export_funnel):
             funnel_df.to_parquet(funnel_1545_path, index=False)
+
+    dq_day_df = pdx.DataFrame(list(dq_bundle.get("day_reports", [])))
+    if dq_day_df.shape[0] > 0:
+        dq_day_df = dq_day_df.sort_values(["symbol", "session_date"], kind="mergesort").reset_index(drop=True)
+    dq_day_df.to_csv(dq_report_path, index=False)
+
+    dq_bar_df = pdx.DataFrame(list(dq_bundle.get("bar_flags_rows", [])))
+    if dq_bar_df.shape[0] > 0:
+        dq_bar_df["timestamp"] = pdx.to_datetime(dq_bar_df["timestamp"], utc=True, errors="coerce")
+        dq_bar_df = dq_bar_df.sort_values(["symbol", "timestamp"], kind="mergesort").reset_index(drop=True)
+    dq_bar_df.to_parquet(dq_bar_flags_path, index=False)
 
     candidate_rows, robustness_rows, plateaus_doc = _build_candidate_artifacts(
         report_root=report_root,
@@ -3053,6 +3634,7 @@ def run_weightiz_harness(
         "aborted_early": bool(aborted_early),
         "abort_reason": str(abort_reason),
         "execution_mode": str(execution_mode),
+        "process_start_method": str(mp_start_method if mp_start_method else mp.get_start_method(allow_none=True) or ""),
         "tasks_submitted": int(tasks_submitted),
         "tasks_completed": int(tasks_completed),
         "groups_completed": int(groups_completed),
@@ -3062,6 +3644,20 @@ def run_weightiz_harness(
             "class": first_exception_class if first_exception_class else None,
             "message": first_exception_message if first_exception_message else None,
             "error_hash": first_exception_hash if first_exception_hash else None,
+        },
+        "systemic_breaker": {
+            "enabled": True,
+            "triggered": bool(aborted),
+            "reason": str(abort_reason),
+            "tracked_signatures": int(len(failure_tracker)),
+            "rule": "same_signature && units>=3 && assets>=2 && candidates>=2",
+        },
+        "quick_run": {
+            "enabled": bool(quick_settings.enabled),
+            "task_timeout_sec": int(quick_settings.task_timeout_sec),
+            "progress_every_groups": int(quick_settings.progress_every_groups),
+            "baseline_only": bool(quick_settings.baseline_only),
+            "disable_cpcv": bool(quick_settings.disable_cpcv),
         },
     }
     _write_json(run_status_path, run_status)
@@ -3088,6 +3684,7 @@ def run_weightiz_harness(
         "n_task_results": len(all_results),
         "n_ok_results": len(ok_results),
         "execution_mode": str(execution_mode),
+        "process_start_method": str(mp_start_method if mp_start_method else mp.get_start_method(allow_none=True) or ""),
         "tasks_submitted": int(tasks_submitted),
         "tasks_completed": int(tasks_completed),
         "groups_completed": int(groups_completed),
@@ -3118,6 +3715,16 @@ def run_weightiz_harness(
         "circuit_breaker": {
             "failure_rate_abort_threshold": float(harness_cfg.failure_rate_abort_threshold),
             "failure_count_abort_threshold": int(harness_cfg.failure_count_abort_threshold),
+            "mode": "systemic_signature_distinctness",
+            "systemic_rule": "same_signature && units>=3 && assets>=2 && candidates>=2",
+            "tracked_signatures": int(len(failure_tracker)),
+        },
+        "quick_run": {
+            "enabled": bool(quick_settings.enabled),
+            "task_timeout_sec": int(quick_settings.task_timeout_sec),
+            "progress_every_groups": int(quick_settings.progress_every_groups),
+            "baseline_only": bool(quick_settings.baseline_only),
+            "disable_cpcv": bool(quick_settings.disable_cpcv),
         },
         "memory": {
             "available_bytes": int(avail),
@@ -3133,6 +3740,21 @@ def run_weightiz_harness(
             "rows_exported": int(len(micro_df)),
             "profile_rows_exported": int(len(profile_df)),
             "funnel_rows_exported": int(len(funnel_df)),
+        },
+        "dq": {
+            "report_path": str(dq_report_path),
+            "bar_flags_path": str(dq_bar_flags_path),
+            "n_day_rows": int(dq_day_df.shape[0]),
+            "n_bar_flag_rows": int(dq_bar_df.shape[0]),
+            "accept_count": int((dq_day_df.get("decision", pdx.Series(dtype=str)) == DQ_ACCEPT).sum())
+            if dq_day_df.shape[0] > 0
+            else 0,
+            "degrade_count": int((dq_day_df.get("decision", pdx.Series(dtype=str)) == DQ_DEGRADE).sum())
+            if dq_day_df.shape[0] > 0
+            else 0,
+            "reject_count": int((dq_day_df.get("decision", pdx.Series(dtype=str)) == DQ_REJECT).sum())
+            if dq_day_df.shape[0] > 0
+            else 0,
         },
     }
     _write_json(manifest_path, manifest)
@@ -3150,6 +3772,8 @@ def run_weightiz_harness(
         "robustness_leaderboard_csv": str(robustness_csv_path),
         "plateaus": str(plateaus_path),
         "deadletter_tasks": str(deadletter_path),
+        "dq_report_csv": str(dq_report_path),
+        "dq_bar_flags_parquet": str(dq_bar_flags_path),
     }
     if bool(harness_cfg.export_micro_diagnostics):
         artifact_paths["micro_diagnostics"] = str(micro_diag_path)

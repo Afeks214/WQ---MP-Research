@@ -29,7 +29,13 @@ from weightiz_module1_core import (
     TensorState,
     validate_state_hard,
 )
-from weightiz_module3_structure import ContextIdx, Module3Output, Struct30mIdx
+from weightiz_module3_structure import (
+    IB_MISSING_POLICY,
+    IB_POLICY_NO_TRADE,
+    ContextIdx,
+    Module3Output,
+    Struct30mIdx,
+)
 
 
 class RegimeIdx(IntEnum):
@@ -361,6 +367,16 @@ def run_module4_strategy_funnel(
     phase_flat = np.int8(Phase.FLATTEN)
     in_exec_phase_t = np.isin(state.phase, np.array([phase_live, phase_os, phase_flat], dtype=np.int8))
     tradable_ta = state.bar_valid & m3.context_valid_ta & in_exec_phase_t[:, None]
+    dqs_day_ta = np.asarray(getattr(state, "dqs_day_ta", np.ones((T, A), dtype=np.float64)), dtype=np.float64)
+    if dqs_day_ta.shape != (T, A):
+        raise RuntimeError(f"dqs_day_ta shape mismatch: got {dqs_day_ta.shape}, expected {(T, A)}")
+    dqs_day_ta = np.clip(np.where(np.isfinite(dqs_day_ta), dqs_day_ta, 0.0), 0.0, 1.0)
+    ib_defined_ta = np.ones((T, A), dtype=bool)
+    if m3.ib_defined_ta is not None:
+        ib_defined_ta = np.asarray(m3.ib_defined_ta, dtype=bool)
+        if ib_defined_ta.shape != (T, A):
+            raise RuntimeError(f"m3.ib_defined_ta shape mismatch: got {ib_defined_ta.shape}, expected {(T, A)}")
+    ib_no_trade_policy = str(IB_MISSING_POLICY).upper().strip() == str(IB_POLICY_NO_TRADE)
 
     if cfg4.fail_on_non_finite_input:
         _assert_finite_masked("close_px", state.close_px, tradable_ta)
@@ -488,6 +504,8 @@ def run_module4_strategy_funnel(
         atr_eff_t = state.atr_floor[t]
         rvol_t = state.rvol[t]
         skew_t = skew_ta[t]
+        dqs_t = dqs_day_ta[t]
+        ib_defined_t = ib_defined_ta[t]
 
         ctx_x_vah = ctx[:, int(ContextIdx.CTX_X_VAH)]
         ctx_x_val = ctx[:, int(ContextIdx.CTX_X_VAL)]
@@ -513,8 +531,11 @@ def run_module4_strategy_funnel(
             & np.isfinite(ctx_tgs)
             & np.isfinite(ctx_poc_drift)
             & np.isfinite(ctx_poc_vs_prev_va)
+            & np.isfinite(dqs_t)
         )
         tradable &= finite_core
+        if ib_no_trade_policy:
+            tradable &= ib_defined_t
 
         # 2) Regime logic
         trend_up = (
@@ -582,16 +603,21 @@ def run_module4_strategy_funnel(
         regime_confidence_ta[t] = reg_conf
 
         # 3) Deterministic intents
-        intent_bo_long = tradable & (trend_up | p_shape | double_up) & (bo_l > float(cfg4.entry_threshold)) & (gbreak > 0.5)
-        intent_bo_short = tradable & (trend_down | b_shape | double_down) & (bo_s > float(cfg4.entry_threshold)) & (gbreak > 0.5)
-        intent_rej_long = tradable & (neutral | p_shape) & (rj_l > float(cfg4.entry_threshold)) & (greject > 0.5)
-        intent_rej_short = tradable & (neutral | b_shape) & (rj_s > float(cfg4.entry_threshold)) & (greject > 0.5)
+        conv_long_raw = np.maximum(bo_l, rj_l)
+        conv_short_raw = np.maximum(bo_s, rj_s)
+        conv_long_eff = conv_long_raw * dqs_t
+        conv_short_eff = conv_short_raw * dqs_t
+
+        intent_bo_long = tradable & (trend_up | p_shape | double_up) & (conv_long_eff > float(cfg4.entry_threshold)) & (gbreak > 0.5)
+        intent_bo_short = tradable & (trend_down | b_shape | double_down) & (conv_short_eff > float(cfg4.entry_threshold)) & (gbreak > 0.5)
+        intent_rej_long = tradable & (neutral | p_shape) & (conv_long_eff > float(cfg4.entry_threshold)) & (greject > 0.5)
+        intent_rej_short = tradable & (neutral | b_shape) & (conv_short_eff > float(cfg4.entry_threshold)) & (greject > 0.5)
 
         intent_long = intent_bo_long | intent_rej_long
         intent_short = intent_bo_short | intent_rej_short
 
-        conv_long = np.maximum(bo_l, rj_l)
-        conv_short = np.maximum(bo_s, rj_s)
+        conv_long = conv_long_eff
+        conv_short = conv_short_eff
         both = intent_long & intent_short
         long_better = conv_long > conv_short
         short_better = conv_short > conv_long
@@ -606,6 +632,14 @@ def run_module4_strategy_funnel(
         # Exits override entries.
         intent_long = intent_long & (~exit_any)
         intent_short = intent_short & (~exit_any)
+
+        low_dqs = dqs_t < 0.50
+        intent_long[low_dqs] = False
+        intent_short[low_dqs] = False
+        if ib_no_trade_policy:
+            ib_block = ~ib_defined_t
+            intent_long[ib_block] = False
+            intent_short[ib_block] = False
 
         # Kill switch blocks new entries.
         if kill_switch_session:

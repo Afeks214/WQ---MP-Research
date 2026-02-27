@@ -31,6 +31,15 @@ def _cfg(T: int, A: int = 2) -> EngineConfig:
 
 
 class TestModule1Core(unittest.TestCase):
+    def test_locked_x_grid_definition(self):
+        ts_ns = _minute_range_utc("2024-01-03T14:30:00", "2024-01-03T14:34:00")
+        cfg = _cfg(ts_ns.shape[0], A=2)
+        state = preallocate_state(ts_ns=ts_ns, cfg=cfg, symbols=("A0", "A1"))
+        self.assertEqual(int(state.x_grid.shape[0]), 240)
+        self.assertAlmostEqual(float(state.x_grid[0]), -6.0, places=12)
+        self.assertAlmostEqual(float(state.x_grid[1] - state.x_grid[0]), 0.05, places=12)
+        self.assertAlmostEqual(float(state.x_grid[-1]), 5.95, places=12)
+
     def test_deterministic_replay_digest(self):
         ts_ns = _minute_range_utc("2024-01-03T14:30:00", "2024-01-03T20:00:00")
         cfg = _cfg(ts_ns.shape[0], A=3)

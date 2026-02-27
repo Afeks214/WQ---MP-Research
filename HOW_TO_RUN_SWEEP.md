@@ -75,3 +75,107 @@ Run twice and compare:
 # after two runs, compare file hashes
 sha256sum <run1>/robustness_leaderboard.csv <run2>/robustness_leaderboard.csv
 ```
+
+## 6) Sweep v2 Auto-Resolve (one command)
+
+Use the v2 orchestrator to auto-resolve symbols from `data/alpaca/clean`, generate immutable derived configs under `configs/_generated/`, run scout, derive focused candidates from scout plateaus, then run focused full:
+
+```bash
+./.venv/bin/python ./scripts/run_sweep_auto.py \
+  --base-config ./configs/sweep_20x100.yaml \
+  --scout-config ./configs/sweep_scout_20x12.yaml \
+  --clean-dir ./data/alpaca/clean \
+  --mode scout_then_focused_full \
+  --target-symbols 20 \
+  --min-symbols 8 \
+  --top-plateaus 3 \
+  --max-focused-candidates 30
+```
+
+Expected v2 outputs:
+- Inventory + manifest: `artifacts/sweep_v2/<UTC_TS>/data_inventory.csv` and `manifest.json`
+- Derived configs: `configs/_generated/sweep_auto_full_<UTC_TS>.yaml`, `sweep_auto_scout_<UTC_TS>.yaml`, `sweep_auto_focused_<UTC_TS>.yaml`
+- Run artifacts from `run_research.py` under `artifacts/module5_harness/run_...`
+
+## 7) DQ artifacts (robustness hardening)
+
+Each harness run now writes deterministic Data Quality artifacts under the run directory:
+- `dq_report.csv`: one row per (symbol, session_date) with decision (`ACCEPT|DEGRADE|REJECT`), reason codes, inferred timeframe, cadence-aware session metrics (`cadence_day_min`, `cadence_day_stable`, delta count/CV), expected/observed/missing bars, bad-tick diagnostics, and DQS components.
+- `dq_bar_flags.parquet`: per-bar diagnostics (`timestamp`, `symbol`, `dq_filled_bar`, `dq_issue_flags`, `dqs_day`).
+
+Repair behavior is fail-closed and deterministic:
+- Micro-gaps are repaired strictly intra-session only.
+- Filled bars use `O=H=L=C=prev_close` and `volume=0`.
+- No overnight forward fill is allowed.
+
+## 8) Quick-Run Health Check
+
+Use this when you want a fast end-to-end wiring proof (DQ -> M2 -> M3 -> M4 -> M5 artifacts) without running full CPCV/stress workload:
+
+```bash
+./.venv/bin/python ./scripts/run_sweep_auto.py --mode scout_only --quick-run
+```
+
+Quick-run behavior is deterministic and schema-safe:
+- symbols reduced to first 2 alphabetically from the selected universe,
+- candidates reduced to ~2-3 total,
+- CPCV disabled and WF reduced to a single split at runtime,
+- baseline stress scenario only,
+- per-group timeout and progress logging enabled.
+
+Quick-run verifies these artifacts in the final run directory:
+- `dq_report.csv`
+- `dq_bar_flags.parquet`
+- `robustness_leaderboard.csv`
+- `run_status.json`
+
+Sweep-v2 logs for quick-run and non-quick subprocess execution are stored under:
+- `artifacts/sweep_v2/<UTC_TS>/logs/`
+
+For observability on long non-quick runs:
+- `artifacts/sweep_v2/<UTC_TS>/manifest.json` is written immediately after config generation (`status=running`) and updated at run end.
+- `artifacts/module5_harness/run_<...>/run_status.json` is checkpointed periodically during execution.
+
+## 9) Robustness & Data Quality
+
+- DQ decisions are per `(symbol, session_date)`: `ACCEPT | DEGRADE | REJECT`.
+- `DQS` is propagated at runtime as `dqs_day_ta` and scales Module4 conviction deterministically: `effective_conviction = raw_conviction * DQS`.
+- Safety gates:
+  - if `DQS < 0.50`, Module4 blocks new entries (neutral).
+  - if IB is undefined and policy is `NO_TRADE` (default), Module4 blocks new entries for those rows.
+- Invariant guards run post-Module2, post-Module3, and pre-Module4; non-finite rows are masked out (not traded), not silently passed.
+- Circuit breaker aborts only on systemic repeated exception signatures:
+  - same signature across `>=3` units, `>=2` assets, and `>=2` candidates.
+  - localized DQ/invariant reason-coded issues are deadlettered but do not trigger systemic abort by themselves.
+
+## 10) Build Clean Cache From MarketData Bundle
+
+Use the atomic builder to ingest a bundle and replace `data/alpaca/clean` safely:
+
+```bash
+./.venv/bin/python scripts/build_clean_cache_from_bundle.py \
+  --bundle-zip /mnt/data/MarketData-20260225T215136Z-1-001.zip \
+  --extract-dir /mnt/data/MarketData_unzipped \
+  --target-year 2024
+```
+
+What it does:
+- extracts the bundle,
+- chooses preferred partitions per symbol (2024 + `1Min` first),
+- normalizes to canonical columns with UTC `timestamp`,
+- builds `data/alpaca/clean_build_tmp_<ts>/`,
+- swaps atomically to `data/alpaca/clean/` and keeps `data/alpaca/clean_backup_<ts>/`.
+
+Build manifest:
+- `artifacts/clean_cache_build/<ts>/build_manifest.json`
+
+## 11) DQ-Aware Symbol Selection
+
+`scripts/run_sweep_auto.py` now ranks symbols by DQ reliability before raw row count:
+1. `coverage_ratio = (ACCEPT + DEGRADE) / total_days` (desc)
+2. `median_dqs` (desc)
+3. `quality_score` (desc)
+4. symbol (asc)
+
+Selection evidence is written to:
+- `artifacts/sweep_v2/<ts>/selection_dq_table.csv`

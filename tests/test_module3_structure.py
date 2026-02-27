@@ -302,6 +302,35 @@ class TestModule3Structure(unittest.TestCase):
         self.assertAlmostEqual(float(ib_hi[89]), float(x[130]), places=12)
         self.assertAlmostEqual(float(ib_lo[89]), float(x[100]), places=12)
 
+    def test_missing_ib_seed_blocks_are_marked_invalid_not_exception(self):
+        state = _make_state(T=120, A=1)
+        # Only seq=2 has usable mass; seq=0/1 are absent.
+        _set_vp_peak(state, 89, 0, bins=[118, 120], values=[10.0, 9.0])
+        cfg = Module3Config(min_block_valid_bars=1, min_block_valid_ratio=0.0, fail_on_non_finite_output=True)
+        out = run_module3_structural_aggregation(state, cfg)
+
+        # seq=2 block-end should be invalidated because IB seed is undefined.
+        self.assertFalse(bool(out.block_valid_ta[89, 0]))
+        self.assertIsNotNone(out.ib_defined_ta)
+        self.assertFalse(bool(out.ib_defined_ta[89, 0]))
+        ib_hi = out.block_features_tak[89, 0, int(Struct30mIdx.IB_HIGH_X)]
+        ib_lo = out.block_features_tak[89, 0, int(Struct30mIdx.IB_LOW_X)]
+        self.assertTrue(np.isnan(float(ib_hi)))
+        self.assertTrue(np.isnan(float(ib_lo)))
+
+    def test_ib_policy_degrade_keeps_block_valid(self):
+        state = _make_state(T=120, A=1)
+        _set_vp_peak(state, 89, 0, bins=[118, 120], values=[10.0, 9.0])
+        cfg = Module3Config(min_block_valid_bars=1, min_block_valid_ratio=0.0, fail_on_non_finite_output=True)
+
+        with patch.object(module3, "IB_MISSING_POLICY", "DEGRADE"):
+            out = run_module3_structural_aggregation(state, cfg)
+
+        self.assertTrue(bool(out.block_end_flag_t[89]))
+        self.assertTrue(bool(out.block_valid_ta[89, 0]))
+        self.assertIsNotNone(out.ib_defined_ta)
+        self.assertFalse(bool(out.ib_defined_ta[89, 0]))
+
     def test_poc_vs_prev_va_piecewise_metric(self):
         state = _make_state(T=90, A=1)
 

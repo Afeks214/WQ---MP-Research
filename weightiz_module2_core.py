@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Optional, Tuple
 import time
+import warnings
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
@@ -34,6 +35,13 @@ from weightiz_module1_core import (
 
 
 SQRT_2PI: float = float(np.sqrt(2.0 * np.pi))
+
+
+def _nanmedian_silent(arr: np.ndarray, axis: Optional[int] = None) -> np.ndarray:
+    # Deterministic guard against noisy "All-NaN slice encountered" warnings.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="All-NaN slice encountered", category=RuntimeWarning)
+        return np.nanmedian(arr, axis=axis)
 
 
 class DayTypeIdx(IntEnum):
@@ -280,8 +288,8 @@ def _rolling_median_mad_causal(
 
     if T >= w:
         wins = sliding_window_view(arr, window_shape=w, axis=0)  # (T-w+1, A, w)
-        med_full = np.nanmedian(wins, axis=-1)
-        mad_full = np.nanmedian(np.abs(wins - med_full[:, :, None]), axis=-1)
+        med_full = _nanmedian_silent(wins, axis=-1)
+        mad_full = _nanmedian_silent(np.abs(wins - med_full[:, :, None]), axis=-1)
         med[w - 1 :] = med_full
         mad[w - 1 :] = mad_full
 
@@ -291,8 +299,8 @@ def _rolling_median_mad_causal(
         if n < min_periods:
             continue
         seg = arr[:n]
-        m = np.nanmedian(seg, axis=0)
-        d = np.nanmedian(np.abs(seg - m[None, :]), axis=0)
+        m = _nanmedian_silent(seg, axis=0)
+        d = _nanmedian_silent(np.abs(seg - m[None, :]), axis=0)
         med[t] = m
         mad[t] = d
 
@@ -363,7 +371,7 @@ def _rvol_baseline_ringbuffer(
                 vals = vals[np.isfinite(vals)]
                 if vals.size == 0:
                     continue
-                baseline[t, a] = float(np.nanmedian(vals))
+                baseline[t, a] = float(_nanmedian_silent(vals, axis=None))
                 eligible[t, a] = baseline[t, a] > 0.0
 
         # After baseline assignment, append this session into ring.
@@ -665,13 +673,13 @@ def precompute_market_physics(state: TensorState, cfg: Module2Config) -> MarketP
             baseline = np.full((S, A), np.nan, dtype=np.float64)
             if S >= L:
                 windows = sliding_window_view(vals_prev, window_shape=L, axis=0)  # (S-L+1, A, L)
-                baseline[L - 1 :] = np.nanmedian(windows, axis=-1)
+                baseline[L - 1 :] = _nanmedian_silent(windows, axis=-1)
                 prefix = min(L - 1, S)
             else:
                 prefix = S
 
             for d in range(prefix):
-                baseline[d] = np.nanmedian(vals_prev[: d + 1], axis=0)
+                baseline[d] = _nanmedian_silent(vals_prev[: d + 1], axis=0)
 
             baseline_cube[:, m, :] = baseline
 
@@ -1004,8 +1012,8 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
             w2_win = 1.0 - w1_win
             # Sealed cap path is decision-time anchored (§9.2/§9.2.1).
             vol_for_cap = np.where(valid_win, vol_win, np.nan)
-            med_cap = np.nanmedian(vol_for_cap, axis=0)
-            mad_cap = np.nanmedian(np.abs(vol_for_cap - med_cap[None, :]), axis=0)
+            med_cap = _nanmedian_silent(vol_for_cap, axis=0)
+            mad_cap = _nanmedian_silent(np.abs(vol_for_cap - med_cap[None, :]), axis=0)
             cap_t = np.where(np.isfinite(med_cap), med_cap, 0.0) + 5.0 * np.where(np.isfinite(mad_cap), mad_cap, 0.0)
             cap_eff_t = cap_t * (1.0 + np.log(np.maximum(1.0, rvol_t)))
             cap_eff_t = np.where(np.isfinite(cap_eff_t), np.maximum(cap_eff_t, 0.0), 0.0)
@@ -1067,8 +1075,8 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
             numer = close_win[1:] - close_win[:-1]
             denom_r = atr_t[None, :] + state.eps.eps_div[None, :]
             r_k[1:] = np.where(valid_ret, numer / denom_r, 0.0)
-            med_r = np.nanmedian(np.where(valid_win, r_k, np.nan), axis=0)
-            sr = 1.4826 * np.nanmedian(np.abs(np.where(valid_win, r_k, np.nan) - med_r[None, :]), axis=0)
+            med_r = _nanmedian_silent(np.where(valid_win, r_k, np.nan), axis=0)
+            sr = 1.4826 * _nanmedian_silent(np.abs(np.where(valid_win, r_k, np.nan) - med_r[None, :]), axis=0)
             s_eff_r = np.maximum(np.where(np.isfinite(sr), sr, 0.0), 0.5 * dx)
             k_r = float(np.log(9.0)) / (s_eff_r + state.eps.eps_pdf)
             p_sr_buy = _sigmoid(k_r[None, :] * r_k)
