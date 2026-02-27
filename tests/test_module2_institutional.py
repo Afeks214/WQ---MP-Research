@@ -52,6 +52,23 @@ def _fill_ohlcv_valid(st, seed: int = 7):
 
 
 class TestModule2Institutional(unittest.TestCase):
+    def test_atr_floor_locked_formula_in_sealed_mode(self):
+        st = _state_from_minute_series(T=40, A=2, mode="sealed")
+
+        close = np.full((st.cfg.T, st.cfg.A), 100.0, dtype=np.float64)
+        st.open_px[:, :] = close
+        st.high_px[:, :] = close
+        st.low_px[:, :] = close
+        st.close_px[:, :] = close
+        st.volume[:, :] = 1_000_000.0
+        st.bar_valid[:, :] = True
+
+        cfg = Module2Config(profile_window_bars=20, profile_warmup_bars=20, rvol_lookback_sessions=20)
+        run_weightiz_profile_engine(st, cfg)
+
+        expected_floor = np.maximum(4.0 * np.asarray(st.eps.eps_div, dtype=np.float64), 0.0002 * close)
+        np.testing.assert_allclose(st.atr_floor, expected_floor, rtol=0.0, atol=1e-12)
+
     def test_prefix_invariance_includes_physics_outputs(self):
         st1 = _state_from_minute_series(T=280, A=3, mode="sealed")
         st2 = _state_from_minute_series(T=280, A=3, mode="sealed")

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -223,7 +225,7 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
 
     def test_ingest_master_index_monotonic_and_unique(self) -> None:
         engine_cfg = self._cfg(T=1, A=2)
-        harness_cfg = h.Module5HarnessConfig(min_asset_coverage=1.0, fail_on_non_finite=False)
+        harness_cfg = h.Module5HarnessConfig(min_asset_coverage=0.5, fail_on_non_finite=False)
 
         idx_dup = pd.DatetimeIndex(
             [
@@ -244,14 +246,16 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
         def dup_loader(path: str, _tz_name: str) -> "pd.DataFrame":
             return dup_frames[path]
 
-        with self.assertRaisesRegex(RuntimeError, "duplicate timestamp"):
-            h._ingest_master_aligned(
-                data_paths=["S1", "S2"],
-                symbols=["S1", "S2"],
-                engine_cfg=engine_cfg,
-                harness_cfg=harness_cfg,
-                data_loader_func=dup_loader,
-            )
+        _state_d, _keep_idx_d, _keep_symbols_d, master_ts_ns_d, _ingest_meta_d, _tick_d, dq_d = h._ingest_master_aligned(
+            data_paths=["S1", "S2"],
+            symbols=["S1", "S2"],
+            engine_cfg=engine_cfg,
+            harness_cfg=harness_cfg,
+            data_loader_func=dup_loader,
+        )
+        self.assertTrue(np.all(np.diff(master_ts_ns_d) > 0))
+        reasons_d = "|".join(str(r.get("reason_codes", "")) for r in dq_d.get("day_reports", []))
+        self.assertIn("DUPLICATE_TIMESTAMP", reasons_d)
 
         idx_ooo = pd.DatetimeIndex(
             [
@@ -265,14 +269,16 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
         def ooo_loader(path: str, _tz_name: str) -> "pd.DataFrame":
             return ooo_frames[path]
 
-        with self.assertRaisesRegex(RuntimeError, "strictly increasing"):
-            h._ingest_master_aligned(
-                data_paths=["S1", "S2"],
-                symbols=["S1", "S2"],
-                engine_cfg=engine_cfg,
-                harness_cfg=harness_cfg,
-                data_loader_func=ooo_loader,
-            )
+        _state_o, _keep_idx_o, _keep_symbols_o, master_ts_ns_o, _ingest_meta_o, _tick_o, dq_o = h._ingest_master_aligned(
+            data_paths=["S1", "S2"],
+            symbols=["S1", "S2"],
+            engine_cfg=engine_cfg,
+            harness_cfg=harness_cfg,
+            data_loader_func=ooo_loader,
+        )
+        self.assertTrue(np.all(np.diff(master_ts_ns_o) > 0))
+        reasons_o = "|".join(str(r.get("reason_codes", "")) for r in dq_o.get("day_reports", []))
+        self.assertIn("NON_MONOTONIC_TIMESTAMP", reasons_o)
 
         idx_local = pd.date_range(
             "2024-01-03 09:30:00",
@@ -285,7 +291,7 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
         def ok_loader(path: str, _tz_name: str) -> "pd.DataFrame":
             return valid_frames[path]
 
-        state, _keep_idx, _keep_symbols, master_ts_ns, _ingest_meta, _tick = h._ingest_master_aligned(
+        state, _keep_idx, _keep_symbols, master_ts_ns, _ingest_meta, _tick, _dq_bundle = h._ingest_master_aligned(
             data_paths=["S1", "S2"],
             symbols=["S1", "S2"],
             engine_cfg=engine_cfg,
@@ -294,6 +300,34 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
         )
         self.assertTrue(np.all(np.diff(master_ts_ns) > 0))
         self.assertTrue(np.all(np.diff(state.ts_ns) > 0))
+
+    def test_load_asset_frame_accepts_datetime_index_without_timestamp_column(self) -> None:
+        idx = pd.date_range(
+            "2024-01-03 09:31:00",
+            periods=4,
+            freq="1min",
+            tz="America/New_York",
+        ).tz_convert("UTC")
+        df = pd.DataFrame(
+            {
+                "open": [100.0, 100.1, 100.2, 100.3],
+                "high": [100.2, 100.3, 100.4, 100.5],
+                "low": [99.9, 100.0, 100.1, 100.2],
+                "close": [100.1, 100.2, 100.3, 100.4],
+                "volume": [1000.0, 1001.0, 1002.0, 1003.0],
+            },
+            index=idx,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "asset.parquet"
+            df.to_parquet(p)
+            out = h._load_asset_frame(str(p), "America/New_York")
+
+        self.assertIsInstance(out.index, pd.DatetimeIndex)
+        self.assertIsNotNone(out.index.tz)
+        self.assertEqual(int(out.shape[0]), 4)
+        self.assertEqual(list(out.columns), ["open", "high", "low", "close", "volume"])
 
     def test_orchestration_order_placeholders_after_perturbations(self) -> None:
         T, A = 16, 2
@@ -474,6 +508,143 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
             self.assertIn("class", run_status["first_exception"])
             self.assertIn("message", run_status["first_exception"])
             self.assertIn("error_hash", run_status["first_exception"])
+
+    @unittest.skipIf(os.name == "nt", "process_pool fork context test is POSIX-only")
+    def test_process_pool_executes_tasks_and_updates_status(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="m5_process_pool_progress_") as td:
+            report_dir = Path(td) / "artifacts"
+            os.environ["WEIGHTIZ_MP_START_METHOD"] = "fork"
+            try:
+                out = self._run_minimal_harness(
+                    report_dir=report_dir,
+                    harness_overrides={
+                        "parallel_backend": "process_pool",
+                        "parallel_workers": 2,
+                        "payload_pickle_threshold_bytes": 1024 * 1024,
+                    },
+                )
+            finally:
+                os.environ.pop("WEIGHTIZ_MP_START_METHOD", None)
+
+            self.assertEqual(str(out.run_manifest.get("execution_mode")), "process_pool")
+            run_status_path = Path(str(out.artifact_paths["run_status"]))
+            run_status = json.loads(run_status_path.read_text(encoding="utf-8"))
+            self.assertGreater(int(run_status.get("tasks_completed", 0)), 0)
+            self.assertEqual(
+                int(run_status.get("tasks_completed", 0)),
+                int(run_status.get("tasks_submitted", 0)),
+            )
+            self.assertIn(
+                str(run_status.get("process_start_method", "")),
+                {"fork", "spawn", "forkserver"},
+            )
+
+    def test_aggregate_candidate_baseline_matrix_keeps_zero_return_days(self) -> None:
+        bench_sessions = np.asarray([101, 102, 103, 104, 105], dtype=np.int64)
+        bench_ret = np.asarray([0.0, 0.001, -0.002, 0.0, 0.003], dtype=np.float64)
+        results_ok = [
+            {
+                "candidate_id": "cand_a",
+                "scenario_id": "baseline",
+                "session_ids": np.asarray([102, 104], dtype=np.int64),
+                "daily_returns": np.asarray([0.01, -0.02], dtype=np.float64),
+                "status": "ok",
+                "test_days": 2,
+            }
+        ]
+        common, mat, _bmk, baseline_ids, _series = h._aggregate_candidate_baseline_matrix(
+            results_ok=results_ok,
+            bench_sessions=bench_sessions,
+            bench_ret=bench_ret,
+            candidate_ids=["cand_a"],
+            min_days=3,
+        )
+        self.assertEqual(common.tolist(), [101, 102, 103, 104, 105])
+        self.assertEqual(baseline_ids, ["cand_a"])
+        self.assertEqual(mat.shape, (5, 1))
+        self.assertAlmostEqual(float(mat[0, 0]), 0.0, places=12)
+        self.assertAlmostEqual(float(mat[1, 0]), 0.01, places=12)
+        self.assertAlmostEqual(float(mat[2, 0]), 0.0, places=12)
+        self.assertAlmostEqual(float(mat[3, 0]), -0.02, places=12)
+        self.assertAlmostEqual(float(mat[4, 0]), 0.0, places=12)
+
+    def test_split_group_tasks_by_candidate_deterministic(self) -> None:
+        candidates = [
+            h.CandidateSpec(
+                candidate_id=f"c{i}",
+                m2_idx=0,
+                m3_idx=0,
+                m4_idx=i,
+                enabled_assets_mask=np.ones(2, dtype=bool),
+                tags=(),
+            )
+            for i in range(4)
+        ]
+        splits = [
+            h.SplitSpec(
+                split_id="wf_000",
+                mode="wf",
+                train_idx=np.arange(0, 10, dtype=np.int64),
+                test_idx=np.arange(10, 15, dtype=np.int64),
+                purge_idx=np.zeros(0, dtype=np.int64),
+                embargo_idx=np.zeros(0, dtype=np.int64),
+                session_train_bounds=(0, 0),
+                session_test_bounds=(0, 0),
+                purge_bars=0,
+                embargo_bars=0,
+                total_bars=20,
+            )
+        ]
+        scenarios = [
+            h.StressScenario(
+                scenario_id="baseline",
+                name="baseline",
+                missing_burst_prob=0.0,
+                missing_burst_min=0,
+                missing_burst_max=0,
+                jitter_sigma_bps=0.0,
+                slippage_mult=1.0,
+                enabled=True,
+            )
+        ]
+        grouped = h._build_group_tasks(candidates, splits, scenarios)
+        self.assertEqual(len(grouped), 1)
+        self.assertEqual(len(grouped[0].candidate_indices), 4)
+
+        split_groups = h._split_group_tasks_by_candidate(grouped, chunk_size=1)
+        self.assertEqual(len(split_groups), 4)
+        self.assertEqual([g.candidate_indices for g in split_groups], [(0,), (1,), (2,), (3,)])
+        self.assertEqual([g.group_id for g in split_groups], [f"{grouped[0].group_id}_p{i:03d}" for i in range(4)])
+
+    def test_minimal_harness_has_finite_robustness_for_non_pathological_candidate(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="m5_finite_robustness_") as td:
+            report_dir = Path(td) / "artifacts"
+            out = self._run_minimal_harness(
+                report_dir=report_dir,
+                harness_overrides={"daily_return_min_days": 3},
+            )
+            rb_path = Path(str(out.artifact_paths["robustness_leaderboard_csv"]))
+            self.assertTrue(rb_path.exists())
+            rb = pd.read_csv(rb_path)
+            self.assertGreaterEqual(int(rb.shape[0]), 1)
+            scores = pd.to_numeric(rb["robustness_score"], errors="coerce")
+            self.assertTrue(bool(np.isfinite(scores).any()))
+
+    def test_clean_fixture_emits_no_runtime_warnings(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="m5_warning_regression_") as td:
+            report_dir = Path(td) / "artifacts"
+            with warnings.catch_warnings(record=True) as wrn:
+                warnings.simplefilter("always", RuntimeWarning)
+                _ = self._run_minimal_harness(
+                    report_dir=report_dir,
+                    harness_overrides={"daily_return_min_days": 3},
+                )
+            runtime_warnings = [w for w in wrn if issubclass(w.category, RuntimeWarning)]
+            self.assertEqual(
+                len(runtime_warnings),
+                0,
+                msg=f"unexpected runtime warnings: {[str(w.message) for w in runtime_warnings[:5]]}",
+            )
 
 
 if __name__ == "__main__":
