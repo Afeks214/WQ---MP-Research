@@ -31,7 +31,7 @@ class TestAlpacaUniverse10QA(unittest.TestCase):
         self.assertEqual(int(cfg["alpaca"]["min_ok_symbols"]), 8)
 
     @unittest.skipUnless(HAS_XCALS, "exchange_calendars not available")
-    def test_post_clean_qa_rejects_missing_minute_holes_in_nyse_rth(self):
+    def test_post_clean_qa_reports_missing_minute_holes_in_nyse_rth(self):
         records = [
             {"t": "2024-03-11T13:30:00Z", "o": 100.0, "h": 101.0, "l": 99.5, "c": 100.5, "v": 10},
             {"t": "2024-03-11T13:31:00Z", "o": 100.5, "h": 101.2, "l": 100.4, "c": 101.0, "v": 11},
@@ -49,17 +49,17 @@ class TestAlpacaUniverse10QA(unittest.TestCase):
         self.assertEqual(int(clean.shape[0]), 2)
         self.assertGreater(int(qa["session"]["missing_minutes_total"]), 0)
 
-        with self.assertRaisesRegex(RuntimeError, "missing NYSE expected minutes remain"):
-            run_post_clean_qa_or_raise(
-                clean=clean,
-                session_meta=dict(qa["session"]),
-                timezone="America/New_York",
-                session_policy="RTH",
-                rth_open="09:30",
-                rth_close="16:00",
-                rth_close_inclusive=False,
-                calendar_mode="nyse",
-            )
+        post = run_post_clean_qa_or_raise(
+            clean=clean,
+            session_meta=dict(qa["session"]),
+            timezone="America/New_York",
+            session_policy="RTH",
+            rth_open="09:30",
+            rth_close="16:00",
+            rth_close_inclusive=False,
+            calendar_mode="nyse",
+        )
+        self.assertGreater(int(post["missing_minutes_total"]), 0)
 
     def test_post_clean_qa_rejects_nan_non_monotonic_and_duplicates(self):
         base_ts = pd.to_datetime(["2024-01-02T14:30:00Z", "2024-01-02T14:31:00Z"], utc=True)

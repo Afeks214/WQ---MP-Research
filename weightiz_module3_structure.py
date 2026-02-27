@@ -21,6 +21,10 @@ import numpy as np
 
 from weightiz_module1_core import Phase, ProfileStatIdx, ScoreIdx, TensorState
 
+IB_POLICY_NO_TRADE = "NO_TRADE"
+IB_POLICY_DEGRADE = "DEGRADE"
+IB_MISSING_POLICY = IB_POLICY_NO_TRADE
+
 
 class Struct30mIdx(IntEnum):
     VALID_RATIO = 0
@@ -104,6 +108,7 @@ class Module3Output:
     context_tac: np.ndarray
     context_valid_ta: np.ndarray
     context_source_t_index_ta: np.ndarray
+    ib_defined_ta: np.ndarray | None = None
 
 
 def _assert_shape(name: str, arr: np.ndarray, expected: Tuple[int, ...]) -> None:
@@ -309,6 +314,7 @@ def run_module3_structural_aggregation(state: TensorState, cfg: Module3Config) -
             context_tac=context_tac,
             context_valid_ta=context_valid_ta,
             context_source_t_index_ta=src,
+            ib_defined_ta=np.zeros((T, A), dtype=bool),
         )
         validate_module3_output(state, out, cfg)
         return out
@@ -364,6 +370,7 @@ def run_module3_structural_aggregation(state: TensorState, cfg: Module3Config) -
             context_tac=context_tac,
             context_valid_ta=context_valid_ta,
             context_source_t_index_ta=src,
+            ib_defined_ta=np.zeros((T, A), dtype=bool),
         )
         validate_module3_output(state, out, cfg)
         return out
@@ -672,6 +679,19 @@ def run_module3_structural_aggregation(state: TensorState, cfg: Module3Config) -
     feat_eak[:, :, int(Struct30mIdx.IB_LOW_X)] = ib_lo_out_ea
     feat_eak[:, :, int(Struct30mIdx.POC_VS_PREV_VA)] = rel_prev_va_ea
 
+    # IB may be undefined when split-domain masking removes opening seed blocks.
+    # Expose explicit policy state instead of crashing.
+    ib_defined_ea = np.isfinite(ib_hi_out_ea) & np.isfinite(ib_lo_out_ea)
+    policy = str(IB_MISSING_POLICY).upper().strip()
+    if policy not in {IB_POLICY_NO_TRADE, IB_POLICY_DEGRADE}:
+        raise RuntimeError(f"Unsupported IB policy: {IB_MISSING_POLICY!r}")
+    if policy == IB_POLICY_NO_TRADE:
+        block_valid_ea = block_valid_ea & ib_defined_ea
+    else:
+        # Research degrade mode keeps block features finite while exposing ib_defined flag.
+        feat_eak[:, :, int(Struct30mIdx.IB_HIGH_X)] = np.where(ib_defined_ea, ib_hi_out_ea, x_poc)
+        feat_eak[:, :, int(Struct30mIdx.IB_LOW_X)] = np.where(ib_defined_ea, ib_lo_out_ea, x_poc)
+
     # Invalid block rows -> NaN features
     feat_eak = np.where(block_valid_ea[:, :, None], feat_eak, np.nan)
 
@@ -681,6 +701,8 @@ def run_module3_structural_aggregation(state: TensorState, cfg: Module3Config) -
 
     block_valid_ta = np.zeros((T, A), dtype=bool)
     block_valid_ta[te_idx] = block_valid_ea
+    ib_defined_ta = np.zeros((T, A), dtype=bool)
+    ib_defined_ta[te_idx] = ib_defined_ea
 
     block_start_t_index_t = np.full(T, -1, dtype=np.int64)
     block_end_t_index_t = np.full(T, -1, dtype=np.int64)
@@ -740,6 +762,7 @@ def run_module3_structural_aggregation(state: TensorState, cfg: Module3Config) -
         context_tac=context_tac,
         context_valid_ta=context_valid_ta,
         context_source_t_index_ta=context_source_t_index_ta,
+        ib_defined_ta=ib_defined_ta,
     )
 
     validate_module3_output(state, out, cfg)
@@ -762,6 +785,8 @@ def validate_module3_output(state: TensorState, out: Module3Output, cfg: Module3
     _assert_shape("context_tac", out.context_tac, (T, A, C3))
     _assert_shape("context_valid_ta", out.context_valid_ta, (T, A))
     _assert_shape("context_source_t_index_ta", out.context_source_t_index_ta, (T, A))
+    if out.ib_defined_ta is not None:
+        _assert_shape("ib_defined_ta", out.ib_defined_ta, (T, A))
 
     # Source must be causal
     t_idx = np.arange(T, dtype=np.int64)[:, None]
@@ -848,6 +873,8 @@ def deterministic_digest_sha256_module3(out: Module3Output) -> str:
         out.context_valid_ta,
         out.context_source_t_index_ta,
     ]
+    if out.ib_defined_ta is not None:
+        arrs.append(out.ib_defined_ta)
     for a in arrs:
         h.update(np.ascontiguousarray(a).view(np.uint8))
     return h.hexdigest()

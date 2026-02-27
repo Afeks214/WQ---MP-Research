@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional, Union
+import warnings
 
 import numpy as np
 
@@ -668,22 +669,53 @@ def main() -> None:
     stress_scenarios = _build_stress_scenarios(cfg)
     candidate_specs = _build_candidates(cfg)
 
-    out = run_weightiz_harness(
-        data_paths=data_paths,
-        symbols=symbols,
-        engine_cfg=engine_cfg,
-        m2_configs=m2_cfgs,
-        m3_configs=m3_cfgs,
-        m4_configs=m4_cfgs,
-        harness_cfg=harness_cfg,
-        candidate_specs=candidate_specs,
-        data_loader_func=data_loader,
-        stress_scenarios=stress_scenarios,
-    )
+    with warnings.catch_warnings(record=True) as captured_warnings:
+        warnings.simplefilter("always", RuntimeWarning)
+        out = run_weightiz_harness(
+            data_paths=data_paths,
+            symbols=symbols,
+            engine_cfg=engine_cfg,
+            m2_configs=m2_cfgs,
+            m3_configs=m3_cfgs,
+            m4_configs=m4_cfgs,
+            harness_cfg=harness_cfg,
+            candidate_specs=candidate_specs,
+            data_loader_func=data_loader,
+            stress_scenarios=stress_scenarios,
+        )
+    runtime_warnings = [w for w in captured_warnings if issubclass(w.category, RuntimeWarning)]
+    runtime_warning_count = int(len(runtime_warnings))
 
     run_manifest_path = Path(out.artifact_paths["run_manifest"]).resolve()
     run_dir = run_manifest_path.parent
     run_id = str(out.run_manifest.get("run_id", run_dir.name))
+    run_status_path = Path(out.artifact_paths.get("run_status", run_dir / "run_status.json")).resolve()
+
+    # Runtime warning telemetry (captured in this process) is attached to both
+    # run_manifest.json and run_status.json without changing strict YAML schemas.
+    out.run_manifest["runtime_warning_count"] = int(runtime_warning_count)
+    if run_manifest_path.exists():
+        try:
+            manifest_doc = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+            if isinstance(manifest_doc, dict):
+                manifest_doc["runtime_warning_count"] = int(runtime_warning_count)
+                run_manifest_path.write_text(
+                    json.dumps(manifest_doc, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        except Exception:
+            pass
+    if run_status_path.exists():
+        try:
+            status_doc = json.loads(run_status_path.read_text(encoding="utf-8"))
+            if isinstance(status_doc, dict):
+                status_doc["runtime_warning_count"] = int(runtime_warning_count)
+                run_status_path.write_text(
+                    json.dumps(status_doc, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        except Exception:
+            pass
 
     leaderboard = out.stats_verdict.get("leaderboard", [])
     pass_count = int(sum(1 for row in leaderboard if bool(row.get("pass", False))))
@@ -717,6 +749,7 @@ def main() -> None:
         "resolved_config_sha256": resolved_sha,
         "run_index": str((artifacts_root / "run_index.jsonl").resolve()),
         "latest_run": str((artifacts_root / ".latest_run").resolve()),
+        "runtime_warning_count": int(runtime_warning_count),
     }
 
     with (run_dir / "run_summary.json").open("w", encoding="utf-8") as f:
