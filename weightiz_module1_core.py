@@ -713,7 +713,7 @@ def preallocate_state(
 
 def _validate_portfolio_constraints(state: TensorState) -> None:
     cfg = state.cfg
-    tol = 1e-10
+    tol = 0.0
 
     if np.any(state.margin_used < -tol):
         idx = int(np.where(state.margin_used < -tol)[0][0])

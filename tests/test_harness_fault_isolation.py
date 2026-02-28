@@ -83,6 +83,36 @@ class TestHarnessFaultIsolation(unittest.TestCase):
         self.assertIn("assets=2", last_reason)
         self.assertIn("candidates=3", last_reason)
 
+    def test_baseline_shortfall_ignores_localized_failures(self) -> None:
+        rows = [
+            {"status": "ok", "scenario_id": "baseline", "split_id": "wf_000", "quality_reason_codes": []},
+            {"status": "ok", "scenario_id": "baseline", "split_id": "wf_001", "quality_reason_codes": []},
+            {
+                "status": "error",
+                "scenario_id": "baseline",
+                "split_id": "wf_002",
+                "error_type": "NonFiniteExecutionPriceError",
+                "quality_reason_codes": ["NONFINITE_EXEC_PX"],
+            },
+        ]
+        reasons = h._baseline_failure_reasons(rows, expected_baseline_tasks=3)
+        self.assertEqual(reasons, [])
+
+    def test_baseline_shortfall_keeps_nonlocalized_errors(self) -> None:
+        rows = [
+            {"status": "ok", "scenario_id": "baseline", "split_id": "wf_000", "quality_reason_codes": []},
+            {
+                "status": "error",
+                "scenario_id": "baseline",
+                "split_id": "wf_001",
+                "error_type": "ValueError",
+                "quality_reason_codes": ["SCHEMA_ERROR"],
+            },
+        ]
+        reasons = h._baseline_failure_reasons(rows, expected_baseline_tasks=2)
+        self.assertTrue(any("baseline_ok_tasks=1 expected=2" in r for r in reasons))
+        self.assertTrue(any("wf_001:ValueError" in r for r in reasons))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -31,6 +31,7 @@ import json
 import multiprocessing as mp
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -66,7 +67,13 @@ from weightiz_module3_structure import (
     Module3Output,
     run_module3_structural_aggregation,
 )
-from weightiz_module4_strategy_funnel import Module4Config, Module4Output, RegimeIdx, run_module4_strategy_funnel
+from weightiz_module4_strategy_funnel import (
+    Module4Config,
+    Module4Output,
+    NonFiniteExecutionPriceError,
+    RegimeIdx,
+    run_module4_strategy_funnel,
+)
 from weightiz_module5_stats import (
     deflated_sharpe_ratio,
     model_confidence_set,
@@ -304,6 +311,12 @@ def _record_deadletter(path: Path, row: dict[str, Any]) -> None:
         "exception_signature": str(row.get("exception_signature", "")),
         "reason_codes": sorted([str(x) for x in row.get("quality_reason_codes", [])]),
     }
+    state_dump = row.get("state_dump")
+    if isinstance(state_dump, dict):
+        payload["state_dump"] = _to_jsonable(state_dump)
+    exec_px_dump = row.get("exec_px_dump")
+    if isinstance(exec_px_dump, dict):
+        payload["exec_px_dump"] = _to_jsonable(exec_px_dump)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(_to_jsonable(payload), ensure_ascii=False) + "\n")
@@ -360,8 +373,111 @@ def _is_localized_reason_codes(reason_codes: list[str]) -> bool:
         or c.startswith("INVARIANT_")
         or ("IB_MISSING" in c)
         or c == "TIMEOUT"
+        or c == "RISK_CONSTRAINT_BREACH"
+        or c == "NONFINITE_EXEC_PX"
+        or c == "NEXT_OPEN_UNAVAILABLE"
         for c in rc
     )
+
+
+def _is_risk_constraint_breach(error_type: str, error_msg: str, top_frame: str, traceback_text: str = "") -> bool:
+    if str(error_type).strip() not in {"RuntimeError", "ValueError", "AssertionError"}:
+        return False
+    top = str(top_frame).strip() or _normalized_top_frame(str(traceback_text))
+    top_low = top.lower()
+    msg_low = str(error_msg).lower()
+    if ("weightiz_module1_core.py" in top_low) and ("_validate_portfolio_constraints" in top_low):
+        return True
+    risk_terms = (
+        "leverage breach",
+        "portfolio constraints",
+        "margin_used",
+        "buying_power",
+        "equity",
+    )
+    return any(term in msg_low for term in risk_terms)
+
+
+def _baseline_failure_reasons(
+    rows_base_all: list[dict[str, Any]],
+    expected_baseline_tasks: int,
+) -> list[str]:
+    rows_base_ok = [r for r in rows_base_all if str(r.get("status", "")) == "ok"]
+    rows_base_err = [r for r in rows_base_all if str(r.get("status", "")) != "ok"]
+    localized_err_rows = [
+        r for r in rows_base_err if _is_localized_reason_codes([str(x) for x in r.get("quality_reason_codes", [])])
+    ]
+    hard_err_rows = [r for r in rows_base_err if r not in localized_err_rows]
+    effective_ok = int(len(rows_base_ok) + len(localized_err_rows))
+
+    reasons: list[str] = []
+    if int(expected_baseline_tasks) > 0 and effective_ok < int(expected_baseline_tasks):
+        reasons.append(f"baseline_ok_tasks={effective_ok} expected={int(expected_baseline_tasks)}")
+    for er in hard_err_rows:
+        reasons.append(f"{str(er.get('split_id', ''))}:{str(er.get('error_type', 'error'))}")
+    return reasons
+
+
+def _extract_breach_index(error_msg: str, state: TensorState | None) -> int:
+    m = re.search(r"\bt\s*=\s*(-?\d+)", str(error_msg))
+    if m is not None:
+        idx = int(m.group(1))
+        if state is None:
+            return max(idx, 0)
+        return int(min(max(idx, 0), state.cfg.T - 1))
+    if state is None:
+        return 0
+    eq = np.asarray(state.equity, dtype=np.float64)
+    mg = np.asarray(state.margin_used, dtype=np.float64)
+    lev = np.asarray(state.leverage_limit, dtype=np.float64)
+    valid = np.isfinite(eq) & np.isfinite(mg) & np.isfinite(lev)
+    breach = valid & (mg > (eq * lev))
+    if np.any(breach):
+        return int(np.where(breach)[0][0])
+    return int(max(state.cfg.T - 1, 0))
+
+
+def _build_risk_constraint_state_dump(
+    state: TensorState,
+    t: int,
+    candidate_id: str,
+    split_id: str,
+    scenario_id: str,
+) -> dict[str, Any]:
+    idx = int(min(max(int(t), 0), state.cfg.T - 1))
+    ts_ns = int(state.ts_ns[idx])
+    ts_utc = datetime.fromtimestamp(float(ts_ns) / 1_000_000_000.0, tz=timezone.utc).isoformat()
+    close_row = np.asarray(state.close_px[idx], dtype=np.float64)
+    pos_row = np.asarray(state.position_qty[idx], dtype=np.float64)
+    position_value = pos_row * close_row
+    per_asset = []
+    for a, sym in enumerate(state.symbols):
+        per_asset.append(
+            {
+                "a": int(a),
+                "symbol": str(sym),
+                "position_qty": float(pos_row[a]),
+                "position_value": float(position_value[a]),
+                "close_px": float(close_row[a]),
+            }
+        )
+    equity_t = float(state.equity[idx])
+    leverage_limit_t = float(state.leverage_limit[idx])
+    return {
+        "t": int(idx),
+        "ts_utc": ts_utc,
+        "candidate_id": str(candidate_id),
+        "split_id": str(split_id),
+        "scenario_id": str(scenario_id),
+        "equity_t": equity_t,
+        "margin_used_t": float(state.margin_used[idx]),
+        "leverage_limit_t": leverage_limit_t,
+        "buying_power_t": float(state.buying_power[idx]),
+        "cash_t": float(state.available_cash[idx]),
+        "realized_pnl_t": float(state.realized_pnl[idx]),
+        "max_margin_allowed_t": float(equity_t * leverage_limit_t),
+        "assets": per_asset,
+    }
 
 
 def _is_high_suspicion_exception(error_type: str) -> bool:
@@ -2240,6 +2356,7 @@ def _run_group_task(
         c = candidates[ci]
         task_id = f"{c.candidate_id}|{split.split_id}|{scenario.scenario_id}"
         task_seed = _seed_for_task(group_seed, task_id)
+        st: TensorState | None = None
         try:
             if task_id in set(harness_cfg.test_fail_task_ids):
                 raise RuntimeError("InjectedTaskFailure: task_id match")
@@ -2273,7 +2390,16 @@ def _run_group_task(
                 * float(scenario.slippage_mult),
             )
 
-            m4_out = run_module4_strategy_funnel(st, m3c, m4_cfg)
+            m4_out = run_module4_strategy_funnel(
+                st,
+                m3c,
+                m4_cfg,
+                run_context={
+                    "candidate_id": str(c.candidate_id),
+                    "split_id": str(split.split_id),
+                    "scenario_id": str(scenario.scenario_id),
+                },
+            )
             validate_state_hard(st)
 
             sess_ids, close_idx, daily_ret = _candidate_daily_returns_close_to_close(
@@ -2341,13 +2467,15 @@ def _run_group_task(
                     "dqs_median": dqs_median,
                 }
             )
-        except Exception as exc:
+        except NonFiniteExecutionPriceError as exc:
             err_type = type(exc).__name__
             err_msg = str(exc)
             tb = traceback.format_exc()
             top_frame = _normalized_top_frame(tb)
             sig = f"{err_type}|{top_frame}"
             asset_keys = [base_state.symbols[i] for i in np.flatnonzero(c.enabled_assets_mask).tolist()]
+            rc = str(getattr(exc, "reason_code", "NONFINITE_EXEC_PX")).strip() or "NONFINITE_EXEC_PX"
+            quality_reason_codes = sorted(set(post_m2_reasons + post_m3_reasons + [rc]))
             outputs.append(
                 {
                     "task_id": task_id,
@@ -2375,8 +2503,63 @@ def _run_group_task(
                     "tags": list(c.tags),
                     "test_days": 0,
                     "task_seed": int(task_seed),
-                    "quality_reason_codes": sorted(set(post_m2_reasons + post_m3_reasons)),
+                    "quality_reason_codes": quality_reason_codes,
                     "asset_keys": asset_keys,
+                    "exec_px_dump": dict(getattr(exc, "exec_px_dump", {}) or {}),
+                    "dqs_min": 0.0,
+                    "dqs_median": 0.0,
+                }
+            )
+        except Exception as exc:
+            err_type = type(exc).__name__
+            err_msg = str(exc)
+            tb = traceback.format_exc()
+            top_frame = _normalized_top_frame(tb)
+            sig = f"{err_type}|{top_frame}"
+            asset_keys = [base_state.symbols[i] for i in np.flatnonzero(c.enabled_assets_mask).tolist()]
+            quality_reason_codes = sorted(set(post_m2_reasons + post_m3_reasons))
+            state_dump: dict[str, Any] | None = None
+            if _is_risk_constraint_breach(err_type, err_msg, top_frame, tb):
+                quality_reason_codes = sorted(set(quality_reason_codes + ["RISK_CONSTRAINT_BREACH"]))
+                if st is not None:
+                    t_idx = _extract_breach_index(err_msg, st)
+                    state_dump = _build_risk_constraint_state_dump(
+                        st,
+                        t_idx,
+                        c.candidate_id,
+                        split.split_id,
+                        scenario.scenario_id,
+                    )
+            outputs.append(
+                {
+                    "task_id": task_id,
+                    "candidate_id": c.candidate_id,
+                    "split_id": split.split_id,
+                    "scenario_id": scenario.scenario_id,
+                    "status": "error",
+                    "error_type": err_type,
+                    "error_hash": _error_hash(err_type, err_msg),
+                    "error": f"{err_type}: {err_msg}",
+                    "traceback": tb,
+                    "top_frame": top_frame,
+                    "exception_signature": sig,
+                    "session_ids": np.zeros(0, dtype=np.int64),
+                    "daily_returns": np.zeros(0, dtype=np.float64),
+                    "equity_payload": None,
+                    "trade_payload": None,
+                    "asset_pnl_by_symbol": {},
+                    "micro_payload": None,
+                    "profile_payload": None,
+                    "funnel_payload": None,
+                    "m2_idx": int(c.m2_idx),
+                    "m3_idx": int(c.m3_idx),
+                    "m4_idx": int(c.m4_idx),
+                    "tags": list(c.tags),
+                    "test_days": 0,
+                    "task_seed": int(task_seed),
+                    "quality_reason_codes": quality_reason_codes,
+                    "asset_keys": asset_keys,
+                    "state_dump": state_dump,
                     "dqs_min": 0.0,
                     "dqs_median": 0.0,
                 }
@@ -2798,16 +2981,10 @@ def _build_candidate_artifacts(
         fold_dsrs: list[float] = []
         rows_base_all = [r for r in rows_all if str(r.get("scenario_id", "")) == "baseline"]
         rows_base = [r for r in rows_base_all if str(r.get("status", "")) == "ok"]
-        baseline_fail_reasons: list[str] = []
-        if int(expected_baseline_tasks) > 0 and len(rows_base) < int(expected_baseline_tasks):
-            baseline_fail_reasons.append(
-                f"baseline_ok_tasks={len(rows_base)} expected={int(expected_baseline_tasks)}"
-            )
-        baseline_err_rows = [r for r in rows_base_all if str(r.get("status", "")) != "ok"]
-        for er in baseline_err_rows:
-            baseline_fail_reasons.append(
-                f"{str(er.get('split_id', ''))}:{str(er.get('error_type', 'error'))}"
-            )
+        baseline_fail_reasons = _baseline_failure_reasons(
+            rows_base_all=rows_base_all,
+            expected_baseline_tasks=int(expected_baseline_tasks),
+        )
         dqs_row_median = np.asarray(
             [float(r.get("dqs_median", np.nan)) for r in rows_all],
             dtype=np.float64,

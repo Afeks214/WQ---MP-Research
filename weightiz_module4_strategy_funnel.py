@@ -15,9 +15,10 @@ Key guarantees:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Tuple
+from typing import Any, Callable, Tuple
 
 import numpy as np
 
@@ -30,9 +31,9 @@ from weightiz_module1_core import (
     validate_state_hard,
 )
 from weightiz_module3_structure import (
+    ContextIdx,
     IB_MISSING_POLICY,
     IB_POLICY_NO_TRADE,
-    ContextIdx,
     Module3Output,
     Struct30mIdx,
 )
@@ -55,7 +56,6 @@ class OrderFlagBit(IntEnum):
     OVERNIGHT_SELECTED = 1 << 4
     KILL_SWITCH = 1 << 5
     MOC_EXEC = 1 << 6
-    EXEC_SKIPPED_BAD_PRICE = 1 << 7
 
 
 @dataclass(frozen=True)
@@ -94,7 +94,6 @@ class Module4Config:
 
     # Runtime strictness
     fail_on_non_finite_input: bool = True
-    execution_strict_prices: bool = False
     fail_on_non_finite_output: bool = True
     eps: float = 1e-12
 
@@ -112,6 +111,20 @@ class Module4Output:
     overnight_score_ta: np.ndarray
     overnight_winner_t: np.ndarray
     kill_switch_t: np.ndarray
+
+
+class NonFiniteExecutionPriceError(RuntimeError):
+    def __init__(self, reason_code: str, exec_px_dump: dict[str, Any], message: str) -> None:
+        super().__init__(str(message))
+        self.reason_code = str(reason_code)
+        self.exec_px_dump = dict(exec_px_dump)
+
+
+def _first_true_idx(mask: np.ndarray) -> int:
+    m = np.asarray(mask, dtype=bool)
+    if not np.any(m):
+        return -1
+    return int(np.where(m)[0][0])
 
 
 def _assert_shape(name: str, arr: np.ndarray, expected: Tuple[int, ...]) -> None:
@@ -204,29 +217,6 @@ def _weighted_argmax_with_tie(score: np.ndarray, tie: np.ndarray) -> int:
     return int(idx[order[0]])
 
 
-def _pending_exec_price_with_fallback(
-    open_px: np.ndarray,
-    close_px: np.ndarray,
-    bar_valid: np.ndarray,
-) -> np.ndarray:
-    """
-    Deterministic pending-open execution price selection, per asset:
-    1) use open if bar_valid and finite and > 0
-    2) else use close if bar_valid and finite and > 0
-    3) else NaN
-    """
-    open_t = np.asarray(open_px, dtype=np.float64)
-    close_t = np.asarray(close_px, dtype=np.float64)
-    valid_t = np.asarray(bar_valid, dtype=bool)
-    out = np.full(open_t.shape, np.nan, dtype=np.float64)
-    open_ok = valid_t & np.isfinite(open_t) & (open_t > 0.0)
-    close_ok = valid_t & np.isfinite(close_t) & (close_t > 0.0)
-    out[open_ok] = open_t[open_ok]
-    use_close = (~open_ok) & close_ok
-    out[use_close] = close_t[use_close]
-    return out
-
-
 def _execute_to_target(
     pos: np.ndarray,
     avg_cost: np.ndarray,
@@ -239,7 +229,10 @@ def _execute_to_target(
     cfg: Module4Config,
     strict: bool,
     eps: float,
-) -> Tuple[float, float, np.ndarray, np.ndarray, np.ndarray]:
+    px_source_name: str = "unknown",
+    dump_builder: Callable[[int, float, str], dict[str, Any]] | None = None,
+    error_reason_code: str = "NONFINITE_EXEC_PX",
+) -> Tuple[float, float, np.ndarray, np.ndarray]:
     """
     Execute transition pos -> target at supplied prices.
     Mutates pos/avg_cost; returns updated cash/realized and per-asset delta/cost.
@@ -247,8 +240,25 @@ def _execute_to_target(
     A = pos.shape[0]
     delta = target - pos
     trade_cost = np.zeros(A, dtype=np.float64)
-    exec_skipped_bad_price = np.zeros(A, dtype=bool)
     slip_bps = _slippage_bps_from_rvol(rvol, cfg)
+    exec_needed = np.abs(delta) > eps
+    if np.any(exec_needed):
+        bad = exec_needed & ((~np.isfinite(price)) | (price <= 0.0))
+        if np.any(bad):
+            a_bad = int(np.where(bad)[0][0])
+            px_bad = float(price[a_bad])
+            payload = dump_builder(a_bad, px_bad, str(px_source_name)) if dump_builder is not None else {
+                "t": -1,
+                "asset_index": int(a_bad),
+                "asset_symbol": "",
+                "px_source_name": str(px_source_name),
+                "px_value": px_bad,
+            }
+            raise NonFiniteExecutionPriceError(
+                reason_code=str(error_reason_code),
+                exec_px_dump=payload,
+                message=f"Non-finite/non-positive execution price at a={a_bad}: {px_bad}",
+            )
 
     for a in range(A):
         dq = float(delta[a])
@@ -257,9 +267,19 @@ def _execute_to_target(
         px = float(price[a])
         if (not np.isfinite(px)) or (px <= 0.0):
             if strict:
-                raise RuntimeError(f"Non-finite/non-positive execution price at a={a}: {px}")
+                payload = dump_builder(a, px, str(px_source_name)) if dump_builder is not None else {
+                    "t": -1,
+                    "asset_index": int(a),
+                    "asset_symbol": "",
+                    "px_source_name": str(px_source_name),
+                    "px_value": px,
+                }
+                raise NonFiniteExecutionPriceError(
+                    reason_code=str(error_reason_code),
+                    exec_px_dump=payload,
+                    message=f"Non-finite/non-positive execution price at a={a}: {px}",
+                )
             delta[a] = 0.0
-            exec_skipped_bad_price[a] = True
             continue
 
         ts = float(tick_size[a])
@@ -300,7 +320,80 @@ def _execute_to_target(
         pos[a] = new_pos
         cash -= dq * px + cost
 
-    return cash, realized, delta, trade_cost, exec_skipped_bad_price
+    return cash, realized, delta, trade_cost
+
+
+def _build_exec_px_dump(
+    state: TensorState,
+    m3: Module3Output,
+    t_signal: int,
+    t_fill: int,
+    a: int,
+    px_source_name: str,
+    px_value: float,
+    target_qty: float,
+    reason_code: str,
+    pending_order_id: str,
+    quarantine_applied: bool,
+    run_context: dict[str, Any],
+) -> dict[str, Any]:
+    t_sig = int(min(max(int(t_signal), 0), state.cfg.T - 1))
+    t_fil = int(min(max(int(t_fill), 0), state.cfg.T - 1))
+    aa = int(min(max(int(a), 0), state.cfg.A - 1))
+    ts_ns_sig = int(state.ts_ns[t_sig])
+    ts_ns_fil = int(state.ts_ns[t_fil])
+    ts_utc_sig = datetime.fromtimestamp(float(ts_ns_sig) / 1_000_000_000.0, tz=timezone.utc).isoformat()
+    ts_utc_fil = datetime.fromtimestamp(float(ts_ns_fil) / 1_000_000_000.0, tz=timezone.utc).isoformat()
+    dqs_day = np.nan
+    if hasattr(state, "dqs_day_ta"):
+        dqs_arr = np.asarray(getattr(state, "dqs_day_ta"), dtype=np.float64)
+        if dqs_arr.shape == (state.cfg.T, state.cfg.A):
+            dqs_day = float(dqs_arr[t_fil, aa])
+    ib_defined = True
+    if m3.ib_defined_ta is not None:
+        ib_defined = bool(np.asarray(m3.ib_defined_ta, dtype=bool)[t_fil, aa])
+    return {
+        "run_context": {
+            "candidate_id": str(run_context.get("candidate_id", "unknown")),
+            "split_id": str(run_context.get("split_id", "unknown")),
+            "scenario_id": str(run_context.get("scenario_id", "unknown")),
+        },
+        "reason_code": str(reason_code),
+        "t_signal": int(t_sig),
+        "t_fill": int(t_fil),
+        "ts_utc_signal": ts_utc_sig,
+        "ts_utc_fill": ts_utc_fil,
+        "asset_index": int(aa),
+        "asset_symbol": str(state.symbols[aa]),
+        "px_source_name": str(px_source_name),
+        "px_value": float(px_value),
+        "open_px_signal": float(state.open_px[t_sig, aa]),
+        "high_px_signal": float(state.high_px[t_sig, aa]),
+        "low_px_signal": float(state.low_px[t_sig, aa]),
+        "close_px_signal": float(state.close_px[t_sig, aa]),
+        "open_px_fill": float(state.open_px[t_fil, aa]),
+        "high_px_fill": float(state.high_px[t_fil, aa]),
+        "low_px_fill": float(state.low_px[t_fil, aa]),
+        "close_px_fill": float(state.close_px[t_fil, aa]),
+        "bar_valid_signal": bool(state.bar_valid[t_sig, aa]),
+        "bar_valid_fill": bool(state.bar_valid[t_fil, aa]),
+        "target_qty": float(target_qty),
+        "position_qty_fill": float(state.position_qty[t_fil, aa]),
+        "limit_px": float(state.orders[t_sig, aa, int(OrderIdx.LIMIT_PX)]),
+        "stop_px": float(state.orders[t_sig, aa, int(OrderIdx.STOP_PX)]),
+        "take_px": float(state.orders[t_sig, aa, int(OrderIdx.TAKE_PX)]),
+        "conviction": float(state.orders[t_sig, aa, int(OrderIdx.CONVICTION)]),
+        "dqs_day": float(dqs_day),
+        "ib_defined": bool(ib_defined),
+        "phase_signal": int(state.phase[t_sig]),
+        "phase_fill": int(state.phase[t_fil]),
+        "tod_signal": int(state.tod[t_sig]),
+        "tod_fill": int(state.tod[t_fil]),
+        "minute_of_day_signal": int(state.minute_of_day[t_sig]),
+        "minute_of_day_fill": int(state.minute_of_day[t_fil]),
+        "pending_order_id": str(pending_order_id),
+        "quarantine_applied": bool(quarantine_applied),
+    }
 
 
 def _accumulate_exec_row(
@@ -336,6 +429,7 @@ def run_module4_strategy_funnel(
     state: TensorState,
     m3: Module3Output,
     cfg4: Module4Config,
+    run_context: dict[str, Any] | None = None,
 ) -> Module4Output:
     """
     Run deterministic strategy engine and Zimtra funnel with in-place state mutation.
@@ -344,6 +438,8 @@ def run_module4_strategy_funnel(
     A = state.cfg.A
     B = state.cfg.B
     eps = float(cfg4.eps)
+    if run_context is None:
+        run_context = {}
 
     # Shape checks
     _assert_shape("profile_stats", state.profile_stats, (T, A, int(ProfileStatIdx.N_FIELDS)))
@@ -361,22 +457,26 @@ def run_module4_strategy_funnel(
     _assert_shape("m3.context_valid_ta", m3.context_valid_ta, (T, A))
     _assert_shape("m3.context_source_t_index_ta", m3.context_source_t_index_ta, (T, A))
     _assert_shape("m3.block_features_tak", m3.block_features_tak, (T, A, int(Struct30mIdx.N_FIELDS)))
+    if m3.ib_defined_ta is not None:
+        _assert_shape("m3.ib_defined_ta", m3.ib_defined_ta, (T, A))
 
     phase_live = np.int8(Phase.LIVE)
     phase_os = np.int8(Phase.OVERNIGHT_SELECT)
     phase_flat = np.int8(Phase.FLATTEN)
     in_exec_phase_t = np.isin(state.phase, np.array([phase_live, phase_os, phase_flat], dtype=np.int8))
     tradable_ta = state.bar_valid & m3.context_valid_ta & in_exec_phase_t[:, None]
-    dqs_day_ta = np.asarray(getattr(state, "dqs_day_ta", np.ones((T, A), dtype=np.float64)), dtype=np.float64)
-    if dqs_day_ta.shape != (T, A):
-        raise RuntimeError(f"dqs_day_ta shape mismatch: got {dqs_day_ta.shape}, expected {(T, A)}")
+    dqs_day_ta = getattr(state, "dqs_day_ta", None)
+    if dqs_day_ta is None:
+        dqs_day_ta = np.ones((T, A), dtype=np.float64)
+    else:
+        dqs_day_ta = np.asarray(dqs_day_ta, dtype=np.float64)
+        _assert_shape("state.dqs_day_ta", dqs_day_ta, (T, A))
     dqs_day_ta = np.clip(np.where(np.isfinite(dqs_day_ta), dqs_day_ta, 0.0), 0.0, 1.0)
-    ib_defined_ta = np.ones((T, A), dtype=bool)
-    if m3.ib_defined_ta is not None:
+    ib_missing_no_trade = str(IB_MISSING_POLICY).upper().strip() == str(IB_POLICY_NO_TRADE)
+    if m3.ib_defined_ta is None:
+        ib_defined_ta = np.ones((T, A), dtype=bool)
+    else:
         ib_defined_ta = np.asarray(m3.ib_defined_ta, dtype=bool)
-        if ib_defined_ta.shape != (T, A):
-            raise RuntimeError(f"m3.ib_defined_ta shape mismatch: got {ib_defined_ta.shape}, expected {(T, A)}")
-    ib_no_trade_policy = str(IB_MISSING_POLICY).upper().strip() == str(IB_POLICY_NO_TRADE)
 
     if cfg4.fail_on_non_finite_input:
         _assert_finite_masked("close_px", state.close_px, tradable_ta)
@@ -433,8 +533,11 @@ def run_module4_strategy_funnel(
     realized = 0.0
     pending_target = np.zeros(A, dtype=np.float64)
     pending_active = False
+    pending_signal_t = -1
+    pending_signal_session_id = -1
     overnight_idx = -1
     kill_switch_session = False
+    quarantined_asset = np.zeros(A, dtype=bool)
 
     # Session baseline for daily loss
     session_start_equity = float(state.cfg.initial_cash)
@@ -444,51 +547,150 @@ def run_module4_strategy_funnel(
 
     # Causal bar loop (required due portfolio state recursion)
     for t in range(T):
-        exec_skipped_bad_price_row = np.zeros(A, dtype=bool)
         if t == 0 or state.session_id[t] != state.session_id[t - 1]:
             kill_switch_session = False
+            quarantined_asset[:] = False
             # Mark new session baseline at open mark-to-market.
             open_mark = np.where(np.isfinite(state.open_px[t]), state.open_px[t], np.where(np.isfinite(state.close_px[t]), state.close_px[t], 0.0))
             session_start_equity = float(cash + np.sum(pos * open_mark))
 
         # 1) Execute pending next-open target from prior bar.
         if pending_active:
-            open_px = state.open_px[t]
-            close_px = state.close_px[t]
-            bar_valid = state.bar_valid[t]
-            exec_px = _pending_exec_price_with_fallback(
-                open_px=open_px,
-                close_px=close_px,
-                bar_valid=bar_valid,
-            )
-            rvol_t = state.rvol[t]
-            cash, realized, delta_open, cost_open, skipped_open = _execute_to_target(
+            t_fill = int(t)
+            t_signal = int(pending_signal_t)
+            same_session = (t_signal >= 0) and (int(state.session_id[t_fill]) == int(pending_signal_session_id))
+            exec_needed = np.abs(pending_target - pos) > eps
+            if np.any(exec_needed) and (not same_session):
+                a_bad = _first_true_idx(exec_needed)
+                target_before_cancel = float(pending_target[a_bad])
+                quarantined_asset[a_bad] = True
+                pending_target[a_bad] = pos[a_bad]
+                pending_active = False
+                dump = _build_exec_px_dump(
+                    state=state,
+                    m3=m3,
+                    t_signal=max(t_signal, 0),
+                    t_fill=t_fill,
+                    a=a_bad,
+                    px_source_name="next_open",
+                    px_value=float("nan"),
+                    target_qty=target_before_cancel,
+                    reason_code="NEXT_OPEN_UNAVAILABLE",
+                    pending_order_id=f"sig{max(t_signal,0)}_fill{t_fill}_a{a_bad}",
+                    quarantine_applied=True,
+                    run_context=run_context,
+                )
+                raise NonFiniteExecutionPriceError(
+                    reason_code="NEXT_OPEN_UNAVAILABLE",
+                    exec_px_dump=dump,
+                    message=f"Next-open unavailable for pending order at a={a_bad}: signal_t={t_signal}, fill_t={t_fill}",
+                )
+
+            open_px = state.open_px[t_fill]
+            invalid_fill_bar = exec_needed & (~np.asarray(state.bar_valid[t_fill], dtype=bool))
+            if np.any(invalid_fill_bar):
+                a_bad = _first_true_idx(invalid_fill_bar)
+                target_before_cancel = float(pending_target[a_bad])
+                quarantined_asset[a_bad] = True
+                pending_target[a_bad] = pos[a_bad]
+                pending_active = False
+                dump = _build_exec_px_dump(
+                    state=state,
+                    m3=m3,
+                    t_signal=max(t_signal, 0),
+                    t_fill=t_fill,
+                    a=a_bad,
+                    px_source_name="next_open",
+                    px_value=float(open_px[a_bad]),
+                    target_qty=target_before_cancel,
+                    reason_code="NEXT_OPEN_UNAVAILABLE",
+                    pending_order_id=f"sig{max(t_signal,0)}_fill{t_fill}_a{a_bad}",
+                    quarantine_applied=True,
+                    run_context=run_context,
+                )
+                raise NonFiniteExecutionPriceError(
+                    reason_code="NEXT_OPEN_UNAVAILABLE",
+                    exec_px_dump=dump,
+                    message=f"Next-open unavailable at invalid fill bar for pending order at a={a_bad}: signal_t={t_signal}, fill_t={t_fill}",
+                )
+            bad_px = exec_needed & ((~np.isfinite(open_px)) | (open_px <= 0.0))
+            if np.any(bad_px):
+                a_bad = _first_true_idx(bad_px)
+                target_before_cancel = float(pending_target[a_bad])
+                quarantined_asset[a_bad] = True
+                pending_target[a_bad] = pos[a_bad]
+                pending_active = False
+                dump = _build_exec_px_dump(
+                    state=state,
+                    m3=m3,
+                    t_signal=max(t_signal, 0),
+                    t_fill=t_fill,
+                    a=a_bad,
+                    px_source_name="next_open",
+                    px_value=float(open_px[a_bad]),
+                    target_qty=target_before_cancel,
+                    reason_code="NONFINITE_EXEC_PX",
+                    pending_order_id=f"sig{max(t_signal,0)}_fill{t_fill}_a{a_bad}",
+                    quarantine_applied=True,
+                    run_context=run_context,
+                )
+                raise NonFiniteExecutionPriceError(
+                    reason_code="NONFINITE_EXEC_PX",
+                    exec_px_dump=dump,
+                    message=f"Non-finite/non-positive execution price at a={a_bad}: {float(open_px[a_bad])}",
+                )
+
+            rvol_t = state.rvol[t_fill]
+            cash, realized, delta_open, cost_open = _execute_to_target(
                 pos=pos,
                 avg_cost=avg_cost,
                 cash=cash,
                 realized=realized,
                 target=pending_target,
-                price=exec_px,
+                price=open_px,
                 rvol=rvol_t,
                 tick_size=tick_size,
                 cfg=cfg4,
-                strict=cfg4.execution_strict_prices,
+                strict=cfg4.fail_on_non_finite_input,
                 eps=eps,
+                px_source_name="next_open",
+                dump_builder=lambda a_bad, px_bad, src_name: _build_exec_px_dump(
+                    state=state,
+                    m3=m3,
+                    t_signal=max(t_signal, 0),
+                    t_fill=t_fill,
+                    a=a_bad,
+                    px_source_name=src_name,
+                    px_value=px_bad,
+                    target_qty=float(pending_target[int(a_bad)]),
+                    reason_code="NONFINITE_EXEC_PX",
+                    pending_order_id=f"sig{max(t_signal,0)}_fill{t_fill}_a{int(a_bad)}",
+                    quarantine_applied=False,
+                    run_context=run_context,
+                ),
+                error_reason_code="NONFINITE_EXEC_PX",
             )
-            exec_skipped_bad_price_row |= skipped_open
             _accumulate_exec_row(
                 filled_row=filled_qty_ta[t],
                 exec_px_row=exec_price_ta[t],
                 cost_row=trade_cost_ta[t],
                 delta=delta_open,
-                px=exec_px,
+                px=open_px,
                 cost=cost_open,
                 eps=eps,
             )
             pending_active = False
+            pending_signal_t = -1
+            pending_signal_session_id = -1
 
         phase_t = np.int8(state.phase[t])
         tradable = tradable_ta[t].copy()
+        dqs_t = dqs_day_ta[t]
+        dqs_force_neutral = dqs_t < 0.50
+        ib_force_neutral = (~ib_defined_ta[t]) if ib_missing_no_trade else np.zeros(A, dtype=bool)
+        force_neutral = dqs_force_neutral | ib_force_neutral
+        tradable &= (~force_neutral)
+        tradable &= (~quarantined_asset)
 
         # Pull channels
         ctx = m3.context_tac[t]
@@ -504,8 +706,6 @@ def run_module4_strategy_funnel(
         atr_eff_t = state.atr_floor[t]
         rvol_t = state.rvol[t]
         skew_t = skew_ta[t]
-        dqs_t = dqs_day_ta[t]
-        ib_defined_t = ib_defined_ta[t]
 
         ctx_x_vah = ctx[:, int(ContextIdx.CTX_X_VAH)]
         ctx_x_val = ctx[:, int(ContextIdx.CTX_X_VAL)]
@@ -531,11 +731,8 @@ def run_module4_strategy_funnel(
             & np.isfinite(ctx_tgs)
             & np.isfinite(ctx_poc_drift)
             & np.isfinite(ctx_poc_vs_prev_va)
-            & np.isfinite(dqs_t)
         )
         tradable &= finite_core
-        if ib_no_trade_policy:
-            tradable &= ib_defined_t
 
         # 2) Regime logic
         trend_up = (
@@ -603,21 +800,21 @@ def run_module4_strategy_funnel(
         regime_confidence_ta[t] = reg_conf
 
         # 3) Deterministic intents
-        conv_long_raw = np.maximum(bo_l, rj_l)
-        conv_short_raw = np.maximum(bo_s, rj_s)
-        conv_long_eff = conv_long_raw * dqs_t
-        conv_short_eff = conv_short_raw * dqs_t
+        bo_l_eff = bo_l * dqs_t
+        bo_s_eff = bo_s * dqs_t
+        rj_l_eff = rj_l * dqs_t
+        rj_s_eff = rj_s * dqs_t
 
-        intent_bo_long = tradable & (trend_up | p_shape | double_up) & (conv_long_eff > float(cfg4.entry_threshold)) & (gbreak > 0.5)
-        intent_bo_short = tradable & (trend_down | b_shape | double_down) & (conv_short_eff > float(cfg4.entry_threshold)) & (gbreak > 0.5)
-        intent_rej_long = tradable & (neutral | p_shape) & (conv_long_eff > float(cfg4.entry_threshold)) & (greject > 0.5)
-        intent_rej_short = tradable & (neutral | b_shape) & (conv_short_eff > float(cfg4.entry_threshold)) & (greject > 0.5)
+        intent_bo_long = tradable & (trend_up | p_shape | double_up) & (bo_l_eff > float(cfg4.entry_threshold)) & (gbreak > 0.5)
+        intent_bo_short = tradable & (trend_down | b_shape | double_down) & (bo_s_eff > float(cfg4.entry_threshold)) & (gbreak > 0.5)
+        intent_rej_long = tradable & (neutral | p_shape) & (rj_l_eff > float(cfg4.entry_threshold)) & (greject > 0.5)
+        intent_rej_short = tradable & (neutral | b_shape) & (rj_s_eff > float(cfg4.entry_threshold)) & (greject > 0.5)
 
         intent_long = intent_bo_long | intent_rej_long
         intent_short = intent_bo_short | intent_rej_short
 
-        conv_long = conv_long_eff
-        conv_short = conv_short_eff
+        conv_long = np.maximum(bo_l_eff, rj_l_eff)
+        conv_short = np.maximum(bo_s_eff, rj_s_eff)
         both = intent_long & intent_short
         long_better = conv_long > conv_short
         short_better = conv_short > conv_long
@@ -633,18 +830,13 @@ def run_module4_strategy_funnel(
         intent_long = intent_long & (~exit_any)
         intent_short = intent_short & (~exit_any)
 
-        low_dqs = dqs_t < 0.50
-        intent_long[low_dqs] = False
-        intent_short[low_dqs] = False
-        if ib_no_trade_policy:
-            ib_block = ~ib_defined_t
-            intent_long[ib_block] = False
-            intent_short[ib_block] = False
-
         # Kill switch blocks new entries.
         if kill_switch_session:
             intent_long[:] = False
             intent_short[:] = False
+        if np.any(force_neutral):
+            intent_long[force_neutral] = False
+            intent_short[force_neutral] = False
 
         intent_long_ta[t] = intent_long
         intent_short_ta[t] = intent_short
@@ -652,6 +844,7 @@ def run_module4_strategy_funnel(
         # Build target at bar t
         target = pos.copy()
         target[exit_any] = 0.0
+        target[force_neutral] = 0.0
 
         # 5) Intraday allocation (LIVE only, next-open fill)
         if phase_t == phase_live and (not kill_switch_session):
@@ -677,8 +870,7 @@ def run_module4_strategy_funnel(
                     w_sum = float(np.sum(w))
                     if w_sum > eps:
                         w = w / w_sum
-                        mtm_alloc = np.where(np.isfinite(close_t), close_t, np.where(np.isfinite(state.open_px[t]), state.open_px[t], 0.0))
-                        equity_now = float(cash + np.sum(pos * mtm_alloc))
+                        equity_now = float(cash + np.sum(pos * close_t))
                         gross_budget = max(0.0, equity_now * float(state.cfg.intraday_leverage_max))
                         raw_notional = gross_budget * w
                         cap_notional = equity_now * float(cfg4.max_asset_cap_frac)
@@ -706,7 +898,7 @@ def run_module4_strategy_funnel(
         if phase_t == phase_os:
             # Force flatten at close first.
             zero_target = np.zeros(A, dtype=np.float64)
-            cash, realized, delta_close_flat, cost_close_flat, skipped_close_flat = _execute_to_target(
+            cash, realized, delta_close_flat, cost_close_flat = _execute_to_target(
                 pos=pos,
                 avg_cost=avg_cost,
                 cash=cash,
@@ -716,10 +908,24 @@ def run_module4_strategy_funnel(
                 rvol=rvol_t,
                 tick_size=tick_size,
                 cfg=cfg4,
-                strict=cfg4.execution_strict_prices,
+                strict=cfg4.fail_on_non_finite_input,
                 eps=eps,
+                px_source_name="close_flatten",
+                dump_builder=lambda a_bad, px_bad, src_name: _build_exec_px_dump(
+                    state=state,
+                    m3=m3,
+                    t_signal=t,
+                    t_fill=t,
+                    a=a_bad,
+                    px_source_name=src_name,
+                    px_value=px_bad,
+                    target_qty=float(zero_target[int(a_bad)]),
+                    reason_code="NONFINITE_EXEC_PX",
+                    pending_order_id=f"samebar_close_flat_t{t}_a{int(a_bad)}",
+                    quarantine_applied=False,
+                    run_context=run_context,
+                ),
             )
-            exec_skipped_bad_price_row |= skipped_close_flat
             _accumulate_exec_row(
                 filled_row=filled_qty_ta[t],
                 exec_px_row=exec_price_ta[t],
@@ -757,14 +963,13 @@ def run_module4_strategy_funnel(
                 else:
                     side = 1.0 if dclip[win] >= 0.0 else -1.0
 
-                mtm_overnight = np.where(np.isfinite(close_t), close_t, np.where(np.isfinite(state.open_px[t]), state.open_px[t], 0.0))
-                equity_now = float(cash + np.sum(pos * mtm_overnight))
+                equity_now = float(cash + np.sum(pos * close_t))
                 overnight_notional = max(0.0, equity_now * float(state.cfg.overnight_leverage))
                 px = max(float(close_t[win]), float(tick_size[win]))
                 one_target = np.zeros(A, dtype=np.float64)
                 one_target[win] = side * (overnight_notional / (px + eps))
 
-                cash, realized, delta_close_on, cost_close_on, skipped_close_on = _execute_to_target(
+                cash, realized, delta_close_on, cost_close_on = _execute_to_target(
                     pos=pos,
                     avg_cost=avg_cost,
                     cash=cash,
@@ -774,10 +979,24 @@ def run_module4_strategy_funnel(
                     rvol=rvol_t,
                     tick_size=tick_size,
                     cfg=cfg4,
-                    strict=cfg4.execution_strict_prices,
+                    strict=cfg4.fail_on_non_finite_input,
                     eps=eps,
+                    px_source_name="close_overnight_select",
+                    dump_builder=lambda a_bad, px_bad, src_name: _build_exec_px_dump(
+                        state=state,
+                        m3=m3,
+                        t_signal=t,
+                        t_fill=t,
+                        a=a_bad,
+                        px_source_name=src_name,
+                        px_value=px_bad,
+                        target_qty=float(one_target[int(a_bad)]),
+                        reason_code="NONFINITE_EXEC_PX",
+                        pending_order_id=f"samebar_overnight_t{t}_a{int(a_bad)}",
+                        quarantine_applied=False,
+                        run_context=run_context,
+                    ),
                 )
-                exec_skipped_bad_price_row |= skipped_close_on
                 _accumulate_exec_row(
                     filled_row=filled_qty_ta[t],
                     exec_px_row=exec_price_ta[t],
@@ -800,19 +1019,30 @@ def run_module4_strategy_funnel(
             pending_active = False
 
         elif phase_t == phase_live:
-            safe_close_live = np.where(np.isfinite(close_t) & (close_t > 0.0), close_t, 0.0)
-            equity_live = float(cash + np.sum(pos * safe_close_live))
-            gross_budget_live = max(0.0, equity_live * float(state.cfg.intraday_leverage_max))
-            target_notional = float(np.sum(np.abs(target * safe_close_live)))
-            if target_notional > gross_budget_live + eps and target_notional > eps:
-                target = target * (gross_budget_live / target_notional)
-            # Schedule target for next open.
-            pending_target = target.copy()
-            pending_active = True
+            # Schedule target for next open only if the structural next bar remains in-session.
+            # This is a calendar/clock guard (no price peeking) that prevents orphan pending orders
+            # across short-session and holiday boundaries.
+            has_next_bar = (t + 1) < T
+            same_session_next = has_next_bar and (int(state.session_id[t + 1]) == int(state.session_id[t]))
+            if same_session_next:
+                pending_target = target.copy()
+                pending_active = True
+                pending_signal_t = int(t)
+                pending_signal_session_id = int(state.session_id[t])
+            else:
+                blocked = np.abs(target - pos) > eps
+                if np.any(blocked):
+                    target[blocked] = pos[blocked]
+                    quarantined_asset[blocked] = True
+                pending_active = False
+                pending_signal_t = -1
+                pending_signal_session_id = -1
         else:
             # WARMUP or unknown: no new orders.
             target = pos.copy()
             pending_active = False
+            pending_signal_t = -1
+            pending_signal_session_id = -1
 
         target_qty_ta[t] = target
 
@@ -832,7 +1062,6 @@ def run_module4_strategy_funnel(
             flags[cands] |= np.uint16(OrderFlagBit.OVERNIGHT_CANDIDATE)
             if overnight_winner_t[t] >= 0:
                 flags[int(overnight_winner_t[t])] |= np.uint16(OrderFlagBit.OVERNIGHT_SELECTED)
-        flags[exec_skipped_bad_price_row] |= np.uint16(OrderFlagBit.EXEC_SKIPPED_BAD_PRICE)
 
         state.orders[t, :, int(OrderIdx.TARGET_QTY)] = target
         state.orders[t, :, int(OrderIdx.CONVICTION)] = np.maximum(conv_long, conv_short)
@@ -852,20 +1081,35 @@ def run_module4_strategy_funnel(
 
         # Hard kill switch: immediate same-bar flatten at close.
         if breached and bool(cfg4.hard_kill_on_daily_loss_breach):
-            kill_target = np.zeros(A, dtype=np.float64)
             if np.any(np.abs(pos) > eps):
-                cash, realized, delta_kill, cost_kill, skipped_kill = _execute_to_target(
+                zero_target = np.zeros(A, dtype=np.float64)
+                cash, realized, delta_kill, cost_kill = _execute_to_target(
                     pos=pos,
                     avg_cost=avg_cost,
                     cash=cash,
                     realized=realized,
-                    target=kill_target,
+                    target=zero_target,
                     price=mtm_close,
                     rvol=rvol_t,
                     tick_size=tick_size,
                     cfg=cfg4,
-                    strict=cfg4.execution_strict_prices,
+                    strict=cfg4.fail_on_non_finite_input,
                     eps=eps,
+                    px_source_name="kill_switch_close",
+                    dump_builder=lambda a_bad, px_bad, src_name: _build_exec_px_dump(
+                        state=state,
+                        m3=m3,
+                        t_signal=t,
+                        t_fill=t,
+                        a=a_bad,
+                        px_source_name=src_name,
+                        px_value=px_bad,
+                        target_qty=float(zero_target[int(a_bad)]),
+                        reason_code="NONFINITE_EXEC_PX",
+                        pending_order_id=f"samebar_kill_t{t}_a{int(a_bad)}",
+                        quarantine_applied=False,
+                        run_context=run_context,
+                    ),
                 )
                 _accumulate_exec_row(
                     filled_row=filled_qty_ta[t],
@@ -877,9 +1121,7 @@ def run_module4_strategy_funnel(
                     eps=eps,
                 )
                 state.order_flags[t] |= np.uint16(OrderFlagBit.KILL_SWITCH | OrderFlagBit.FLATTEN | OrderFlagBit.MOC_EXEC)
-                state.order_flags[t, skipped_kill] |= np.uint16(OrderFlagBit.EXEC_SKIPPED_BAD_PRICE)
-            state.orders[t, :, int(OrderIdx.TARGET_QTY)] = kill_target
-            target_qty_ta[t] = kill_target
+                target_qty_ta[t] = pos.copy()
             kill_switch_session = True
             pending_active = False
             overnight_idx = -1
