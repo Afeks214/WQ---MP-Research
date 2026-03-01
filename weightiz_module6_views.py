@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import pandas as pd
 
 from weightiz_module6_data import rolling_calmar, rolling_sharpe, to_et_datetime, x_to_price
 
@@ -226,6 +227,7 @@ def build_brain_figure(
 
     d = micro_day_df.sort_values("ts_ns", kind="mergesort").reset_index(drop=True)
     ts = to_et_datetime(d["ts_ns"].to_numpy(dtype=np.int64), timezone=timezone)
+    ts_list = list(pd.to_datetime(ts, errors="coerce"))
 
     bo = np.maximum(
         d.get("score_bo_long", 0.0).to_numpy(dtype=np.float64),
