@@ -255,14 +255,17 @@ def _require_pandas() -> Any:
 
 
 def _to_jsonable(obj: Any) -> Any:
+    np_floating = getattr(np, "floating", ())
+    np_integer = getattr(np, "integer", ())
+    np_bool_ = getattr(np, "bool_", ())
     if isinstance(obj, np.ndarray):
         return obj.tolist()
-    if isinstance(obj, (np.float64, np.float32, np.float16, np.float_)):
+    if isinstance(obj, (float,)) or (np_floating and isinstance(obj, np_floating)):
         return float(obj)
-    if isinstance(obj, (np.int64, np.int32, np.int16, np.int8, np.int_)):
-        return int(obj)
-    if isinstance(obj, (np.bool_,)):
+    if isinstance(obj, (bool,)) or (np_bool_ and isinstance(obj, np_bool_)):
         return bool(obj)
+    if isinstance(obj, (int,)) or (np_integer and isinstance(obj, np_integer)):
+        return int(obj)
     if isinstance(obj, dict):
         return {str(k): _to_jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):

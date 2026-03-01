@@ -131,6 +131,7 @@ def build_micro_matrix_figure(
 
     d = micro_day_df.sort_values("ts_ns", kind="mergesort").reset_index(drop=True)
     ts = to_et_datetime(d["ts_ns"].to_numpy(dtype=np.int64), timezone=timezone)
+    ts_list = list(pd.to_datetime(ts, errors="coerce"))
 
     fig.add_trace(
         go.Candlestick(
@@ -258,7 +259,11 @@ def build_brain_figure(
             if i == len(reg) or reg[i] != reg[start]:
                 color = cmap.get(int(reg[start]), "rgba(0,0,0,0.0)")
                 if color != "rgba(0,0,0,0.0)":
-                    fig.add_vrect(x0=ts.iloc[start], x1=ts.iloc[i - 1], fillcolor=color, line_width=0, layer="below")
+                    if start < 0 or (i - 1) < 0 or start >= len(ts_list) or (i - 1) >= len(ts_list):
+                        continue
+                    if pd.isna(ts_list[start]) or pd.isna(ts_list[i - 1]):
+                        continue
+                    fig.add_vrect(x0=ts_list[start], x1=ts_list[i - 1], fillcolor=color, line_width=0, layer="below")
                 start = i
 
     if "intent_long" in d.columns:
