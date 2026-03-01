@@ -167,6 +167,8 @@ class Module3ConfigModel(BaseModel):
 
 
 class Module4ConfigModel(BaseModel):
+    # Schema gate for module4_configs:
+    # this strict model is the real validator used by _load_config -> RunConfigModel.
     model_config = ConfigDict(extra="forbid")
 
     entry_threshold: float = 0.55
@@ -192,6 +194,29 @@ class Module4ConfigModel(BaseModel):
     fail_on_non_finite_input: bool = True
     fail_on_non_finite_output: bool = True
     eps: float = 1e-12
+
+    # Additive compatibility fields for Cell-6 nomenclature.
+    strategy_type: str = "legacy"
+    score_gate: str = ""
+    score_gate_rule: str = ""
+    deviation_signal: str = ""
+    deviation_rule: str = ""
+    entry_model: str = ""
+    exit_model: str = ""
+    origin_level: str = "POC"
+    direction: str = "long"
+    delta_th: float = 0.55
+    dev_th: float = 1.0
+    tp_mult: float = 1.0
+    atr_stop_mult: float = 1.0
+
+    @model_validator(mode="after")
+    def apply_delta_threshold_mapping(self) -> "Module4ConfigModel":
+        # Backward-compatible mapping policy:
+        # if delta_th was explicitly supplied, mirror it to legacy entry_threshold.
+        if "delta_th" in self.model_fields_set:
+            self.entry_threshold = float(self.delta_th)
+        return self
 
 
 class HarnessConfigModel(BaseModel):

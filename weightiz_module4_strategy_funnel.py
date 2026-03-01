@@ -97,6 +97,22 @@ class Module4Config:
     fail_on_non_finite_output: bool = True
     eps: float = 1e-12
 
+    # Compatibility-only schema fields for Cell-6 nomenclature.
+    # Core Module4 trading logic remains unchanged in this patch.
+    strategy_type: str = "legacy"
+    score_gate: str = ""
+    score_gate_rule: str = ""
+    deviation_signal: str = ""
+    deviation_rule: str = ""
+    entry_model: str = ""
+    exit_model: str = ""
+    origin_level: str = "POC"
+    direction: str = "long"
+    delta_th: float = 0.55
+    dev_th: float = 1.0
+    tp_mult: float = 1.0
+    atr_stop_mult: float = 1.0
+
 
 @dataclass
 class Module4Output:
