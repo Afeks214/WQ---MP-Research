@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import itertools
 import json
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional, Union
@@ -197,7 +198,7 @@ class Module4ConfigModel(BaseModel):
 
     # Additive compatibility fields for Cell-6 nomenclature.
     strategy_type: str = "legacy"
-    score_gate: str = ""
+    score_gate: float = 0.0
     score_gate_rule: str = ""
     deviation_signal: str = ""
     deviation_rule: str = ""
@@ -308,6 +309,100 @@ class RunConfigModel(BaseModel):
     harness: HarnessConfigModel = Field(default_factory=HarnessConfigModel)
     stress_scenarios: Optional[list[StressScenarioModel]] = None
     candidates: CandidatesModel = Field(default_factory=CandidatesModel)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_family_d_grid_payload(cls, raw: Any) -> Any:
+        if not isinstance(raw, dict):
+            return raw
+
+        # Bridge accepted alias: universe.symbols -> symbols
+        if "symbols" not in raw and isinstance(raw.get("universe"), dict):
+            u = raw.get("universe", {})
+            if isinstance(u, dict) and isinstance(u.get("symbols"), list):
+                raw = dict(raw)
+                raw["symbols"] = u.get("symbols")
+            raw.pop("universe", None)
+
+        # Bridge accepted alias: module4_configs.grid -> expanded list[Module4ConfigModel]
+        m4 = raw.get("module4_configs")
+        if isinstance(m4, dict) and isinstance(m4.get("grid"), dict):
+            grid = m4.get("grid", {})
+            if not isinstance(grid, dict):
+                return raw
+            # Keep strictness by requiring only this exact Family-D grid keyset.
+            allowed_keys = [
+                "strategy_type",
+                "score_gate",
+                "dev_th",
+                "delta_th",
+                "atr_stop_mult",
+                "tp_mult",
+                "top_k_intraday",
+                "max_asset_cap_frac",
+                "max_turnover_frac_per_bar",
+                "overnight_min_conviction",
+                "allow_cash_overnight",
+            ]
+            extra = sorted(k for k in grid.keys() if k not in allowed_keys)
+            if extra:
+                raise ValueError(f"module4_configs.grid contains unsupported keys: {extra}")
+
+            # Validate required keys and strict numeric bounds for the requested factors.
+            for k in allowed_keys:
+                if k not in grid:
+                    raise ValueError(f"module4_configs.grid missing required key: {k}")
+                if not isinstance(grid[k], list) or len(grid[k]) == 0:
+                    raise ValueError(f"module4_configs.grid.{k} must be a non-empty list")
+
+            for v in grid["score_gate"]:
+                x = float(v)
+                if not (0.0 <= x <= 1.0):
+                    raise ValueError("module4_configs.grid.score_gate values must be in [0,1]")
+            for v in grid["delta_th"]:
+                x = float(v)
+                if not (0.0 <= x <= 1.0):
+                    raise ValueError("module4_configs.grid.delta_th values must be in [0,1]")
+            for key in ("dev_th", "atr_stop_mult", "tp_mult"):
+                for v in grid[key]:
+                    if float(v) <= 0.0:
+                        raise ValueError(f"module4_configs.grid.{key} values must be > 0")
+
+            order = [
+                "strategy_type",
+                "score_gate",
+                "dev_th",
+                "delta_th",
+                "atr_stop_mult",
+                "tp_mult",
+                "top_k_intraday",
+                "max_asset_cap_frac",
+                "max_turnover_frac_per_bar",
+                "overnight_min_conviction",
+                "allow_cash_overnight",
+            ]
+            combos = []
+            for values in itertools.product(*[grid[k] for k in order]):
+                row = dict(zip(order, values))
+                # Deterministic scalar coercions and backward-compatible mapping.
+                row["strategy_type"] = str(row["strategy_type"])
+                row["score_gate"] = float(row["score_gate"])
+                row["dev_th"] = float(row["dev_th"])
+                row["delta_th"] = float(row["delta_th"])
+                row["atr_stop_mult"] = float(row["atr_stop_mult"])
+                row["tp_mult"] = float(row["tp_mult"])
+                row["top_k_intraday"] = int(row["top_k_intraday"])
+                row["max_asset_cap_frac"] = float(row["max_asset_cap_frac"])
+                row["max_turnover_frac_per_bar"] = float(row["max_turnover_frac_per_bar"])
+                row["overnight_min_conviction"] = float(row["overnight_min_conviction"])
+                row["allow_cash_overnight"] = bool(row["allow_cash_overnight"])
+                row["entry_threshold"] = float(row["score_gate"])
+                combos.append(row)
+
+            raw = dict(raw)
+            raw["module4_configs"] = combos
+
+        return raw
 
     @model_validator(mode="after")
     def validate_cross_fields(self) -> "RunConfigModel":
@@ -518,7 +613,7 @@ def in_memory_date_filter_loader(data_cfg: DataConfigModel) -> Callable[[str, st
         v_col = _find_col(df, ("volume", "vol", "v"), "volume")
 
         ts = pdx.to_datetime(df[ts_col], utc=True, errors="coerce")
-        keep = ts.notna().to_numpy(dtype=bool)
+        keep = ts.notna().to_numpy(dtype=bool).copy()
 
         if start_utc is not None:
             keep &= (ts >= start_utc).to_numpy(dtype=bool)
