@@ -6,7 +6,13 @@ from datetime import datetime, timezone
 import hashlib
 import itertools
 import json
+import os
 from pathlib import Path
+import platform
+import socket
+import subprocess
+import sys
+import time
 from typing import Any, Callable, Literal, Optional, Union
 import warnings
 
@@ -766,6 +772,418 @@ def _load_config(path: Path) -> RunConfigModel:
     return RunConfigModel.model_validate(raw)
 
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        x = float(v)
+        if np.isfinite(x):
+            return float(x)
+    except Exception:
+        pass
+    return float(default)
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
+
+
+def _json_load(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _family_mode_enabled(run_name: str) -> bool:
+    return str(run_name).strip().lower().startswith("sweep_family_")
+
+
+def _deterministic_jitter_seconds(run_name: str, seed: int) -> int:
+    token = f"{str(run_name)}{int(seed)}".encode("utf-8")
+    h = int.from_bytes(hashlib.sha256(token).digest()[:8], byteorder="big", signed=False)
+    return int(10 + (h % 21))
+
+
+def _family_log_append(log_path: Path, message: str) -> None:
+    ts = datetime.now(timezone.utc).isoformat()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(f"[{ts}] {message}\n")
+
+
+def _safe_git_hash(project_root: Path) -> str:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(project_root),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        return str(out)
+    except Exception:
+        return "UNKNOWN"
+
+
+def _flatten_dict(prefix: str, value: Any, out: dict[str, Any]) -> None:
+    if isinstance(value, dict):
+        for k in sorted(value.keys()):
+            key = f"{prefix}.{k}" if prefix else str(k)
+            _flatten_dict(key, value[k], out)
+    else:
+        out[prefix] = value
+
+
+def _candidate_returns_stats(candidate_dir: Path) -> tuple[float, float]:
+    ret_path = candidate_dir / "candidate_returns.parquet"
+    if not ret_path.exists():
+        return 0.0, 0.0
+    pdx = _require_pandas()
+    try:
+        df = pdx.read_parquet(ret_path)
+    except Exception:
+        return 0.0, 0.0
+    if "returns" not in df.columns or len(df) == 0:
+        return 0.0, 0.0
+    arr = pdx.to_numeric(df["returns"], errors="coerce").to_numpy(dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return 0.0, 0.0
+    return float(np.mean(arr)), float(np.median(arr))
+
+
+def _results_required_columns() -> list[str]:
+    return [
+        "family",
+        "config_id",
+        "seed",
+        "W",
+        "T",
+        "A",
+        "B",
+        "start_date",
+        "end_date",
+        "bars",
+        "trades",
+        "win_rate",
+        "avg_ret",
+        "med_ret",
+        "profit_factor",
+        "max_drawdown",
+    ]
+
+
+def _assert_results_integrity(df: Any) -> None:
+    pdx = _require_pandas()
+    required = _results_required_columns()
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"Family results missing required columns: {missing}")
+
+    if len(df) > 0:
+        dup = df.duplicated(subset=["config_id", "seed"], keep=False)
+        if bool(dup.any()):
+            first = int(np.where(dup.to_numpy(dtype=bool))[0][0])
+            raise RuntimeError(
+                f"Family results must be unique by (config_id, seed). Duplicate at row={first}"
+            )
+
+    numeric_required = ["seed", "W", "T", "A", "B", "bars", "trades", "win_rate", "avg_ret", "med_ret", "profit_factor", "max_drawdown"]
+    for col in numeric_required:
+        vals = pdx.to_numeric(df[col], errors="raise").to_numpy(dtype=np.float64)
+        if vals.size and (not np.all(np.isfinite(vals))):
+            bad_idx = int(np.where(~np.isfinite(vals))[0][0])
+            raise RuntimeError(f"Family results column {col!r} has non-finite value at row={bad_idx}")
+
+
+def _canonical_results_sha256(df: Any) -> str:
+    pdx = _require_pandas()
+    norm = df.copy()
+    if norm.shape[0] > 0:
+        norm = norm.sort_values(["config_id", "seed"], kind="mergesort").reset_index(drop=True)
+
+    for col in norm.columns:
+        if pdx.api.types.is_numeric_dtype(norm[col]):
+            norm[col] = pdx.to_numeric(norm[col], errors="raise").astype(np.float64)
+            norm[col] = norm[col].round(8)
+        else:
+            norm[col] = norm[col].astype("string")
+
+    canonical_bytes = norm.to_csv(index=False, lineterminator="\n").encode("utf-8")
+    return hashlib.sha256(canonical_bytes).hexdigest()
+
+
+def _estimate_gap_reset_stats(
+    data_paths: list[str],
+    data_loader: Callable[[str, str], Any],
+    tz_name: str,
+    gap_reset_minutes: float,
+) -> dict[str, Any]:
+    if not data_paths:
+        return {"symbol_path": "", "rows": 0, "gap_resets": 0, "gap_reset_rate": 0.0}
+    path = str(data_paths[0])
+    pdx = _require_pandas()
+    try:
+        df = data_loader(path, tz_name)
+        if not isinstance(df.index, pdx.DatetimeIndex):
+            return {"symbol_path": path, "rows": 0, "gap_resets": 0, "gap_reset_rate": 0.0}
+        idx = pdx.DatetimeIndex(df.index)
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        idx = idx.tz_convert("UTC")
+        ts_ns = idx.asi8.astype(np.int64)
+        if ts_ns.size == 0:
+            return {"symbol_path": path, "rows": 0, "gap_resets": 0, "gap_reset_rate": 0.0}
+        gap = np.zeros(ts_ns.size, dtype=np.float64)
+        gap[1:] = (ts_ns[1:] - ts_ns[:-1]) / float(60 * 1_000_000_000)
+        resets = int(1 + np.sum(gap[1:] > float(gap_reset_minutes)))
+        rate = float(resets / max(int(ts_ns.size), 1))
+        return {
+            "symbol_path": path,
+            "rows": int(ts_ns.size),
+            "gap_resets": int(resets),
+            "gap_reset_rate": float(rate),
+        }
+    except Exception:
+        return {"symbol_path": path, "rows": 0, "gap_resets": 0, "gap_reset_rate": 0.0}
+
+
+def _build_family_results_rows(
+    family_name: str,
+    run_dir: Path,
+    cfg: RunConfigModel,
+    bars_total: int,
+) -> list[dict[str, Any]]:
+    pdx = _require_pandas()
+    lb_path = run_dir / "leaderboard.csv"
+    rb_path = run_dir / "robustness_leaderboard.csv"
+    if lb_path.exists():
+        lb_df = pdx.read_csv(lb_path)
+    elif rb_path.exists():
+        lb_df = pdx.read_csv(rb_path)
+    else:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    if "candidate_id" not in lb_df.columns:
+        return rows
+
+    start_date = cfg.data.start.isoformat() if cfg.data.start is not None else ""
+    end_date = cfg.data.end.isoformat() if cfg.data.end is not None else ""
+    seed = int(cfg.harness.seed)
+
+    for _, lb_row in lb_df.sort_values("candidate_id", kind="mergesort").iterrows():
+        candidate_id = str(lb_row.get("candidate_id", "")).strip()
+        if not candidate_id:
+            continue
+        candidate_dir = run_dir / "candidates" / candidate_id
+        if not candidate_dir.exists():
+            raise RuntimeError(f"Missing candidate directory for candidate_id={candidate_id}: {candidate_dir}")
+        metrics_doc = _json_load(candidate_dir / "candidate_metrics.json", default={})
+        config_doc = _json_load(candidate_dir / "candidate_config.json", default={})
+        base_metrics = metrics_doc.get("base_metrics", {}) if isinstance(metrics_doc, dict) else {}
+        if not isinstance(base_metrics, dict):
+            raise RuntimeError(f"candidate_metrics.json base_metrics missing/invalid for candidate_id={candidate_id}")
+        required_metric_keys = ("n_trades", "win_rate", "profit_factor", "max_drawdown")
+        missing_metric_keys = [k for k in required_metric_keys if k not in base_metrics]
+        if missing_metric_keys:
+            raise RuntimeError(
+                f"candidate_metrics.json missing keys for candidate_id={candidate_id}: {missing_metric_keys}"
+            )
+
+        m2_idx = _safe_int(lb_row.get("m2_idx", 0), default=0)
+        m4_idx = _safe_int(lb_row.get("m4_idx", 0), default=0)
+        if not (0 <= m2_idx < len(cfg.module2_configs)):
+            m2_idx = 0
+        if not (0 <= m4_idx < len(cfg.module4_configs)):
+            m4_idx = 0
+
+        m2_cfg = cfg.module2_configs[m2_idx]
+        m4_cfg = cfg.module4_configs[m4_idx]
+        avg_ret, med_ret = _candidate_returns_stats(candidate_dir)
+
+        row: dict[str, Any] = {
+            "family": family_name,
+            "config_id": candidate_id,
+            "seed": int(seed),
+            "W": int(m2_cfg.profile_window_bars),
+            "T": float(m4_cfg.entry_threshold),
+            "A": float(m4_cfg.trend_poc_drift_min_abs),
+            "B": float(m4_cfg.neutral_poc_drift_max_abs),
+            "start_date": start_date,
+            "end_date": end_date,
+            "bars": int(bars_total),
+            "trades": int(_safe_int(base_metrics.get("n_trades", 0), default=0)),
+            "win_rate": float(_safe_float(base_metrics.get("win_rate", 0.0), default=0.0)),
+            "avg_ret": float(avg_ret),
+            "med_ret": float(med_ret),
+            "profit_factor": float(_safe_float(base_metrics.get("profit_factor", 0.0), default=0.0)),
+            "max_drawdown": float(_safe_float(base_metrics.get("max_drawdown", 0.0), default=0.0)),
+            "m2_idx": int(m2_idx),
+            "m4_idx": int(m4_idx),
+        }
+
+        # Merge existing leaderboard features.
+        for k in lb_df.columns:
+            if k not in row:
+                row[str(k)] = lb_row.get(k)
+
+        # Merge candidate module4 and base metrics as flattened fields.
+        if isinstance(config_doc, dict):
+            m4_payload = config_doc.get("module4_config", {})
+            if isinstance(m4_payload, dict):
+                flat_m4: dict[str, Any] = {}
+                _flatten_dict("module4", m4_payload, flat_m4)
+                for k, v in flat_m4.items():
+                    row.setdefault(k, v)
+        if isinstance(base_metrics, dict):
+            flat_metrics: dict[str, Any] = {}
+            _flatten_dict("base_metrics", base_metrics, flat_metrics)
+            for k, v in flat_metrics.items():
+                row.setdefault(k, v)
+
+        # Re-assert required row contract after merges.
+        row["family"] = family_name
+        row["config_id"] = candidate_id
+        row["seed"] = int(seed)
+        row["W"] = int(m2_cfg.profile_window_bars)
+        row["T"] = float(m4_cfg.entry_threshold)
+        row["A"] = float(m4_cfg.trend_poc_drift_min_abs)
+        row["B"] = float(m4_cfg.neutral_poc_drift_max_abs)
+        row["start_date"] = start_date
+        row["end_date"] = end_date
+        row["bars"] = int(bars_total)
+        row["trades"] = int(_safe_int(base_metrics.get("n_trades", 0), default=0))
+        row["win_rate"] = float(_safe_float(base_metrics.get("win_rate", 0.0), default=0.0))
+        row["avg_ret"] = float(avg_ret)
+        row["med_ret"] = float(med_ret)
+        row["profit_factor"] = float(_safe_float(base_metrics.get("profit_factor", 0.0), default=0.0))
+        row["max_drawdown"] = float(_safe_float(base_metrics.get("max_drawdown", 0.0), default=0.0))
+        rows.append(row)
+
+    rows.sort(key=lambda x: (str(x.get("config_id", "")), int(_safe_int(x.get("seed", 0), 0))))
+    return rows
+
+
+def _write_family_artifacts(
+    *,
+    family_root: Path,
+    family_name: str,
+    config_path: Path,
+    cfg: RunConfigModel,
+    resolved_sha: str,
+    run_dir: Path,
+    run_id: str,
+    run_summary: dict[str, Any],
+    data_paths: list[str],
+    data_loader: Callable[[str, str], Any],
+    jitter_seconds: float,
+    family_start_utc: datetime,
+) -> dict[str, Any]:
+    family_root.mkdir(parents=True, exist_ok=True)
+    audit_dir = family_root / "audit_bundle"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+
+    run_manifest = _json_load(run_dir / "run_manifest.json", default={})
+    run_status = _json_load(run_dir / "run_status.json", default={})
+    bars_total = int(run_manifest.get("ingestion", {}).get("master_rows", 0)) if isinstance(run_manifest, dict) else 0
+
+    rows = _build_family_results_rows(
+        family_name=family_name,
+        run_dir=run_dir,
+        cfg=cfg,
+        bars_total=bars_total,
+    )
+    pdx = _require_pandas()
+    results_df = pdx.DataFrame(rows)
+    if not results_df.empty:
+        results_df = results_df.sort_values(["config_id", "seed"], kind="mergesort").reset_index(drop=True)
+    _assert_results_integrity(results_df)
+    results_path = family_root / "results.parquet"
+    results_df.to_parquet(results_path, index=False)
+    results_sha = _canonical_results_sha256(results_df)
+    results_file_sha = hashlib.sha256(results_path.read_bytes()).hexdigest()
+
+    gap_stats = _estimate_gap_reset_stats(
+        data_paths=data_paths,
+        data_loader=data_loader,
+        tz_name=cfg.harness.timezone,
+        gap_reset_minutes=float(cfg.engine.gap_reset_minutes),
+    )
+
+    summary_doc = {
+        "family": family_name,
+        "run_id": str(run_id),
+        "source_run_dir": str(run_dir),
+        "config_path": str(config_path),
+        "resolved_config_sha256": str(resolved_sha),
+        "rows": int(results_df.shape[0]),
+        "aborted": bool(run_summary.get("aborted", False)),
+        "failure_count": int(run_summary.get("failure_count", 0)),
+        "runtime_warning_count": int(run_summary.get("runtime_warning_count", 0)),
+        "jitter_seconds": float(jitter_seconds),
+        "gap_reset_minutes": float(cfg.engine.gap_reset_minutes),
+        "gap_reset_stats": gap_stats,
+        "family_started_utc": family_start_utc.isoformat(),
+        "family_finished_utc": datetime.now(timezone.utc).isoformat(),
+        "results_sha256_canonical": str(results_sha),
+        "results_sha256_file": str(results_file_sha),
+    }
+    (family_root / "summary.json").write_text(
+        json.dumps(summary_doc, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    # Audit bundle
+    (audit_dir / "config.yaml").write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
+    (audit_dir / "git_commit.txt").write_text(_safe_git_hash(Path(__file__).resolve().parent) + "\n", encoding="utf-8")
+    (audit_dir / "python_version.txt").write_text(sys.version + "\n", encoding="utf-8")
+    try:
+        pip_out = subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True)
+    except Exception as exc:
+        pip_out = f"ERROR: {type(exc).__name__}: {exc}\n"
+    (audit_dir / "pip_freeze.txt").write_text(pip_out, encoding="utf-8")
+    env_lines = [f"{k}={v}" for k, v in sorted(os.environ.items(), key=lambda x: x[0])]
+    (audit_dir / "env_vars.txt").write_text("\n".join(env_lines) + "\n", encoding="utf-8")
+    machine_doc = {
+        "platform": platform.platform(),
+        "system": platform.system(),
+        "release": platform.release(),
+        "version": platform.version(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "python_executable": sys.executable,
+        "hostname": socket.gethostname(),
+    }
+    (audit_dir / "machine_info.json").write_text(
+        json.dumps(machine_doc, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    time_doc = {
+        "family_start_utc": family_start_utc.isoformat(),
+        "family_end_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    (audit_dir / "timestamps.json").write_text(
+        json.dumps(time_doc, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (audit_dir / "results_parquet_sha256_canonical.txt").write_text(results_sha + "\n", encoding="utf-8")
+    (audit_dir / "results_parquet_sha256_file.txt").write_text(results_file_sha + "\n", encoding="utf-8")
+    if isinstance(run_manifest, dict):
+        (audit_dir / "run_manifest.json").write_text(
+            json.dumps(run_manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    if isinstance(run_status, dict):
+        (audit_dir / "run_status.json").write_text(
+            json.dumps(run_status, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    return summary_doc
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Weightiz V3.5 research runner")
     parser.add_argument("--config", required=True, help="Path to YAML config")
@@ -775,6 +1193,24 @@ def main() -> None:
     config_path = Path(args.config).expanduser().resolve()
     cfg = _load_config(config_path)
     resolved_sha = _resolved_config_sha256(cfg)
+    family_mode = _family_mode_enabled(cfg.run_name)
+    family_root = (project_root / "artifacts" / str(cfg.run_name)).resolve()
+    family_log_path = family_root / "run.log"
+    family_started_utc = datetime.now(timezone.utc)
+
+    if family_mode:
+        family_root.mkdir(parents=True, exist_ok=True)
+        (family_root / "pid").write_text(str(os.getpid()) + "\n", encoding="utf-8")
+        _family_log_append(family_log_path, f"FAMILY_MODE_START run_name={cfg.run_name} config={config_path}")
+        if str(cfg.harness.parallel_backend) != "process_pool":
+            raise RuntimeError(
+                "Family sweeps require process_pool backend (fail-closed). "
+                f"Got harness.parallel_backend={cfg.harness.parallel_backend!r}"
+            )
+        if int(cfg.harness.parallel_workers) > 14:
+            raise ValueError(
+                f"Strict cap exceeded: {int(cfg.harness.parallel_workers)} > 14. Fail-closed."
+            )
 
     symbols = [s.strip().upper() for s in cfg.symbols]
     data_paths = _resolve_data_paths(cfg, project_root)
@@ -789,8 +1225,26 @@ def main() -> None:
     stress_scenarios = _build_stress_scenarios(cfg)
     candidate_specs = _build_candidates(cfg)
 
+    jitter_seconds = 0.0
+    if family_mode:
+        jitter_seconds = float(_deterministic_jitter_seconds(str(cfg.run_name), int(cfg.harness.seed)))
+        _family_log_append(
+            family_log_path,
+            f"FAMILY_JITTER_SECONDS={jitter_seconds:.6f} formula=10+(sha256(run_name+seed)%21)",
+        )
+        time.sleep(jitter_seconds)
+
     with warnings.catch_warnings(record=True) as captured_warnings:
         warnings.simplefilter("always", RuntimeWarning)
+        if family_mode:
+            _family_log_append(
+                family_log_path,
+                (
+                    "HARNESS_START "
+                    f"symbols={len(symbols)} m2={len(m2_cfgs)} m3={len(m3_cfgs)} "
+                    f"m4={len(m4_cfgs)} workers={harness_cfg.parallel_workers}"
+                ),
+            )
         out = run_weightiz_harness(
             data_paths=data_paths,
             symbols=symbols,
@@ -874,6 +1328,30 @@ def main() -> None:
 
     with (run_dir / "run_summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    if family_mode:
+        family_summary = _write_family_artifacts(
+            family_root=family_root,
+            family_name=str(cfg.run_name),
+            config_path=config_path,
+            cfg=cfg,
+            resolved_sha=resolved_sha,
+            run_dir=run_dir,
+            run_id=run_id,
+            run_summary=summary,
+            data_paths=data_paths,
+            data_loader=data_loader,
+            jitter_seconds=jitter_seconds,
+            family_start_utc=family_started_utc,
+        )
+        _family_log_append(
+            family_log_path,
+            (
+                "FAMILY_MODE_COMPLETE "
+                f"rows={int(family_summary.get('rows', 0))} "
+                f"results_sha256_canonical={family_summary.get('results_sha256_canonical', '')}"
+            ),
+        )
 
     print("RUN_COMPLETE")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
