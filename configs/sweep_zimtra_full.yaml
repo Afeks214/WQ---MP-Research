@@ -1,0 +1,93 @@
+run_name: sweep_zimtra_full
+symbols: [SPY, QQQ, GLD, EEM, HYG, IWM, XLU, XLK, XLE, TLT]
+
+data:
+  root: ./data/alpaca/clean
+  format: parquet
+  path_by_symbol:
+    SPY: SPY/part-2023-1Min.parquet
+    QQQ: QQQ/part-2023-1Min.parquet
+    GLD: GLD/part-2023-1Min.parquet
+    EEM: EEM/part-2023-1Min.parquet
+    HYG: HYG/part-2023-1Min.parquet
+    IWM: IWM/part-2023-1Min.parquet
+    XLU: XLU/part-2023-1Min.parquet
+    XLK: XLK/part-2023-1Min.parquet
+    XLE: XLE/part-2023-1Min.parquet
+    TLT: TLT/part-2023-1Min.parquet
+  start: 2023-01-01T00:00:00+00:00
+  end: 2026-02-27T23:59:59+00:00
+
+engine:
+  mode: research
+  B: 240
+  warmup_minutes: 15
+  flat_time_minute: 945
+  gap_reset_minutes: 5.0
+  seed: 17
+  fail_on_nan: true
+  initial_cash: 1000000.0
+  tick_size_default: 0.01
+
+module2_configs:
+  - profile_window_bars: 60
+module3_configs:
+  - block_minutes: 30
+module4_configs:
+  - entry_threshold: 0.55
+
+harness:
+  seed: 97
+  timezone: America/New_York
+  parallel_backend: process_pool
+  parallel_workers: 1
+  report_dir: ./artifacts/module5_harness
+
+zimtra_sweep:
+  enabled: true
+  workers: 48
+  max_workers_cap: 50
+  deterministic_required: true
+  forbid_randomness: true
+  rth_only: true
+  union_master_timeline: true
+  shared_memory_required: true
+  memory_transport: shared_memory
+  stage_a:
+    enabled: true
+    workers: 48
+    max_workers_cap: 50
+    screen_assets: [SPY, QQQ, IWM]
+    screen_wf_splits: 4
+    gate_profit_factor_min: 1.05
+    gate_max_drawdown_max: 0.08
+    gate_positive_assets_min: 2
+    gate_assets_total: 3
+  stage_b:
+    enabled: true
+    workers: 48
+    max_workers_cap: 50
+  cv:
+    wf_train_months: 6
+    wf_test_months: 3
+    wf_splits: 10
+    purge_trading_days: 5
+    cpcv_n: 10
+    cpcv_k: 3
+  risk:
+    per_asset_notional_cap_mult: 2.5
+    overnight_gross_cap_mult: 1.6
+    daily_max_loss_frac: 0.10
+    delever_check_minute_et: 945
+    delever_exec_minute_et: 946
+    kill_switch_lockout_same_day: true
+  cost:
+    tick_size: 0.01
+    slippage_ticks: 1
+    missing_bar_slippage_ticks: 5
+    commission_per_share: 0.0015
+    reg_fee_per_share_sell: 0.000119
+    locate_fee_per_share_short_entry: 0.005
+  scenarios:
+    requested: [baseline, mild, severe]
+    allow_baseline_only_without_hooks: true

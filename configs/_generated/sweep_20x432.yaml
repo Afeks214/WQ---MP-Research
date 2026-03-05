@@ -2244,7 +2244,7 @@ harness:
   cpcv_slices: 6
   cpcv_k_test: 3
   parallel_backend: process_pool
-  parallel_workers: 4
+  parallel_workers: 48
   stress_profile: baseline_mild_severe
   max_ram_utilization_frac: 0.7
   enforce_lookahead_guard: true

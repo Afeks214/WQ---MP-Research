@@ -3,3 +3,4 @@ pandas
 pyyaml
 pydantic>=2
 pytest
+scipy
