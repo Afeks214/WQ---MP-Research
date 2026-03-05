@@ -441,6 +441,10 @@ def _compute_one_symbol_parity(
     include_aux: bool = False,
 ) -> pd.DataFrame:
     df0 = _prepare_df(df_raw)
+    if df0.empty:
+        raise RuntimeError(
+            f"PARITY_EMPTY_INPUT_BEFORE_SESSION_PROCESSING: symbol={symbol}, window={int(window)}"
+        )
     df0["ATR_floor"] = compute_atr_floor(df0, atr_period=14).astype(np.float64)
     df0["rvol"] = compute_rvol_diurnal_causal(df0, vol_col="volume").astype(np.float64)
 
@@ -449,14 +453,15 @@ def _compute_one_symbol_parity(
     df0["body_pct"] = np.clip(body / rng, 0.0, 1.0)
 
     chunks: list[pd.DataFrame] = []
-    for _, day_df in df0.groupby("session_date", sort=True):
-        built = build_daily_vp_tensors(day_df, x_grid=X_GRID, w=int(window))
+
+    def _emit_chunk(frame: pd.DataFrame) -> pd.DataFrame | None:
+        built = build_daily_vp_tensors(frame, x_grid=X_GRID, w=int(window))
         VP = built["VP"]
         VP_delta = built["VP_delta"]
         poc_idx = built["POC_idx"]
         df_mp = built["df_mp"]
         if VP.shape[0] == 0:
-            continue
+            return None
 
         day_out = compute_r6_spec_from_tensors(
             df_mp=df_mp,
@@ -499,11 +504,28 @@ def _compute_one_symbol_parity(
         if include_aux:
             feat_map["RVOL"] = day_out["rvol"].to_numpy(dtype=np.float64)
             feat_map["ATR"] = day_out["ATR_floor"].to_numpy(dtype=np.float64)
-        feat = pd.DataFrame(feat_map)
-        chunks.append(feat)
+        return pd.DataFrame(feat_map)
+
+    # Preserve session-bucket processing for normal windows.
+    for _, day_df in df0.groupby("session_date", sort=True):
+        feat = _emit_chunk(day_df)
+        if feat is not None:
+            chunks.append(feat)
+
+    # Fail over to continuous multi-session processing for long windows (e.g. week-sized W).
+    if not chunks:
+        feat_all = _emit_chunk(df0)
+        if feat_all is not None:
+            chunks.append(feat_all)
 
     if not chunks:
-        raise RuntimeError(f"PARITY_EMPTY_AFTER_SESSION_PROCESSING: symbol={symbol}")
+        day_sizes = df0.groupby("session_date", sort=True).size()
+        max_session_rows = int(day_sizes.max()) if len(day_sizes) else 0
+        raise RuntimeError(
+            "PARITY_EMPTY_AFTER_SESSION_PROCESSING: "
+            f"symbol={symbol}, window={int(window)}, rows={int(len(df0))}, "
+            f"max_session_rows={max_session_rows}"
+        )
 
     out = pd.concat(chunks, ignore_index=True)
     out = out.sort_values("timestamp", kind="mergesort").reset_index(drop=True)
