@@ -1,17 +1,32 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+exe = str(Path(sys.executable).resolve())
+
+valid_markers = (".venv", "envs", "conda", "miniforge")
+
+if not any(marker in exe for marker in valid_markers):
+    raise RuntimeError(
+        "\nFATAL ENVIRONMENT LOCK\n"
+        f"Detected interpreter: {exe}\n"
+        "run_research.py must run inside the project virtual environment\n"
+        "Example:\n"
+        "./.venv/bin/python run_research.py --config configs/..."
+    )
+
 import argparse
 from datetime import datetime, timezone
 import hashlib
 import itertools
 import json
+import multiprocessing as mp
 import os
-from pathlib import Path
 import platform
 import socket
 import subprocess
-import sys
 import time
 from typing import Any, Callable, Literal, Optional, Union
 import warnings
@@ -302,6 +317,190 @@ class CandidatesModel(BaseModel):
         return self
 
 
+class ZimtraCostConfigModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tick_size: float = 0.01
+    slippage_ticks: int = 1
+    missing_bar_slippage_ticks: int = 5
+    commission_per_share: float = 0.0015
+    reg_fee_per_share_sell: float = 0.000119
+    locate_fee_per_share_short_entry: float = 0.005
+
+
+class ZimtraRiskConfigModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    per_asset_notional_cap_mult: float = 2.5
+    max_position_buying_power_frac: float = 1.0
+    overnight_gross_cap_mult: float = 1.6
+    daily_max_loss_frac: float = 0.10
+    account_disable_equity: float = 0.0
+    account_disable_buffer_scale: float = 1.0
+    delever_check_minute_et: int = 15 * 60 + 45
+    delever_exec_minute_et: int = 15 * 60 + 46
+    kill_switch_lockout_same_day: bool = True
+
+
+class ZimtraSwingGridConfigModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profile_window_minutes: list[int]
+    profile_memory_sessions: list[int]
+    deltaeff_threshold: list[float]
+    distance_to_poc_atr: list[float]
+    acceptance_threshold: list[float]
+    rvol_filter: list[float]
+    holding_period_days: list[int]
+    lev_target: float = 1.5
+
+    @model_validator(mode="after")
+    def validate_non_empty(self) -> "ZimtraSwingGridConfigModel":
+        fields = [
+            "profile_window_minutes",
+            "profile_memory_sessions",
+            "deltaeff_threshold",
+            "distance_to_poc_atr",
+            "acceptance_threshold",
+            "rvol_filter",
+            "holding_period_days",
+        ]
+        for f in fields:
+            vals = getattr(self, f)
+            if len(vals) == 0:
+                raise ValueError(f"zimtra_sweep.swing_grid.{f} must be non-empty")
+        return self
+
+
+class ZimtraSamplingConfigModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["grid", "sobol"] = "grid"
+    n_samples: int = 65536
+    seed: int = 42
+    lev_target: float = 1.5
+    param_ranges: dict[str, list[float]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_sampling(self) -> "ZimtraSamplingConfigModel":
+        if self.method == "sobol":
+            if self.n_samples <= 0:
+                raise ValueError("zimtra_sweep.sampling.n_samples must be > 0")
+            if (self.n_samples & (self.n_samples - 1)) != 0:
+                raise ValueError(
+                    "zimtra_sweep.sampling.n_samples must be a power-of-two for Sobol random_base2"
+                )
+            for k, v in self.param_ranges.items():
+                if len(v) != 2:
+                    raise ValueError(
+                        f"zimtra_sweep.sampling.param_ranges.{k} must have exactly 2 values [low, high]"
+                    )
+                lo = float(v[0])
+                hi = float(v[1])
+                if hi < lo:
+                    raise ValueError(
+                        f"zimtra_sweep.sampling.param_ranges.{k} invalid bounds: high < low"
+                    )
+        return self
+
+
+class ZimtraAdaptiveConfigModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    new_samples: int = 10000
+    noise: float = 0.15
+
+    @model_validator(mode="after")
+    def validate_adaptive(self) -> "ZimtraAdaptiveConfigModel":
+        if int(self.new_samples) < 0:
+            raise ValueError("zimtra_sweep.adaptive.new_samples must be >= 0")
+        if float(self.noise) < 0.0:
+            raise ValueError("zimtra_sweep.adaptive.noise must be >= 0")
+        return self
+
+
+class ZimtraCVConfigModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    wf_train_months: int = 6
+    wf_test_months: int = 3
+    wf_splits: int = 10
+    purge_trading_days: int = 5
+    cpcv_n: int = 10
+    cpcv_k: int = 3
+
+
+class ZimtraStageConfigModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    workers: int = 48
+    max_workers_cap: int = 50
+    screen_assets: list[str] = Field(default_factory=lambda: ["SPY", "QQQ", "IWM"])
+    screen_wf_splits: int = 4
+    gate_profit_factor_min: float = 1.05
+    gate_max_drawdown_max: float = 0.08
+    gate_positive_assets_min: int = 2
+    gate_assets_total: int = 3
+
+    @model_validator(mode="after")
+    def validate_stage_workers(self) -> "ZimtraStageConfigModel":
+        if self.workers <= 0:
+            raise ValueError("workers must be > 0")
+        if self.workers > self.max_workers_cap:
+            raise ValueError(
+                f"workers must be <= max_workers_cap ({self.max_workers_cap}), got {self.workers}"
+            )
+        return self
+
+
+class ZimtraScenarioConfigModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requested: list[str] = Field(default_factory=lambda: ["baseline", "mild", "severe"])
+    allow_baseline_only_without_hooks: bool = True
+
+
+class ZimtraSweepConfigModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    workers: int = 48
+    max_workers_cap: int = 50
+    deterministic_required: bool = True
+    forbid_randomness: bool = True
+    rth_only: bool = True
+    union_master_timeline: bool = True
+    shared_memory_required: bool = True
+    memory_transport: Literal["shared_memory", "memmap"] = "shared_memory"
+    stage_a: ZimtraStageConfigModel = Field(default_factory=ZimtraStageConfigModel)
+    stage_b: ZimtraStageConfigModel = Field(default_factory=lambda: ZimtraStageConfigModel(enabled=True))
+    cv: ZimtraCVConfigModel = Field(default_factory=ZimtraCVConfigModel)
+    risk: ZimtraRiskConfigModel = Field(default_factory=ZimtraRiskConfigModel)
+    cost: ZimtraCostConfigModel = Field(default_factory=ZimtraCostConfigModel)
+    scenarios: ZimtraScenarioConfigModel = Field(default_factory=ZimtraScenarioConfigModel)
+    swing_grid: Optional[ZimtraSwingGridConfigModel] = None
+    sampling: ZimtraSamplingConfigModel = Field(default_factory=ZimtraSamplingConfigModel)
+    adaptive: ZimtraAdaptiveConfigModel = Field(default_factory=ZimtraAdaptiveConfigModel)
+
+    @model_validator(mode="after")
+    def validate_workers(self) -> "ZimtraSweepConfigModel":
+        if self.workers <= 0:
+            raise ValueError("zimtra_sweep.workers must be > 0")
+        if self.workers > self.max_workers_cap:
+            raise ValueError(
+                f"zimtra_sweep.workers must be <= {self.max_workers_cap}, got {self.workers}"
+            )
+        if not self.rth_only:
+            raise ValueError("zimtra_sweep.rth_only must be true (fail-closed)")
+        if not self.union_master_timeline:
+            raise ValueError("zimtra_sweep.union_master_timeline must be true (fail-closed)")
+        if self.memory_transport not in {"shared_memory", "memmap"}:
+            raise ValueError("zimtra_sweep.memory_transport must be shared_memory or memmap")
+        return self
+
+
 class RunConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -315,6 +514,7 @@ class RunConfigModel(BaseModel):
     harness: HarnessConfigModel = Field(default_factory=HarnessConfigModel)
     stress_scenarios: Optional[list[StressScenarioModel]] = None
     candidates: CandidatesModel = Field(default_factory=CandidatesModel)
+    zimtra_sweep: Optional[ZimtraSweepConfigModel] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -1187,12 +1387,27 @@ def _write_family_artifacts(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Weightiz V3.5 research runner")
     parser.add_argument("--config", required=True, help="Path to YAML config")
+    parser.add_argument("--dry-run", action="store_true", help="Load config/data and initialize workers, then exit")
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent
     config_path = Path(args.config).expanduser().resolve()
     cfg = _load_config(config_path)
     resolved_sha = _resolved_config_sha256(cfg)
+
+    if cfg.zimtra_sweep is not None and bool(cfg.zimtra_sweep.enabled):
+        from sweep_runner import run_zimtra_sweep
+
+        zimtra_summary = run_zimtra_sweep(
+            cfg=cfg,
+            project_root=project_root,
+            config_path=config_path,
+            resolved_config_sha256=resolved_sha,
+        )
+        print("RUN_COMPLETE")
+        print(json.dumps(zimtra_summary, ensure_ascii=False, indent=2))
+        return
+
     family_mode = _family_mode_enabled(cfg.run_name)
     family_root = (project_root / "artifacts" / str(cfg.run_name)).resolve()
     family_log_path = family_root / "run.log"
@@ -1224,6 +1439,32 @@ def main() -> None:
     data_loader = in_memory_date_filter_loader(cfg.data)
     stress_scenarios = _build_stress_scenarios(cfg)
     candidate_specs = _build_candidates(cfg)
+
+    if bool(args.dry_run):
+        # Deterministic infrastructure check only (no strategy execution).
+        loaded_rows = 0
+        for p in data_paths:
+            fr = data_loader(p, str(cfg.harness.timezone))
+            loaded_rows += int(getattr(fr, "shape", [0])[0])
+
+        workers = int(max(1, cfg.harness.parallel_workers))
+        if str(cfg.harness.parallel_backend) == "process_pool":
+            with mp.Pool(processes=workers) as pool:
+                _ = pool.map(int, range(min(workers, 4)))
+
+        summary = {
+            "dry_run": True,
+            "config_path": str(config_path),
+            "symbols": len(symbols),
+            "data_files": len(data_paths),
+            "loaded_rows": int(loaded_rows),
+            "parallel_backend": str(cfg.harness.parallel_backend),
+            "parallel_workers": int(workers),
+            "status": "ok",
+        }
+        print("DRY_RUN_COMPLETE")
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return
 
     jitter_seconds = 0.0
     if family_mode:
@@ -1358,4 +1599,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    mp.set_start_method("fork", force=True)
     main()
