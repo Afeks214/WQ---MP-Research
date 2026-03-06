@@ -586,6 +586,19 @@ def simulate_portfolio_task(
             ret = float((day_end - day_start) / max(day_start, 1e-12))
             daily_records.append({"day_key": int(d), "return": ret, "strategy_id": str(strategy["strategy_id"])})
 
+    # Recompute risk-adjusted metrics AFTER daily_records are finalized.
+    dr = np.array([float(x["return"]) for x in daily_records], dtype=np.float64) if daily_records else np.array([], dtype=np.float64)
+    if dr.size >= 2 and float(np.std(dr, ddof=1)) > 0:
+        sharpe = float(np.mean(dr) / np.std(dr, ddof=1) * np.sqrt(252.0))
+        down = dr[dr < 0.0]
+        if down.size >= 2 and float(np.std(down, ddof=1)) > 0:
+            sortino = float(np.mean(dr) / np.std(down, ddof=1) * np.sqrt(252.0))
+        else:
+            sortino = 0.0
+    else:
+        sharpe = 0.0
+        sortino = 0.0
+
     return SimulationResult(
         strategy_id=str(strategy["strategy_id"]),
         wf_split_idx=int(wf_split_idx),
