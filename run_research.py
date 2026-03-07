@@ -5,11 +5,21 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
+import os
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional, Union
 import warnings
 
+# Deterministic runtime thread caps must be configured before importing numpy/scipy.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
 import numpy as np
+import random
 
 try:
     import pandas as pd
@@ -36,6 +46,10 @@ from weightiz_module5_harness import (
     StressScenario,
     run_weightiz_harness,
 )
+from weightiz_self_audit import run_full_self_audit
+from weightiz_architecture_guard import run_architecture_consistency_check
+from weightiz_validation_suite import run_preflight_validation_suite
+from weightiz_system_logger import get_logger
 
 
 def _require_pandas() -> Any:
@@ -256,6 +270,34 @@ class HarnessConfigModel(BaseModel):
     payload_pickle_threshold_bytes: int = 131_072
     test_fail_task_ids: list[str] = Field(default_factory=list)
     test_fail_ratio: float = 0.0
+    cluster_corr_threshold: float = 0.90
+    cluster_distance_block_size: int = 256
+    cluster_distance_in_memory_max_n: int = 2500
+    execution_transaction_cost_per_trade: float = 0.0
+    execution_slippage_mult: float = 1.0
+    execution_extra_slippage_bps: float = 0.0
+    execution_latency_bars: int = 1
+    regime_vol_window: int = 60
+    regime_slope_window: int = 60
+    regime_hurst_window: int = 120
+    regime_min_obs_per_mask: int = 20
+    horizon_minutes: list[int] = Field(default_factory=lambda: [1, 5, 15, 60])
+    robustness_weight_dsr: float = 0.20
+    robustness_weight_pbo: float = 0.15
+    robustness_weight_spa: float = 0.10
+    robustness_weight_regime: float = 0.20
+    robustness_weight_execution: float = 0.20
+    robustness_weight_horizon: float = 0.15
+    robustness_reject_threshold: float = 0.60
+    execution_fragile_threshold: float = 0.50
+
+
+class SearchConfigModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    seed: Optional[int] = None
+    method: Literal["sobol", "lhs", "uniform"] = "sobol"
+    elite_pct: float = 0.10
+    target_evals: int = 700
 
 
 class StressScenarioModel(BaseModel):
@@ -306,6 +348,8 @@ class RunConfigModel(BaseModel):
     module3_configs: list[Module3ConfigModel] = Field(default_factory=lambda: [Module3ConfigModel()])
     module4_configs: list[Module4ConfigModel] = Field(default_factory=lambda: [Module4ConfigModel()])
     harness: HarnessConfigModel = Field(default_factory=HarnessConfigModel)
+    search: SearchConfigModel = Field(default_factory=SearchConfigModel)
+    zimtra_sweep: Optional[dict[str, Any]] = None
     stress_scenarios: Optional[list[StressScenarioModel]] = None
     candidates: CandidatesModel = Field(default_factory=CandidatesModel)
 
@@ -336,6 +380,13 @@ class RunConfigModel(BaseModel):
                     raise ValueError(f"candidates.specs[{i}].m3_idx out of range [0, {n3 - 1}]")
                 if not (0 <= spec.m4_idx < n4):
                     raise ValueError(f"candidates.specs[{i}].m4_idx out of range [0, {n4 - 1}]")
+        # Backward-compatible aliasing from legacy zimtra section into canonical search.
+        if self.search.seed is None and isinstance(self.zimtra_sweep, dict):
+            legacy_seed = self.zimtra_sweep.get("seed")
+            if legacy_seed is not None:
+                self.search.seed = int(legacy_seed)
+        if self.search.seed is None:
+            self.search.seed = int(self.harness.seed)
         return self
 
 
@@ -449,6 +500,26 @@ def _build_harness_config(cfg: RunConfigModel, project_root: Path) -> Module5Har
         payload_pickle_threshold_bytes=h.payload_pickle_threshold_bytes,
         test_fail_task_ids=tuple(str(x) for x in h.test_fail_task_ids),
         test_fail_ratio=h.test_fail_ratio,
+        cluster_corr_threshold=h.cluster_corr_threshold,
+        cluster_distance_block_size=h.cluster_distance_block_size,
+        cluster_distance_in_memory_max_n=h.cluster_distance_in_memory_max_n,
+        execution_transaction_cost_per_trade=h.execution_transaction_cost_per_trade,
+        execution_slippage_mult=h.execution_slippage_mult,
+        execution_extra_slippage_bps=h.execution_extra_slippage_bps,
+        execution_latency_bars=h.execution_latency_bars,
+        regime_vol_window=h.regime_vol_window,
+        regime_slope_window=h.regime_slope_window,
+        regime_hurst_window=h.regime_hurst_window,
+        regime_min_obs_per_mask=h.regime_min_obs_per_mask,
+        horizon_minutes=tuple(int(x) for x in h.horizon_minutes),
+        robustness_weight_dsr=h.robustness_weight_dsr,
+        robustness_weight_pbo=h.robustness_weight_pbo,
+        robustness_weight_spa=h.robustness_weight_spa,
+        robustness_weight_regime=h.robustness_weight_regime,
+        robustness_weight_execution=h.robustness_weight_execution,
+        robustness_weight_horizon=h.robustness_weight_horizon,
+        robustness_reject_threshold=h.robustness_reject_threshold,
+        execution_fragile_threshold=h.execution_fragile_threshold,
     )
 
 
@@ -671,7 +742,36 @@ def _load_config(path: Path) -> RunConfigModel:
     return RunConfigModel.model_validate(raw)
 
 
+def _enforce_canonical_runtime_path(cfg: RunConfigModel) -> None:
+    if isinstance(cfg.zimtra_sweep, dict):
+        enabled = bool(cfg.zimtra_sweep.get("enabled", False))
+        if enabled:
+            raise RuntimeError("PARALLEL_ENGINE_FORBIDDEN: use canonical Module5 pipeline")
+
+
+def _map_legacy_zimtra_aliases(cfg: RunConfigModel) -> RunConfigModel:
+    if not isinstance(cfg.zimtra_sweep, dict):
+        return cfg
+    legacy_workers = cfg.zimtra_sweep.get("workers")
+    if legacy_workers is not None:
+        cfg.harness.parallel_workers = int(legacy_workers)
+    return cfg
+
+
+def _configure_deterministic_runtime(seed: int) -> None:
+    os.environ["PYTHONHASHSEED"] = str(int(seed))
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+    np.random.seed(int(seed))
+    random.seed(int(seed))
+
+
 def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    logger = get_logger("run_research")
     parser = argparse.ArgumentParser(description="Weightiz V3.5 research runner")
     parser.add_argument("--config", required=True, help="Path to YAML config")
     args = parser.parse_args()
@@ -679,6 +779,24 @@ def main() -> None:
     project_root = Path(__file__).resolve().parent
     config_path = Path(args.config).expanduser().resolve()
     cfg = _load_config(config_path)
+    cfg = _map_legacy_zimtra_aliases(cfg)
+    _enforce_canonical_runtime_path(cfg)
+    if cfg.search.seed is None:
+        raise RuntimeError("DETERMINISTIC_SEED_REQUIRED")
+    _configure_deterministic_runtime(int(cfg.search.seed))
+    self_audit_report = run_full_self_audit(
+        cfg=cfg,
+        project_root=project_root,
+    )
+    run_architecture_consistency_check()
+    run_preflight_validation_suite(
+        cfg,
+        context={
+            "parallel_runtime_enabled": False,
+            "config_hash": _resolved_config_sha256(cfg),
+            "report_dir": str(Path(cfg.harness.report_dir).resolve()),
+        },
+    )
     resolved_sha = _resolved_config_sha256(cfg)
 
     symbols = [s.strip().upper() for s in cfg.symbols]
@@ -707,6 +825,7 @@ def main() -> None:
             candidate_specs=candidate_specs,
             data_loader_func=data_loader,
             stress_scenarios=stress_scenarios,
+            self_audit_report=self_audit_report,
         )
     runtime_warnings = [w for w in captured_warnings if issubclass(w.category, RuntimeWarning)]
     runtime_warning_count = int(len(runtime_warnings))
@@ -780,8 +899,15 @@ def main() -> None:
     with (run_dir / "run_summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    print("RUN_COMPLETE")
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    logger.info(
+        "run_complete",
+        extra={
+            "event_type": "run_complete",
+            "run_id": str(run_id),
+            "strategy_id": "",
+            "worker_id": "",
+        },
+    )
 
 
 if __name__ == "__main__":

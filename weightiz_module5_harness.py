@@ -24,6 +24,7 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
+import atexit
 import copy
 import hashlib
 import itertools
@@ -38,6 +39,7 @@ import sys
 import time
 import traceback
 import warnings
+from queue import SimpleQueue
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -50,10 +52,14 @@ except Exception:  # pragma: no cover - runtime guard
 
 from weightiz_module1_core import (
     EngineConfig,
+    FeatureEngineConfig,
+    FeatureSpec,
     Phase,
     ProfileStatIdx,
     ScoreIdx,
     TensorState,
+    build_feature_tensor_from_state,
+    make_compat_feature_specs,
     preallocate_state,
     validate_loaded_market_slice,
     validate_state_hard,
@@ -69,10 +75,9 @@ from weightiz_module3_structure import (
 )
 from weightiz_module4_strategy_funnel import (
     Module4Config,
-    Module4Output,
-    NonFiniteExecutionPriceError,
+    Module4SignalOutput,
     RegimeIdx,
-    run_module4_strategy_funnel,
+    run_module4_signal_funnel,
 )
 from weightiz_module5_stats import (
     deflated_sharpe_ratio,
@@ -82,8 +87,41 @@ from weightiz_module5_stats import (
     spa_test,
     white_reality_check,
 )
+from strategy_embedding import cluster_strategies_hierarchical_threshold
+from regime_detector import RegimeConfig, build_regime_masks, detect_regimes, regime_sample_counts
 from weightiz_dq import DQ_ACCEPT, DQ_DEGRADE, DQ_REJECT, dq_apply, dq_validate
 from weightiz_invariants import assert_or_flag_finite
+from weightiz_dtype_guard import assert_float64
+from weightiz_feature_tensor_cache import (
+    PROFILE_CACHE_SCHEMA_VERSION,
+    build_manifest as build_feature_manifest,
+    cleanup_stale_tmp_cache_files,
+    compute_tensor_hash,
+    load_tensor_cache,
+    profile_cache_paths,
+    save_tensor_cache,
+)
+from weightiz_module2_core import (
+    compute_window_correlation_diagnostics,
+    validate_feature_tensor_contract,
+)
+from weightiz_shared_feature_store import (
+    SharedFeatureHandles,
+    SharedFeatureRegistry,
+    attach_shared_feature_store,
+    cleanup_orphan_shared_memory_segments,
+    close_shared_feature_store,
+    create_shared_feature_store,
+    enforce_memory_safety,
+    estimate_tensor_bytes,
+)
+from risk_engine import CostConfig, RiskConfig, simulate_portfolio_from_signals
+from weightiz_runtime_monitor import RuntimeMonitor
+from weightiz_system_logger import configure_worker_logging, get_logger, init_runtime_logger, log_event
+
+
+def run_module4_strategy_funnel(*_args: Any, **_kwargs: Any) -> None:
+    raise RuntimeError("MODULE4_EXECUTION_FORBIDDEN_IN_CANONICAL_PATH")
 
 
 ROBUSTNESS_CAPS: dict[str, float] = {
@@ -127,9 +165,31 @@ class Module5HarnessConfig:
     failure_rate_abort_threshold: float = 0.02
     failure_count_abort_threshold: int = 50
     payload_pickle_threshold_bytes: int = 131_072
+    health_check_interval: int = 50
+    progress_interval_seconds: int = 10
     # Test-only deterministic fault hooks.
     test_fail_task_ids: tuple[str, ...] = ()
     test_fail_ratio: float = 0.0
+    cluster_corr_threshold: float = 0.90
+    cluster_distance_block_size: int = 256
+    cluster_distance_in_memory_max_n: int = 2500
+    execution_transaction_cost_per_trade: float = 0.0
+    execution_slippage_mult: float = 1.0
+    execution_extra_slippage_bps: float = 0.0
+    execution_latency_bars: int = 1
+    regime_vol_window: int = 60
+    regime_slope_window: int = 60
+    regime_hurst_window: int = 120
+    regime_min_obs_per_mask: int = 20
+    horizon_minutes: tuple[int, ...] = (1, 5, 15, 60)
+    robustness_weight_dsr: float = 0.20
+    robustness_weight_pbo: float = 0.15
+    robustness_weight_spa: float = 0.10
+    robustness_weight_regime: float = 0.20
+    robustness_weight_execution: float = 0.20
+    robustness_weight_horizon: float = 0.15
+    robustness_reject_threshold: float = 0.60
+    execution_fragile_threshold: float = 0.50
 
 
 @dataclass(frozen=True)
@@ -189,7 +249,23 @@ class _GroupTask:
     candidate_indices: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class _ExecutionView:
+    regime_primary_ta: np.ndarray
+    regime_confidence_ta: np.ndarray
+    intent_long_ta: np.ndarray
+    intent_short_ta: np.ndarray
+    target_qty_ta: np.ndarray
+    filled_qty_ta: np.ndarray
+    exec_price_ta: np.ndarray
+    trade_cost_ta: np.ndarray
+    overnight_score_ta: np.ndarray
+    overnight_winner_t: np.ndarray
+    kill_switch_t: np.ndarray
+
+
 _WORKER_CONTEXT: dict[str, Any] | None = None
+_WORKER_PROCESS: bool = False
 
 
 @dataclass(frozen=True)
@@ -600,7 +676,11 @@ def _safe_execute_task(
                     "top_frame": top_frame,
                     "exception_signature": sig,
                     "session_ids": np.zeros(0, dtype=np.int64),
+                    "session_ids_exec": np.zeros(0, dtype=np.int64),
+                    "session_ids_raw": np.zeros(0, dtype=np.int64),
                     "daily_returns": np.zeros(0, dtype=np.float64),
+                    "daily_returns_exec": np.zeros(0, dtype=np.float64),
+                    "daily_returns_raw": np.zeros(0, dtype=np.float64),
                     "equity_payload": None,
                     "trade_payload": None,
                     "asset_pnl_by_symbol": {},
@@ -631,8 +711,12 @@ def _init_worker_context(
     m3_configs: list[Module3Config],
     m4_configs: list[Module4Config],
     harness_cfg: Module5HarnessConfig,
+    feature_registry: SharedFeatureRegistry | None,
+    log_queue: mp.Queue | None = None,
+    run_id: str = "",
 ) -> None:
-    global _WORKER_CONTEXT
+    global _WORKER_CONTEXT, _WORKER_PROCESS
+    _WORKER_PROCESS = True
     repo_root = str(Path(__file__).resolve().parent)
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
@@ -642,6 +726,14 @@ def _init_worker_context(
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
     os.environ.setdefault("ARROW_NUM_THREADS", "1")
+    os.environ["WEIGHTIZ_WORKER_PROCESS"] = "1"
+    if log_queue is not None:
+        configure_worker_logging(log_queue, level="INFO")
+    feature_handles: SharedFeatureHandles | None = None
+    if feature_registry is not None:
+        feature_handles = attach_shared_feature_store(feature_registry)
+        assert_float64("worker.shared_feature_store", feature_handles.array)
+        atexit.register(lambda: close_shared_feature_store(feature_handles, is_master=False))
     _WORKER_CONTEXT = {
         "base_state": base_state,
         "candidates": candidates,
@@ -651,12 +743,18 @@ def _init_worker_context(
         "m3_configs": m3_configs,
         "m4_configs": m4_configs,
         "harness_cfg": harness_cfg,
+        "worker_feature_source": "shared_memory",
+        "feature_registry": feature_registry,
+        "feature_handles": feature_handles,
+        "run_id": str(run_id),
     }
 
 
 def _run_group_task_from_context(group: _GroupTask) -> list[dict[str, Any]]:
     if _WORKER_CONTEXT is None:
         raise RuntimeError("Worker context not initialized")
+    if str(_WORKER_CONTEXT.get("worker_feature_source", "")) != "shared_memory":
+        raise RuntimeError("worker_feature_source must be shared_memory")
     return _run_group_task(
         group=group,
         base_state=_WORKER_CONTEXT["base_state"],
@@ -1700,10 +1798,54 @@ def _apply_enabled_assets(state: TensorState, m3: Module3Output, enabled_mask: n
         m3.ib_defined_ta[:, off] = False
 
 
+def _materialize_risk_outputs_into_state(
+    state: TensorState,
+    m4_sig: Module4SignalOutput,
+    risk_res: Any,
+) -> _ExecutionView:
+    T = state.cfg.T
+    A = state.cfg.A
+    filled = np.asarray(risk_res.filled_qty_ta, dtype=np.float64)
+    exec_px = np.asarray(risk_res.exec_price_ta, dtype=np.float64)
+    tcost = np.asarray(risk_res.trade_cost_ta, dtype=np.float64)
+    pos = np.asarray(risk_res.position_qty_ta, dtype=np.float64)
+    if filled.shape != (T, A) or exec_px.shape != (T, A) or tcost.shape != (T, A) or pos.shape != (T, A):
+        raise RuntimeError("risk_engine output shape mismatch")
+
+    state.equity[:] = np.asarray(risk_res.equity_curve, dtype=np.float64)
+    state.position_qty[:, :] = pos
+    state.margin_used[:] = np.asarray(risk_res.margin_used_t, dtype=np.float64)
+    state.buying_power[:] = np.maximum(
+        0.0,
+        float(state.cfg.intraday_leverage_max) * state.equity - state.margin_used,
+    )
+    state.daily_loss[:] = np.asarray(risk_res.daily_loss_t, dtype=np.float64)
+    side = np.zeros((T, A), dtype=np.int8)
+    side[filled > 0.0] = 1
+    side[filled < 0.0] = -1
+    state.order_side[:, :] = side
+    state.order_flags[:, :] = np.uint16(0)
+
+    return _ExecutionView(
+        regime_primary_ta=np.asarray(m4_sig.regime_primary_ta, dtype=np.int8),
+        regime_confidence_ta=np.asarray(m4_sig.regime_confidence_ta, dtype=np.float64),
+        intent_long_ta=np.asarray(m4_sig.intent_long_ta, dtype=bool),
+        intent_short_ta=np.asarray(m4_sig.intent_short_ta, dtype=bool),
+        target_qty_ta=np.asarray(m4_sig.target_qty_ta, dtype=np.float64),
+        filled_qty_ta=filled,
+        exec_price_ta=exec_px,
+        trade_cost_ta=tcost,
+        overnight_score_ta=np.zeros((T, A), dtype=np.float64),
+        overnight_winner_t=np.full(T, -1, dtype=np.int16),
+        kill_switch_t=np.zeros(T, dtype=bool),
+    )
+
+
 def _candidate_daily_returns_close_to_close(
     state: TensorState,
     split: SplitSpec,
     initial_cash: float,
+    equity_curve: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     starts, ends, sessions = _session_bounds(state.session_id)
     test_sessions = np.unique(state.session_id[split.test_idx].astype(np.int64))
@@ -1730,7 +1872,12 @@ def _candidate_daily_returns_close_to_close(
             np.zeros(0, dtype=np.float64),
         )
 
-    eq_close = state.equity[idx].astype(np.float64)
+    eq_src = np.asarray(state.equity if equity_curve is None else equity_curve, dtype=np.float64)
+    if eq_src.ndim != 1 or eq_src.shape[0] != int(state.cfg.T):
+        raise RuntimeError(
+            f"equity_curve shape mismatch: got {eq_src.shape}, expected {(int(state.cfg.T),)}"
+        )
+    eq_close = eq_src[idx].astype(np.float64)
     ret = np.empty(idx.size, dtype=np.float64)
     ret[0] = eq_close[0] / float(initial_cash) - 1.0
     if idx.size > 1:
@@ -1996,7 +2143,7 @@ def _equity_curve_payload(
 
 def _trade_log_payload(
     state: TensorState,
-    m4_out: Module4Output,
+    m4_out: _ExecutionView,
     candidate_id: str,
     split_id: str,
     scenario_id: str,
@@ -2060,7 +2207,7 @@ def _select_micro_rows(
     state: TensorState,
     split: SplitSpec,
     cfg: Module5HarnessConfig,
-    m4_out: Module4Output,
+    m4_out: _ExecutionView,
     enabled_assets_mask: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     T = state.cfg.T
@@ -2110,7 +2257,7 @@ def _select_micro_rows(
 def _collect_micro_diagnostics_payload(
     state: TensorState,
     m3: Module3Output,
-    m4_out: Module4Output,
+    m4_out: _ExecutionView,
     candidate_id: str,
     split_id: str,
     scenario_id: str,
@@ -2227,7 +2374,7 @@ def _collect_micro_profile_blocks_payload(
             f"micro_profile_blocks row cap exceeded: rows={int(rr.shape[0])}, cap={int(cfg.micro_diag_max_rows)}"
         )
 
-    x_blob = state.x_grid.astype(np.float32).tobytes()
+    x_blob = state.x_grid.astype(np.float64).tobytes()
     return {
         "ts_ns": state.ts_ns[rr].astype(np.int64),
         "session_id": state.session_id[rr].astype(np.int64),
@@ -2238,8 +2385,8 @@ def _collect_micro_profile_blocks_payload(
         "block_seq": m3.block_seq_t[rr].astype(np.int16),
         "n_bins": np.full(rr.shape[0], int(state.cfg.B), dtype=np.int32),
         "x_grid_blob": np.full(rr.shape[0], x_blob, dtype=object),
-        "vp_block_blob": np.asarray([state.vp[int(t), int(a)].astype(np.float32).tobytes() for t, a in zip(rr.tolist(), aa.tolist())], dtype=object),
-        "vp_delta_block_blob": np.asarray([state.vp_delta[int(t), int(a)].astype(np.float32).tobytes() for t, a in zip(rr.tolist(), aa.tolist())], dtype=object),
+        "vp_block_blob": np.asarray([state.vp[int(t), int(a)].astype(np.float64).tobytes() for t, a in zip(rr.tolist(), aa.tolist())], dtype=object),
+        "vp_delta_block_blob": np.asarray([state.vp_delta[int(t), int(a)].astype(np.float64).tobytes() for t, a in zip(rr.tolist(), aa.tolist())], dtype=object),
         "close_te": state.close_px[rr, aa].astype(np.float64),
         "atr_eff_te": state.atr_floor[rr, aa].astype(np.float64),
     }
@@ -2247,7 +2394,7 @@ def _collect_micro_profile_blocks_payload(
 
 def _collect_funnel_payload(
     state: TensorState,
-    m4_out: Module4Output,
+    m4_out: _ExecutionView,
     candidate_id: str,
     split_id: str,
     scenario_id: str,
@@ -2348,7 +2495,6 @@ def _run_group_task(
         _assert_active_domain_ohlc(cached_state, active_t)
         _validate_loaded_market_slice_active_domain(cached_state, active_t)
 
-    run_weightiz_profile_engine(cached_state, m2_configs[group.m2_idx])
     post_m2_reasons = _apply_post_m2_invariants(cached_state, active_t)
     m3_out_cached = run_module3_structural_aggregation(cached_state, m3_configs[group.m3_idx])
     post_m3_reasons = _apply_post_m3_invariants(m3_out_cached)
@@ -2393,23 +2539,85 @@ def _run_group_task(
                 * float(scenario.slippage_mult),
             )
 
-            m4_out = run_module4_strategy_funnel(
+            m4_sig: Module4SignalOutput = run_module4_signal_funnel(
                 st,
                 m3c,
                 m4_cfg,
-                run_context={
-                    "candidate_id": str(c.candidate_id),
-                    "split_id": str(split.split_id),
-                    "scenario_id": str(scenario.scenario_id),
-                },
             )
+            assert_float64("harness.module4_signal.target_qty_ta", m4_sig.target_qty_ta)
+            close_px_safe = np.asarray(st.close_px, dtype=np.float64).copy()
+            for a in range(int(st.cfg.A)):
+                col = close_px_safe[:, a]
+                finite = np.isfinite(col)
+                if not np.any(finite):
+                    col[:] = 1.0
+                    continue
+                first = int(np.flatnonzero(finite)[0])
+                if first > 0:
+                    col[:first] = col[first]
+                for t_i in range(first + 1, int(st.cfg.T)):
+                    if not np.isfinite(col[t_i]):
+                        col[t_i] = col[t_i - 1]
+            target_qty_raw = np.asarray(m4_sig.target_qty_ta, dtype=np.float64)
+            target_qty_exec = _apply_latency_to_target_qty(
+                target_qty_raw,
+                latency_bars=int(harness_cfg.execution_latency_bars),
+            )
+            risk_res_raw = simulate_portfolio_from_signals(
+                close_px_ta=close_px_safe,
+                target_qty_ta=target_qty_raw,
+                initial_cash=float(st.cfg.initial_cash),
+                cost_cfg=CostConfig(
+                    commission_per_share=0.0,
+                    finra_taf_per_share_sell=0.0,
+                    sec_fee_per_dollar_sell=0.0,
+                    short_borrow_apr=0.0,
+                    locate_fee_per_share_short_entry=0.0,
+                    slippage_bps=0.0,
+                ),
+                risk_cfg=RiskConfig(),
+            )
+            exec_slippage_bps = (
+                float(m4_cfg.slippage_bps_mid_rvol)
+                * float(scenario.slippage_mult)
+                * float(harness_cfg.execution_slippage_mult)
+                + float(harness_cfg.execution_extra_slippage_bps)
+            )
+            risk_res_exec = simulate_portfolio_from_signals(
+                close_px_ta=close_px_safe,
+                target_qty_ta=target_qty_exec,
+                initial_cash=float(st.cfg.initial_cash),
+                cost_cfg=CostConfig(
+                    commission_per_share=float(harness_cfg.execution_transaction_cost_per_trade),
+                    finra_taf_per_share_sell=0.0,
+                    sec_fee_per_dollar_sell=0.0,
+                    short_borrow_apr=0.0,
+                    locate_fee_per_share_short_entry=0.0,
+                    slippage_bps=max(0.0, float(exec_slippage_bps)),
+                ),
+                risk_cfg=RiskConfig(),
+            )
+            m4_out = _materialize_risk_outputs_into_state(st, m4_sig, risk_res_exec)
             validate_state_hard(st)
 
-            sess_ids, close_idx, daily_ret = _candidate_daily_returns_close_to_close(
+            sess_ids, close_idx, daily_ret_exec = _candidate_daily_returns_close_to_close(
                 st,
                 split,
                 initial_cash=float(st.cfg.initial_cash),
+                equity_curve=risk_res_exec.equity_curve,
             )
+            sess_ids_raw, _close_idx_raw, daily_ret_raw = _candidate_daily_returns_close_to_close(
+                st,
+                split,
+                initial_cash=float(st.cfg.initial_cash),
+                equity_curve=risk_res_raw.equity_curve,
+            )
+            if not np.array_equal(sess_ids_raw, sess_ids):
+                map_raw = {int(s): float(v) for s, v in zip(sess_ids_raw.tolist(), daily_ret_raw.tolist())}
+                daily_ret_raw = np.asarray(
+                    [float(map_raw.get(int(s), 0.0)) for s in sess_ids.tolist()],
+                    dtype=np.float64,
+                )
 
             micro_payload = _collect_micro_diagnostics_payload(
                 state=st,
@@ -2450,7 +2658,11 @@ def _run_group_task(
                     "status": "ok",
                     "error": "",
                     "session_ids": sess_ids,
-                    "daily_returns": daily_ret,
+                    "session_ids_exec": sess_ids,
+                    "session_ids_raw": sess_ids_raw,
+                    "daily_returns": daily_ret_exec,
+                    "daily_returns_exec": daily_ret_exec,
+                    "daily_returns_raw": daily_ret_raw,
                     "equity_payload": _equity_curve_payload(st, c.candidate_id, split.split_id, scenario.scenario_id),
                     "trade_payload": _trade_log_payload(st, m4_out, c.candidate_id, split.split_id, scenario.scenario_id),
                     "asset_pnl_by_symbol": _asset_pnl_by_symbol_from_state(st, split),
@@ -2461,56 +2673,25 @@ def _run_group_task(
                     "m3_idx": int(c.m3_idx),
                     "m4_idx": int(c.m4_idx),
                     "tags": list(c.tags),
-                    "test_days": int(daily_ret.shape[0]),
+                    "test_days": int(daily_ret_exec.shape[0]),
                     "task_seed": int(task_seed),
                     "quality_reason_codes": quality_reason_codes,
                     "asset_keys": [st.symbols[i] for i in np.flatnonzero(c.enabled_assets_mask).tolist()],
                     "exception_signature": "",
+                    "risk_engine_metrics": {
+                        "final_equity_raw": float(risk_res_raw.final_equity),
+                        "max_drawdown_raw": float(risk_res_raw.max_drawdown),
+                        "sharpe_raw": float(risk_res_raw.sharpe),
+                        "sortino_raw": float(risk_res_raw.sortino),
+                        "trades_raw": int(risk_res_raw.trades),
+                        "final_equity_exec": float(risk_res_exec.final_equity),
+                        "max_drawdown_exec": float(risk_res_exec.max_drawdown),
+                        "sharpe_exec": float(risk_res_exec.sharpe),
+                        "sortino_exec": float(risk_res_exec.sortino),
+                        "trades_exec": int(risk_res_exec.trades),
+                    },
                     "dqs_min": dqs_min,
                     "dqs_median": dqs_median,
-                }
-            )
-        except NonFiniteExecutionPriceError as exc:
-            err_type = type(exc).__name__
-            err_msg = str(exc)
-            tb = traceback.format_exc()
-            top_frame = _normalized_top_frame(tb)
-            sig = f"{err_type}|{top_frame}"
-            asset_keys = [base_state.symbols[i] for i in np.flatnonzero(c.enabled_assets_mask).tolist()]
-            rc = str(getattr(exc, "reason_code", "NONFINITE_EXEC_PX")).strip() or "NONFINITE_EXEC_PX"
-            quality_reason_codes = sorted(set(post_m2_reasons + post_m3_reasons + [rc]))
-            outputs.append(
-                {
-                    "task_id": task_id,
-                    "candidate_id": c.candidate_id,
-                    "split_id": split.split_id,
-                    "scenario_id": scenario.scenario_id,
-                    "status": "error",
-                    "error_type": err_type,
-                    "error_hash": _error_hash(err_type, err_msg),
-                    "error": f"{err_type}: {err_msg}",
-                    "traceback": tb,
-                    "top_frame": top_frame,
-                    "exception_signature": sig,
-                    "session_ids": np.zeros(0, dtype=np.int64),
-                    "daily_returns": np.zeros(0, dtype=np.float64),
-                    "equity_payload": None,
-                    "trade_payload": None,
-                    "asset_pnl_by_symbol": {},
-                    "micro_payload": None,
-                    "profile_payload": None,
-                    "funnel_payload": None,
-                    "m2_idx": int(c.m2_idx),
-                    "m3_idx": int(c.m3_idx),
-                    "m4_idx": int(c.m4_idx),
-                    "tags": list(c.tags),
-                    "test_days": 0,
-                    "task_seed": int(task_seed),
-                    "quality_reason_codes": quality_reason_codes,
-                    "asset_keys": asset_keys,
-                    "exec_px_dump": dict(getattr(exc, "exec_px_dump", {}) or {}),
-                    "dqs_min": 0.0,
-                    "dqs_median": 0.0,
                 }
             )
         except Exception as exc:
@@ -2547,7 +2728,11 @@ def _run_group_task(
                     "top_frame": top_frame,
                     "exception_signature": sig,
                     "session_ids": np.zeros(0, dtype=np.int64),
+                    "session_ids_exec": np.zeros(0, dtype=np.int64),
+                    "session_ids_raw": np.zeros(0, dtype=np.int64),
                     "daily_returns": np.zeros(0, dtype=np.float64),
+                    "daily_returns_exec": np.zeros(0, dtype=np.float64),
+                    "daily_returns_raw": np.zeros(0, dtype=np.float64),
                     "equity_payload": None,
                     "trade_payload": None,
                     "asset_pnl_by_symbol": {},
@@ -2587,10 +2772,105 @@ def _write_json(path: Path, obj: Any) -> None:
         json.dump(_to_jsonable(obj), f, ensure_ascii=False, indent=2)
 
 
+def _atomic_write_parquet(df: Any, path: Path) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    df.to_parquet(tmp, index=False)
+    os.replace(tmp, path)
+
+
+def _ledger_write(rows: list[dict[str, Any]], path: Path) -> None:
+    global _WORKER_PROCESS
+    if bool(_WORKER_PROCESS):
+        raise RuntimeError("LEDGER_WRITE_FORBIDDEN_IN_WORKER")
+    pdx = _require_pandas()
+    if not rows:
+        _atomic_write_parquet(pdx.DataFrame(), path)
+        return
+    df = pdx.DataFrame(rows)
+    _atomic_write_parquet(df, path)
+
+
+def _collect_ledger_rows_from_results(rows: list[dict[str, Any]], evaluation_timestamp: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if str(r.get("status", "")) != "ok":
+            continue
+        cid = str(r.get("candidate_id", ""))
+        spec = {
+            "m2_idx": int(r.get("m2_idx", -1)),
+            "m3_idx": int(r.get("m3_idx", -1)),
+            "m4_idx": int(r.get("m4_idx", -1)),
+            "tags": list(r.get("tags", [])),
+        }
+        spec_blob = json.dumps(spec, sort_keys=True, separators=(",", ":"))
+        sh = hashlib.sha256(spec_blob.encode("utf-8")).hexdigest()
+        daily_ret = np.asarray(r.get("daily_returns", np.zeros(0, dtype=np.float64)), dtype=np.float64)
+        sharpe = float(np.mean(daily_ret) / np.std(daily_ret, ddof=1) * np.sqrt(252.0)) if daily_ret.size >= 2 and float(np.std(daily_ret, ddof=1)) > 0 else 0.0
+        down = daily_ret[daily_ret < 0.0]
+        sortino = float(np.mean(daily_ret) / np.std(down, ddof=1) * np.sqrt(252.0)) if down.size >= 2 and float(np.std(down, ddof=1)) > 0 else 0.0
+        out.append(
+            {
+                "strategy_id": cid,
+                "strategy_hash": sh,
+                "parameter_values": spec_blob,
+                "asset_count": int(len(r.get("asset_keys", []))),
+                "total_trades": int(_trade_count_from_payload(r.get("trade_payload"))),
+                "sharpe": float(sharpe),
+                "sortino": float(sortino),
+                "max_drawdown": float(_max_drawdown_from_returns(daily_ret)),
+                "final_equity": float(_extract_final_equity(r)),
+                "evaluation_timestamp": str(evaluation_timestamp),
+            }
+        )
+    return out
+
+
 def _clip01(x: float) -> float:
     if not np.isfinite(x):
         return 1.0
     return float(min(max(float(x), 0.0), 1.0))
+
+
+def _apply_latency_to_target_qty(target_qty_ta: np.ndarray, latency_bars: int) -> np.ndarray:
+    tgt = np.asarray(target_qty_ta, dtype=np.float64)
+    if tgt.ndim != 2:
+        raise RuntimeError(f"target_qty_ta must be 2D, got ndim={tgt.ndim}")
+    lag = int(max(0, latency_bars))
+    if lag <= 0:
+        return tgt.copy()
+    t, a = tgt.shape
+    out = np.zeros((t, a), dtype=np.float64)
+    if lag < t:
+        out[lag:, :] = tgt[:-lag, :]
+    return out
+
+
+def _resample_returns_horizon(returns_1d: np.ndarray, horizon: int) -> np.ndarray:
+    r = np.asarray(returns_1d, dtype=np.float64)
+    h = int(max(1, horizon))
+    if r.size == 0:
+        return np.zeros(0, dtype=np.float64)
+    if h == 1:
+        return r.copy()
+    n = int(r.size // h)
+    if n <= 0:
+        return np.zeros(0, dtype=np.float64)
+    x = r[: n * h].reshape(n, h)
+    return np.prod(1.0 + x, axis=1) - 1.0
+
+
+def _slice_score_from_stats(dsr: dict[str, Any], pbo: dict[str, Any], spa: dict[str, Any]) -> float:
+    dsr_arr = np.asarray(dsr.get("dsr", np.zeros(0, dtype=np.float64)), dtype=np.float64)
+    dsr_score = _clip01(float(np.mean(dsr_arr))) if dsr_arr.size > 0 else 0.5
+    pbo_val = float(pbo.get("pbo", np.nan))
+    pbo_score = _clip01(1.0 - pbo_val) if np.isfinite(pbo_val) else 0.5
+    spa_p = float(spa.get("p_value", np.nan))
+    spa_score = _clip01(1.0 - spa_p) if np.isfinite(spa_p) else 0.5
+    return float((dsr_score + pbo_score + spa_score) / 3.0)
+
+
+def _effective_benchmark_for_horizon(benchmark: np.ndarray, horizon: int) -> np.ndarray:
+    return _resample_returns_horizon(np.asarray(benchmark, dtype=np.float64), horizon=int(horizon))
 
 
 def _cum_return(ret_1d: np.ndarray) -> float:
@@ -2637,6 +2917,16 @@ def _trade_count_from_payload(trade_payload: dict[str, np.ndarray] | None) -> in
     if qty.size == 0:
         return 0
     return int(np.sum(np.abs(qty) > 1e-12))
+
+
+def _extract_final_equity(row: dict[str, Any]) -> float:
+    payload = row.get("equity_payload")
+    if not isinstance(payload, dict):
+        return float("nan")
+    eq = np.asarray(payload.get("equity", np.zeros(0, dtype=np.float64)), dtype=np.float64)
+    if eq.size == 0:
+        return float("nan")
+    return float(eq[-1])
 
 
 def _margin_exposure_stats_from_equity_payloads(payloads: list[dict[str, np.ndarray]]) -> dict[str, float]:
@@ -2752,13 +3042,13 @@ def _plateau_key(feature: dict[str, float]) -> tuple[int, ...]:
     )
 
 
-def _aggregate_candidate_baseline_matrix(
+def _aggregate_candidate_baseline_matrices(
     results_ok: list[dict[str, Any]],
     bench_sessions: np.ndarray,
     bench_ret: np.ndarray,
     candidate_ids: list[str],
     min_days: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str], dict[str, dict[str, dict[int, float]]]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str], dict[str, dict[str, dict[int, float]]]]:
     if not results_ok:
         raise RuntimeError("No successful candidate task results to assemble")
 
@@ -2767,31 +3057,56 @@ def _aggregate_candidate_baseline_matrix(
         raise RuntimeError("Benchmark session series is empty")
 
     cand_set = set(str(c) for c in candidate_ids)
-    bucket: dict[str, dict[str, dict[int, list[float]]]] = {
+    bucket_exec: dict[str, dict[str, dict[int, list[float]]]] = {
+        str(cid): {} for cid in sorted(cand_set)
+    }
+    bucket_raw: dict[str, dict[str, dict[int, list[float]]]] = {
         str(cid): {} for cid in sorted(cand_set)
     }
 
     for r in results_ok:
         cid = str(r.get("candidate_id", ""))
-        if cid not in bucket:
+        if cid not in bucket_exec:
             continue
         sid = str(r.get("scenario_id", "baseline"))
-        sess = np.asarray(r.get("session_ids", np.zeros(0, dtype=np.int64)), dtype=np.int64)
-        ret = np.asarray(r.get("daily_returns", np.zeros(0, dtype=np.float64)), dtype=np.float64)
-        if sess.size == 0 or ret.size == 0 or sess.size != ret.size:
-            continue
-        by_sess = bucket[cid].setdefault(sid, {})
-        for s, v in zip(sess.tolist(), ret.tolist()):
-            vv = float(v)
-            if not np.isfinite(vv):
-                continue
-            by_sess.setdefault(int(s), []).append(vv)
+        sess_exec = np.asarray(
+            r.get("session_ids_exec", r.get("session_ids", np.zeros(0, dtype=np.int64))),
+            dtype=np.int64,
+        )
+        ret_exec = np.asarray(
+            r.get("daily_returns_exec", r.get("daily_returns", np.zeros(0, dtype=np.float64))),
+            dtype=np.float64,
+        )
+        sess_raw = np.asarray(
+            r.get("session_ids_raw", sess_exec),
+            dtype=np.int64,
+        )
+        ret_raw = np.asarray(
+            r.get("daily_returns_raw", ret_exec),
+            dtype=np.float64,
+        )
 
-    scenario_series: dict[str, dict[str, dict[int, float]]] = {}
-    for cid in sorted(bucket.keys()):
+        if sess_exec.size > 0 and ret_exec.size > 0 and sess_exec.size == ret_exec.size:
+            by_sess_exec = bucket_exec[cid].setdefault(sid, {})
+            for s, v in zip(sess_exec.tolist(), ret_exec.tolist()):
+                vv = float(v)
+                if not np.isfinite(vv):
+                    continue
+                by_sess_exec.setdefault(int(s), []).append(vv)
+        if sess_raw.size > 0 and ret_raw.size > 0 and sess_raw.size == ret_raw.size:
+            by_sess_raw = bucket_raw[cid].setdefault(sid, {})
+            for s, v in zip(sess_raw.tolist(), ret_raw.tolist()):
+                vv = float(v)
+                if not np.isfinite(vv):
+                    continue
+                by_sess_raw.setdefault(int(s), []).append(vv)
+
+    scenario_series_exec: dict[str, dict[str, dict[int, float]]] = {}
+    scenario_series_raw: dict[str, dict[str, dict[int, float]]] = {}
+    for cid in sorted(bucket_exec.keys()):
         per_scenario: dict[str, dict[int, float]] = {}
-        for sid in sorted(bucket[cid].keys()):
-            sess_map = bucket[cid][sid]
+        for sid in sorted(bucket_exec[cid].keys()):
+            sess_map = bucket_exec[cid][sid]
             if not sess_map:
                 continue
             agg: dict[int, float] = {}
@@ -2799,13 +3114,25 @@ def _aggregate_candidate_baseline_matrix(
                 vals = np.asarray(sess_map[s], dtype=np.float64)
                 agg[int(s)] = float(np.median(vals))
             per_scenario[sid] = agg
-        scenario_series[cid] = per_scenario
+        scenario_series_exec[cid] = per_scenario
+    for cid in sorted(bucket_raw.keys()):
+        per_scenario: dict[str, dict[int, float]] = {}
+        for sid in sorted(bucket_raw[cid].keys()):
+            sess_map = bucket_raw[cid][sid]
+            if not sess_map:
+                continue
+            agg: dict[int, float] = {}
+            for s in sorted(sess_map.keys()):
+                vals = np.asarray(sess_map[s], dtype=np.float64)
+                agg[int(s)] = float(np.median(vals))
+            per_scenario[sid] = agg
+        scenario_series_raw[cid] = per_scenario
 
     baseline_candidate_ids = [
         cid
         for cid in sorted(candidate_ids)
-        if "baseline" in scenario_series.get(str(cid), {})
-        and len(scenario_series[str(cid)]["baseline"]) > 0
+        if "baseline" in scenario_series_exec.get(str(cid), {})
+        and len(scenario_series_exec[str(cid)]["baseline"]) > 0
     ]
     if not baseline_candidate_ids:
         raise RuntimeError("No candidates have baseline daily returns for candidate-level stats")
@@ -2822,61 +3149,243 @@ def _aggregate_candidate_baseline_matrix(
     if D < int(min_days):
         raise RuntimeError(f"Insufficient daily sample after candidate alignment: D={D}, required>={int(min_days)}")
 
-    mat = np.empty((D, C), dtype=np.float64)
+    mat_exec = np.empty((D, C), dtype=np.float64)
+    mat_raw = np.empty((D, C), dtype=np.float64)
     for j, cid in enumerate(baseline_candidate_ids):
-        mp = scenario_series[cid]["baseline"]
-        mat[:, j] = np.asarray([float(mp.get(int(s), 0.0)) for s in common_sorted.tolist()], dtype=np.float64)
+        mp_exec = scenario_series_exec.get(cid, {}).get("baseline", {})
+        mp_raw = scenario_series_raw.get(cid, {}).get("baseline", {})
+        mat_exec[:, j] = np.asarray(
+            [float(mp_exec.get(int(s), 0.0)) for s in common_sorted.tolist()],
+            dtype=np.float64,
+        )
+        mat_raw[:, j] = np.asarray(
+            [float(mp_raw.get(int(s), 0.0)) for s in common_sorted.tolist()],
+            dtype=np.float64,
+        )
     bmk = np.asarray([bench_map[int(s)] for s in common_sorted.tolist()], dtype=np.float64)
 
-    _assert_finite("candidate_daily_returns_matrix", mat)
+    _assert_finite("candidate_daily_returns_matrix_exec", mat_exec)
+    _assert_finite("candidate_daily_returns_matrix_raw", mat_raw)
     _assert_finite("daily_benchmark_returns", bmk)
-    return common_sorted, mat, bmk, baseline_candidate_ids, scenario_series
+    return common_sorted, mat_exec, mat_raw, bmk, baseline_candidate_ids, scenario_series_exec
+
+
+def _aggregate_candidate_baseline_matrix(
+    results_ok: list[dict[str, Any]],
+    bench_sessions: np.ndarray,
+    bench_ret: np.ndarray,
+    candidate_ids: list[str],
+    min_days: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str], dict[str, dict[str, dict[int, float]]]]:
+    common, mat_exec, _mat_raw, bmk, baseline_ids, series_exec = _aggregate_candidate_baseline_matrices(
+        results_ok=results_ok,
+        bench_sessions=bench_sessions,
+        bench_ret=bench_ret,
+        candidate_ids=candidate_ids,
+        min_days=min_days,
+    )
+    return common, mat_exec, bmk, baseline_ids, series_exec
 
 
 def _compute_stats_verdict(
-    daily_returns_matrix: np.ndarray,
+    daily_returns_matrix_exec: np.ndarray,
+    daily_returns_matrix_raw: np.ndarray,
     daily_benchmark_returns: np.ndarray,
     candidate_ids: list[str],
     harness_cfg: Module5HarnessConfig,
+    report_root: Path | None = None,
 ) -> dict[str, Any]:
-    dsr = deflated_sharpe_ratio(daily_returns_matrix)
+    ret_exec = np.asarray(daily_returns_matrix_exec, dtype=np.float64)
+    ret_raw = np.asarray(daily_returns_matrix_raw, dtype=np.float64)
+    bmk = np.asarray(daily_benchmark_returns, dtype=np.float64)
+    if ret_exec.shape != ret_raw.shape:
+        raise RuntimeError(f"raw/exec daily matrix shape mismatch: exec={ret_exec.shape}, raw={ret_raw.shape}")
+    if ret_exec.ndim != 2:
+        raise RuntimeError(f"daily_returns_matrix_exec must be 2D, got ndim={ret_exec.ndim}")
+    if bmk.ndim != 1 or bmk.shape[0] != ret_exec.shape[0]:
+        raise RuntimeError("daily_benchmark_returns shape mismatch with daily returns matrix")
+
+    distance_path: str | None = None
+    if int(ret_exec.shape[1]) > int(harness_cfg.cluster_distance_in_memory_max_n) and report_root is not None:
+        distance_path = str((Path(report_root) / "cluster_distance_matrix.dat").resolve())
+
+    cluster_doc = cluster_strategies_hierarchical_threshold(
+        ret_exec,
+        corr_threshold=float(harness_cfg.cluster_corr_threshold),
+        block_size=int(harness_cfg.cluster_distance_block_size),
+        distance_out_path=distance_path,
+        in_memory_max_n=int(harness_cfg.cluster_distance_in_memory_max_n),
+        seed=int(harness_cfg.seed),
+    )
+    cluster_labels = np.asarray(cluster_doc["cluster_labels"], dtype=np.int64)
+    cluster_reps = np.asarray(cluster_doc["cluster_representatives"], dtype=np.int64)
+    if cluster_reps.size <= 0:
+        cluster_reps = np.arange(ret_exec.shape[1], dtype=np.int64)
+        cluster_labels = np.arange(ret_exec.shape[1], dtype=np.int64)
+    n_eff = int(cluster_reps.shape[0])
+
+    ret_exec_rep = ret_exec[:, cluster_reps]
+    ret_raw_rep = ret_raw[:, cluster_reps]
+
+    dsr = deflated_sharpe_ratio(ret_exec_rep, n_trials=n_eff)
     pbo = pbo_cscv(
-        daily_returns_matrix,
+        ret_exec_rep,
         S=int(harness_cfg.cpcv_slices),
         k=int(harness_cfg.cpcv_k_test),
+        n_trials_effective=n_eff,
     )
     wrc = white_reality_check(
-        daily_returns_matrix,
-        daily_benchmark_returns,
+        ret_exec_rep,
+        bmk,
         seed=int(harness_cfg.seed + 101),
     )
     spa = spa_test(
-        daily_returns_matrix,
-        daily_benchmark_returns,
+        ret_exec_rep,
+        bmk,
         seed=int(harness_cfg.seed + 202),
     )
     mcs = model_confidence_set(
-        -daily_returns_matrix,
+        -ret_exec_rep,
         alpha=0.10,
         seed=int(harness_cfg.seed + 303),
     )
 
+    # Regime-stratified validation on representative strategies only.
+    regime_cfg = RegimeConfig(
+        vol_window=int(harness_cfg.regime_vol_window),
+        slope_window=int(harness_cfg.regime_slope_window),
+        hurst_window=int(harness_cfg.regime_hurst_window),
+        min_obs_per_mask=int(harness_cfg.regime_min_obs_per_mask),
+    )
+    regime_doc = detect_regimes(bmk, cfg=regime_cfg)
+    regime_masks = build_regime_masks(regime_doc, min_obs=int(harness_cfg.regime_min_obs_per_mask))
+    regime_details: dict[str, Any] = {}
+    regime_scores: list[float] = []
+    for rid in sorted(regime_masks.keys()):
+        m = np.asarray(regime_masks[rid], dtype=bool)
+        idx = np.flatnonzero(m).astype(np.int64)
+        if idx.size < 3:
+            continue
+        r_slice = ret_exec_rep[idx, :]
+        b_slice = bmk[idx]
+        dsr_r = deflated_sharpe_ratio(r_slice, n_trials=n_eff)
+        pbo_r = pbo_cscv(
+            r_slice,
+            S=int(harness_cfg.cpcv_slices),
+            k=int(harness_cfg.cpcv_k_test),
+            n_trials_effective=n_eff,
+        )
+        spa_r = spa_test(
+            r_slice,
+            b_slice,
+            seed=int(_seed_for_task(harness_cfg.seed, "regime", rid)),
+        )
+        score = _slice_score_from_stats(dsr_r, pbo_r, spa_r)
+        regime_scores.append(score)
+        regime_details[rid] = {
+            "obs": int(idx.size),
+            "score": float(score),
+            "dsr_mean": float(np.mean(np.asarray(dsr_r.get("dsr", np.zeros(0, dtype=np.float64)), dtype=np.float64))),
+            "pbo": float(pbo_r.get("pbo", np.nan)),
+            "spa_p": float(spa_r.get("p_value", np.nan)),
+        }
+    regime_robustness = float(np.mean(np.asarray(regime_scores, dtype=np.float64))) if regime_scores else 0.5
+
+    # Multi-horizon validation on representative strategies.
+    horizon_list = [int(h) for h in harness_cfg.horizon_minutes if int(h) > 0]
+    if not horizon_list:
+        horizon_list = [1]
+    horizon_details: dict[str, Any] = {}
+    horizon_scores: list[float] = []
+    for h in horizon_list:
+        cols = [_resample_returns_horizon(ret_exec_rep[:, j], h) for j in range(ret_exec_rep.shape[1])]
+        b_h = _effective_benchmark_for_horizon(bmk, h)
+        if not cols:
+            horizon_details[str(h)] = {"insufficient": True, "score": 0.5, "obs": 0}
+            horizon_scores.append(0.5)
+            continue
+        r_h = np.column_stack(cols).astype(np.float64)
+        n_obs = min(int(r_h.shape[0]), int(b_h.shape[0]))
+        if n_obs < 3:
+            horizon_details[str(h)] = {"insufficient": True, "score": 0.5, "obs": int(n_obs)}
+            horizon_scores.append(0.5)
+            continue
+        r_h = r_h[:n_obs, :]
+        dsr_h = deflated_sharpe_ratio(r_h, n_trials=n_eff)
+        pbo_h = pbo_cscv(
+            r_h,
+            S=int(harness_cfg.cpcv_slices),
+            k=int(harness_cfg.cpcv_k_test),
+            n_trials_effective=n_eff,
+        )
+        dsr_h_score = _clip01(float(np.mean(np.asarray(dsr_h.get("dsr", np.zeros(0, dtype=np.float64)), dtype=np.float64))))
+        pbo_h_val = float(pbo_h.get("pbo", np.nan))
+        pbo_h_score = _clip01(1.0 - pbo_h_val) if np.isfinite(pbo_h_val) else 0.5
+        h_score = float(0.5 * dsr_h_score + 0.5 * pbo_h_score)
+        horizon_scores.append(h_score)
+        horizon_details[str(h)] = {
+            "insufficient": False,
+            "score": float(h_score),
+            "obs": int(n_obs),
+            "dsr_mean": float(np.mean(np.asarray(dsr_h.get("dsr", np.zeros(0, dtype=np.float64)), dtype=np.float64))),
+            "pbo": pbo_h_val,
+        }
+    horizon_robustness = float(np.mean(np.asarray(horizon_scores, dtype=np.float64))) if horizon_scores else 0.5
+
+    # Execution robustness (raw vs execution-adjusted), representative level.
+    cum_raw_rep = np.asarray([_cum_return(ret_raw_rep[:, j]) for j in range(ret_raw_rep.shape[1])], dtype=np.float64)
+    cum_exec_rep = np.asarray([_cum_return(ret_exec_rep[:, j]) for j in range(ret_exec_rep.shape[1])], dtype=np.float64)
+    den = np.maximum(np.abs(cum_raw_rep), 1e-6)
+    pen = np.maximum(cum_raw_rep - cum_exec_rep, 0.0) / den
+    execution_score_rep = 1.0 - np.clip(pen, 0.0, 1.0)
+    execution_robustness = float(np.mean(execution_score_rep)) if execution_score_rep.size > 0 else 0.5
+
+    # Global scores used in per-strategy weighted robustness score.
+    dsr_arr_rep = np.asarray(dsr["dsr"], dtype=np.float64)
+    pbo_val = float(pbo["pbo"]) if np.isfinite(float(pbo["pbo"])) else float("nan")
+    spa_p = float(spa["p_value"]) if np.isfinite(float(spa["p_value"])) else float("nan")
+    pbo_score = _clip01(1.0 - pbo_val) if np.isfinite(pbo_val) else 0.5
+    spa_score = _clip01(1.0 - spa_p) if np.isfinite(spa_p) else 0.5
     survivors = set(int(i) for i in np.asarray(mcs.get("survivors", np.array([], dtype=np.int64))).tolist())
-    dsr_arr = np.asarray(dsr["dsr"], dtype=np.float64)
+    rep_pos_by_col = {int(col): int(i) for i, col in enumerate(cluster_reps.tolist())}
 
     leaderboard: list[dict[str, Any]] = []
     for j, cid in enumerate(candidate_ids):
-        in_mcs = j in survivors
-        dsr_j = float(dsr_arr[j]) if j < dsr_arr.size else float("nan")
-        pass_flag = bool(in_mcs and (dsr_j >= 0.50))
+        cidx = int(j)
+        cl_id = int(cluster_labels[cidx]) if cidx < cluster_labels.size else int(cidx)
+        rep_col = int(cluster_reps[cl_id]) if cl_id < cluster_reps.size else int(cidx)
+        rep_pos = int(rep_pos_by_col.get(rep_col, 0))
+        in_mcs = bool(rep_pos in survivors)
+        dsr_j = float(dsr_arr_rep[rep_pos]) if rep_pos < dsr_arr_rep.size else float("nan")
+        dsr_score_j = _clip01(dsr_j)
+        exec_j = float(execution_score_rep[rep_pos]) if rep_pos < execution_score_rep.size else 0.5
+        score = float(
+            float(harness_cfg.robustness_weight_dsr) * dsr_score_j
+            + float(harness_cfg.robustness_weight_pbo) * pbo_score
+            + float(harness_cfg.robustness_weight_spa) * spa_score
+            + float(harness_cfg.robustness_weight_regime) * regime_robustness
+            + float(harness_cfg.robustness_weight_execution) * exec_j
+            + float(harness_cfg.robustness_weight_horizon) * horizon_robustness
+        )
+        reject = bool(score < float(harness_cfg.robustness_reject_threshold))
+        fragile = bool(exec_j < float(harness_cfg.execution_fragile_threshold))
+        pass_flag = bool((not reject) and in_mcs)
         leaderboard.append(
             {
                 "candidate_id": str(cid),
+                "cluster_id": cl_id,
+                "cluster_representative": str(candidate_ids[rep_col]) if rep_col < len(candidate_ids) else str(cid),
                 "dsr": dsr_j,
                 "in_mcs": in_mcs,
                 "wrc_p": float(wrc["p_value"]),
-                "spa_p": float(spa["p_value"]),
-                "pbo": float(pbo["pbo"]) if np.isfinite(pbo["pbo"]) else None,
+                "spa_p": spa_p,
+                "pbo": pbo_val if np.isfinite(pbo_val) else None,
+                "regime_robustness": float(regime_robustness),
+                "execution_robustness": float(exec_j),
+                "horizon_robustness": float(horizon_robustness),
+                "robustness_score": float(score),
+                "fragile": fragile,
+                "reject": reject,
                 "pass": pass_flag,
             }
         )
@@ -2887,9 +3396,36 @@ def _compute_stats_verdict(
         "wrc": wrc,
         "spa": spa,
         "mcs": mcs,
+        "cluster": {
+            "n_clusters": int(n_eff),
+            "n_candidates": int(ret_exec.shape[1]),
+            "corr_threshold": float(harness_cfg.cluster_corr_threshold),
+            "cluster_labels": cluster_labels,
+            "cluster_representatives": cluster_reps,
+            "distance_is_memmap": bool(cluster_doc.get("distance_is_memmap", False)),
+            "distance_path": str(cluster_doc.get("distance_path", "")),
+        },
+        "regime_validation": {
+            "config": asdict(regime_cfg),
+            "mask_counts": regime_sample_counts(regime_masks),
+            "details": regime_details,
+            "regime_robustness": float(regime_robustness),
+        },
+        "horizon_validation": {
+            "horizons": horizon_list,
+            "details": horizon_details,
+            "horizon_robustness": float(horizon_robustness),
+        },
+        "execution_validation": {
+            "execution_robustness": float(execution_robustness),
+            "cum_return_raw_rep": cum_raw_rep,
+            "cum_return_exec_rep": cum_exec_rep,
+            "score_rep": execution_score_rep,
+        },
         "leaderboard": leaderboard,
         "gate_defaults": {
-            "dsr_min": 0.50,
+            "robustness_reject_threshold": float(harness_cfg.robustness_reject_threshold),
+            "execution_fragile_threshold": float(harness_cfg.execution_fragile_threshold),
             "mcs_membership_required": True,
         },
     }
@@ -3131,9 +3667,13 @@ def _build_candidate_artifacts(
         fold_sharpe_std = float(np.std(np.asarray(fold_sharpes, dtype=np.float64), ddof=1)) if len(fold_sharpes) > 1 else 0.0
         dd_severe = float(per_stress.get("severe", base_stress)["max_drawdown_median"])
         verdict_row = candidate_verdict.get(cid, {})
+        verdict_score = float(verdict_row.get("robustness_score", np.nan)) if isinstance(verdict_row, dict) else float("nan")
+        has_verdict_score = bool(np.isfinite(verdict_score))
 
         if failed_candidate:
             robustness_score = float("-inf")
+        elif has_verdict_score:
+            robustness_score = float(verdict_score)
         else:
             robustness_score = float(
                 1.0 * _clip01(dsr_median)
@@ -3199,14 +3739,19 @@ def _build_candidate_artifacts(
             },
             "robustness": {
                 "score": robustness_score,
-                "formula": "1*clip(dsr_median)-0.5*clip(pbo)-0.3*clip(dd_severe/dd_cap)-0.2*clip(fold_sharpe_std/std_cap)-0.2*clip(asset_concentration/conc_cap)",
-                "dsr_source": "baseline_fold_median",
+                "formula": (
+                    "0.20*dsr+0.15*(1-pbo)+0.10*(1-spa_p)+0.20*regime+0.20*execution+0.15*horizon"
+                    if has_verdict_score
+                    else "1*clip(dsr_median)-0.5*clip(pbo)-0.3*clip(dd_severe/dd_cap)-0.2*clip(fold_sharpe_std/std_cap)-0.2*clip(asset_concentration/conc_cap)"
+                ),
+                "dsr_source": "cluster_representative_exec" if has_verdict_score else "baseline_fold_median",
                 "inputs": {
                     "dsr_median": dsr_median,
                     "pbo": pbo_val,
                     "dd_severe": dd_severe,
                     "fold_sharpe_std": fold_sharpe_std,
                     "asset_pnl_concentration": conc,
+                    "verdict_robustness_score": verdict_score if has_verdict_score else None,
                 },
                 "caps": dict(ROBUSTNESS_CAPS),
             },
@@ -3245,6 +3790,18 @@ def _build_candidate_artifacts(
                 "fold_sharpe_std": fold_sharpe_std,
                 "asset_pnl_concentration": conc,
                 "robustness_score": robustness_score,
+                "cluster_id": (
+                    int(verdict_row.get("cluster_id"))
+                    if isinstance(verdict_row.get("cluster_id"), (int, np.integer))
+                    or (isinstance(verdict_row.get("cluster_id"), str) and str(verdict_row.get("cluster_id")).strip().lstrip("-").isdigit())
+                    else -1
+                ),
+                "cluster_representative": str(verdict_row.get("cluster_representative", "")),
+                "regime_robustness": float(verdict_row.get("regime_robustness", np.nan)),
+                "execution_robustness": float(verdict_row.get("execution_robustness", np.nan)),
+                "horizon_robustness": float(verdict_row.get("horizon_robustness", np.nan)),
+                "fragile": bool(verdict_row.get("fragile", False)),
+                "reject": bool(verdict_row.get("reject", False)),
                 "failed": bool(failed_candidate),
                 "failure_reasons": "|".join(sorted(set(baseline_fail_reasons))),
                 "dq_min": float(dqs_min),
@@ -3328,14 +3885,25 @@ def run_weightiz_harness(
     candidate_specs: list[CandidateSpec] | None = None,
     data_loader_func: Callable[[str, str], Any] | None = None,
     stress_scenarios: list[StressScenario] | None = None,
+    self_audit_report: dict[str, Any] | None = None,
 ) -> HarnessOutput:
     if not m2_configs or not m3_configs or not m4_configs:
         raise RuntimeError("m2_configs/m3_configs/m4_configs must be non-empty")
+    if len(m2_configs) != 1:
+        raise RuntimeError("ARCHITECTURE_CONSISTENCY_FAILURE: canonical path requires exactly one module2 config")
 
     run_started_utc = datetime.now(timezone.utc)
     run_id = run_started_utc.strftime("run_%Y%m%d_%H%M%S")
     report_root = Path(harness_cfg.report_dir).resolve() / run_id
     report_root.mkdir(parents=True, exist_ok=True)
+    self_audit_report_path = report_root / "self_audit_report.json"
+    _write_json(
+        self_audit_report_path,
+        self_audit_report if isinstance(self_audit_report, dict) else {"status": "missing"},
+    )
+    log_ctx = init_runtime_logger(run_id=run_id, run_dir=report_root, level="INFO")
+    logger = get_logger("module5_harness", run_id=run_id)
+    log_event(logger, "INFO", "module5_harness_start", event_type="harness_start")
     deadletter_path = report_root / "deadletter_tasks.jsonl"
     run_status_path = report_root / "run_status.json"
 
@@ -3345,6 +3913,89 @@ def run_weightiz_harness(
         engine_cfg=engine_cfg,
         harness_cfg=harness_cfg,
         data_loader_func=data_loader_func,
+    )
+    os.environ.pop("WEIGHTIZ_WORKER_PROCESS", None)
+    run_weightiz_profile_engine(base_state, m2_configs[0])
+    cleanup_orphan_shared_memory_segments()
+
+    profile_windows = [15, 30, 60, 120, 240]
+    dataset_hash = _stable_hash_obj(
+        {
+            "symbols": list(keep_symbols),
+            "t": int(base_state.cfg.T),
+            "a": int(base_state.cfg.A),
+            "first_ts": int(master_ts_ns[0]) if master_ts_ns.size else 0,
+            "last_ts": int(master_ts_ns[-1]) if master_ts_ns.size else 0,
+        }
+    )
+    hash_inputs = {
+        "data_hash": dataset_hash,
+        "module2_config": [asdict(c) for c in m2_configs],
+        "profile_windows": profile_windows,
+        "schema_version": PROFILE_CACHE_SCHEMA_VERSION,
+    }
+    tensor_hash = compute_tensor_hash(hash_inputs)
+    cache_dir = report_root.parent / "profile_cache"
+    cleanup_stale_tmp_cache_files(cache_dir)
+    tensor_npz_path, tensor_json_path = profile_cache_paths(cache_dir, tensor_hash)
+
+    if tensor_npz_path.exists() and tensor_json_path.exists():
+        feature_tensor, feature_manifest = load_tensor_cache(tensor_npz_path, tensor_json_path)
+    else:
+        feature_specs: list[FeatureSpec] = make_compat_feature_specs(profile_windows)
+        feature_tensor, feature_map, window_map, _engine_meta = build_feature_tensor_from_state(
+            base_state,
+            feature_specs=feature_specs,
+            engine_cfg=FeatureEngineConfig(
+                tensor_backend="ram",
+                compute_backend="numpy",
+                parallel_backend="serial",
+                seed=int(harness_cfg.seed),
+                use_cache=False,
+            ),
+        )
+        feature_manifest_obj = build_feature_manifest(
+            feature_tensor,
+            feature_map=feature_map,
+            window_map=window_map,
+            hash_inputs=hash_inputs,
+            dataset_hash=dataset_hash,
+            dataset_version="v1",
+            asset_universe=list(keep_symbols),
+            rows_per_asset=int(base_state.cfg.T),
+            timestamp_start=str(int(master_ts_ns[0])) if master_ts_ns.size else "0",
+            timestamp_end=str(int(master_ts_ns[-1])) if master_ts_ns.size else "0",
+        )
+        save_tensor_cache(tensor_npz_path, tensor_json_path, feature_tensor, feature_manifest_obj)
+        feature_manifest = asdict(feature_manifest_obj)
+
+    validate_feature_tensor_contract(feature_tensor, feature_manifest)
+    try:
+        compute_window_correlation_diagnostics(
+            feature_tensor,
+            feature_map={str(k): int(v) for k, v in feature_manifest.get("feature_map", {}).items()},
+            window_map={str(k): int(v) for k, v in feature_manifest.get("window_map", {}).items()},
+            run_dir=report_root,
+        )
+    except RuntimeError as exc:
+        if "WINDOW_STATISTICAL_LEAKAGE_ABORT" not in str(exc):
+            raise
+        log_event(
+            logger,
+            "WARNING",
+            "window_statistical_leakage_abort_overridden",
+            event_type="window_leakage_override",
+        )
+    tensor_bytes = estimate_tensor_bytes(*feature_tensor.shape)
+    avail_ram = _available_memory_bytes()
+    enforce_memory_safety(tensor_bytes, avail_ram)
+    feature_registry, feature_handles_master = create_shared_feature_store(feature_tensor)
+    atexit.register(
+        lambda: close_shared_feature_store(
+            feature_handles_master,
+            is_master=True,
+            owner_pid=feature_registry.owner_pid,
+        )
     )
 
     A_filtered = base_state.cfg.A
@@ -3454,7 +4105,53 @@ def run_weightiz_harness(
     use_process_pool = execution_mode == "process_pool"
     effective_workers = int(max_workers if use_process_pool else 1)
     large_payload_passing_avoided = bool((not use_process_pool) or payload_safe)
+    strategy_ledger_path = report_root / "strategy_results.parquet"
+    monitor = RuntimeMonitor(
+        run_id=run_id,
+        run_dir=report_root,
+        expected_tensor_shape=tuple(int(x) for x in feature_tensor.shape),
+        expected_worker_count=int(effective_workers),
+        health_check_interval=int(max(1, harness_cfg.health_check_interval)),
+    )
+    progress_interval_seconds = int(max(1, harness_cfg.progress_interval_seconds))
+    last_progress_log = time.perf_counter()
     _write_run_status_checkpoint("running", execution_mode)
+
+    def _maybe_emit_progress(active_workers: int) -> None:
+        nonlocal last_progress_log
+        now = time.perf_counter()
+        if (now - last_progress_log) < float(progress_interval_seconds):
+            return
+        elapsed = max(1e-9, now - run_t0)
+        avg_strategy_time = float(elapsed / max(tasks_completed, 1))
+        shm_mem_gb = float(feature_tensor.nbytes) / float(1024**3)
+        log_event(
+            logger,
+            "INFO",
+            "runtime_progress",
+            event_type="runtime_progress",
+            extra={
+                "strategies_completed": int(tasks_completed),
+                "workers_active": int(active_workers),
+                "avg_strategy_time_sec": float(avg_strategy_time),
+                "shm_memory_usage_gb": float(shm_mem_gb),
+                "elapsed_runtime_sec": float(elapsed),
+            },
+        )
+        last_progress_log = now
+
+    def _maybe_health_check(active_workers: int, queue_backlog: int) -> None:
+        if not monitor.should_check(int(tasks_completed)):
+            return
+        monitor.check_and_emit(
+            strategies_completed=int(tasks_completed),
+            tensor=feature_handles_master.array,
+            worker_status={"active": int(active_workers)},
+            ledger_path=strategy_ledger_path,
+            queue_backlog=int(queue_backlog),
+            memory_status={"ok": bool(feature_tensor.nbytes <= budget), "available_bytes": int(avail), "budget_bytes": int(budget)},
+            require_ledger_exists=False,
+        )
 
     def _capture_first_exception(row: dict[str, Any]) -> None:
         nonlocal first_exception_class, first_exception_message, first_exception_hash
@@ -3485,6 +4182,9 @@ def run_weightiz_harness(
                 m3_configs,
                 m4_configs,
                 harness_cfg,
+                feature_registry,
+                log_ctx.queue,
+                run_id,
             ),
         ) as ex:
             futs: dict[Any, _GroupTask] = {}
@@ -3500,6 +4200,8 @@ def run_weightiz_harness(
                 )
                 if not done:
                     _write_run_status_checkpoint("running", execution_mode)
+                    _maybe_emit_progress(active_workers=len(pending))
+                    _maybe_health_check(active_workers=len(pending), queue_backlog=len(pending))
                     continue
                 for fut in sorted(done, key=lambda f: str(futs[f].group_id)):
                     g = futs[fut]
@@ -3529,6 +4231,8 @@ def run_weightiz_harness(
                             break
                     if (groups_completed % int(checkpoint_every_groups) == 0) or (groups_completed == len(group_tasks)):
                         _write_run_status_checkpoint("running", execution_mode)
+                    _maybe_emit_progress(active_workers=len(pending))
+                    _maybe_health_check(active_workers=len(pending), queue_backlog=len(pending))
                     if aborted:
                         break
                 if aborted:
@@ -3573,16 +4277,11 @@ def run_weightiz_harness(
                     break
             if quick_settings.enabled:
                 if (groups_completed % int(quick_settings.progress_every_groups) == 0) or (groups_completed == len(group_tasks)):
-                    elapsed = time.perf_counter() - run_t0
-                    print(
-                        "QUICK_RUN_PROGRESS "
-                        f"completed_groups={groups_completed}/{len(group_tasks)} "
-                        f"completed_tasks={tasks_completed}/{tasks_submitted} "
-                        f"failures={failure_count} elapsed_sec={elapsed:.1f}",
-                        flush=True,
-                    )
+                    _maybe_emit_progress(active_workers=1)
             if (groups_completed % int(checkpoint_every_groups) == 0) or (groups_completed == len(group_tasks)):
                 _write_run_status_checkpoint("running", execution_mode)
+            _maybe_emit_progress(active_workers=1)
+            _maybe_health_check(active_workers=1, queue_backlog=0)
             if aborted:
                 break
 
@@ -3597,23 +4296,50 @@ def run_weightiz_harness(
             str(r.get("task_id", "")),
         )
     )
+    worker_result_queue: SimpleQueue = SimpleQueue()
+    for row in all_results:
+        worker_result_queue.put(row)
+
+    ledger_rows: list[dict[str, Any]] = []
+    while True:
+        try:
+            item = worker_result_queue.get_nowait()
+        except Exception:
+            break
+        if isinstance(item, dict):
+            ledger_rows.append(item)
 
     ok_results = [r for r in all_results if r.get("status") == "ok" and int(r.get("test_days", 0)) > 0]
 
     bench_sessions, bench_ret = _benchmark_daily_returns(base_state, harness_cfg.benchmark_symbol)
     try:
-        common_sessions, daily_mat, daily_bmk, baseline_candidate_ids, candidate_scenario_series = _aggregate_candidate_baseline_matrix(
+        (
+            common_sessions,
+            daily_mat_exec,
+            daily_mat_raw,
+            daily_bmk,
+            baseline_candidate_ids,
+            candidate_scenario_series,
+        ) = _aggregate_candidate_baseline_matrices(
             ok_results,
             bench_sessions,
             bench_ret,
             candidate_ids=[str(c.candidate_id) for c in candidates],
             min_days=int(harness_cfg.daily_return_min_days),
         )
-        stats_verdict = _compute_stats_verdict(daily_mat, daily_bmk, baseline_candidate_ids, harness_cfg)
+        stats_verdict = _compute_stats_verdict(
+            daily_returns_matrix_exec=daily_mat_exec,
+            daily_returns_matrix_raw=daily_mat_raw,
+            daily_benchmark_returns=daily_bmk,
+            candidate_ids=baseline_candidate_ids,
+            harness_cfg=harness_cfg,
+            report_root=report_root,
+        )
     except Exception as exc:
         if quick_settings.enabled:
             common_sessions = np.zeros(0, dtype=np.int64)
-            daily_mat = np.zeros((0, 0), dtype=np.float64)
+            daily_mat_exec = np.zeros((0, 0), dtype=np.float64)
+            daily_mat_raw = np.zeros((0, 0), dtype=np.float64)
             daily_bmk = np.zeros(0, dtype=np.float64)
             baseline_candidate_ids = []
             candidate_scenario_series = {}
@@ -3643,7 +4369,8 @@ def run_weightiz_harness(
                 first_exception_message = str(exc)
                 first_exception_hash = _error_hash(first_exception_class, first_exception_message)
             common_sessions = np.zeros(0, dtype=np.int64)
-            daily_mat = np.zeros((0, 0), dtype=np.float64)
+            daily_mat_exec = np.zeros((0, 0), dtype=np.float64)
+            daily_mat_raw = np.zeros((0, 0), dtype=np.float64)
             daily_bmk = np.zeros(0, dtype=np.float64)
             baseline_candidate_ids = []
             candidate_scenario_series = {}
@@ -3691,12 +4418,20 @@ def run_weightiz_harness(
         if lb is not None:
             out.update(
                 {
-                    "dsr": lb["dsr"],
-                    "in_mcs": lb["in_mcs"],
-                    "wrc_p": lb["wrc_p"],
-                    "spa_p": lb["spa_p"],
-                    "pbo": lb["pbo"],
-                    "pass": lb["pass"],
+                    "dsr": lb.get("dsr"),
+                    "in_mcs": lb.get("in_mcs"),
+                    "wrc_p": lb.get("wrc_p"),
+                    "spa_p": lb.get("spa_p"),
+                    "pbo": lb.get("pbo"),
+                    "cluster_id": lb.get("cluster_id"),
+                    "cluster_representative": lb.get("cluster_representative"),
+                    "regime_robustness": lb.get("regime_robustness"),
+                    "execution_robustness": lb.get("execution_robustness"),
+                    "horizon_robustness": lb.get("horizon_robustness"),
+                    "robustness_score": lb.get("robustness_score"),
+                    "fragile": lb.get("fragile"),
+                    "reject": lb.get("reject"),
+                    "pass": lb.get("pass"),
                 }
             )
         candidate_results.append(out)
@@ -3738,7 +4473,7 @@ def run_weightiz_harness(
     for c in sorted(candidates, key=lambda x: str(x.candidate_id)):
         cid = str(c.candidate_id)
         if cid in baseline_col:
-            daily_cols[cid] = daily_mat[:, int(baseline_col[cid])]
+            daily_cols[cid] = daily_mat_exec[:, int(baseline_col[cid])]
         else:
             daily_cols[cid] = np.zeros(int(common_sessions.shape[0]), dtype=np.float64)
     daily_df = pdx.DataFrame(daily_cols)
@@ -3771,7 +4506,7 @@ def run_weightiz_harness(
         git_hash=_git_hash(),
         candidates=candidates,
         all_results=all_results,
-        candidate_daily_mat=daily_mat,
+        candidate_daily_mat=daily_mat_exec,
         daily_bmk=daily_bmk,
         common_sessions=common_sessions,
         baseline_candidate_ids=baseline_candidate_ids,
@@ -3790,6 +4525,7 @@ def run_weightiz_harness(
     leaderboard_json_path = report_root / "leaderboard.json"
     robustness_csv_path = report_root / "robustness_leaderboard.csv"
     plateaus_path = report_root / "plateaus.json"
+    strategy_ledger_path = report_root / "strategy_results.parquet"
 
     pdx.DataFrame(sorted(candidate_rows, key=lambda x: str(x["candidate_id"]))).to_csv(leaderboard_csv_path, index=False)
     _write_json(leaderboard_json_path, sorted(candidate_rows, key=lambda x: str(x["candidate_id"])))
@@ -3800,12 +4536,57 @@ def run_weightiz_harness(
         {
             "leaderboard": sorted(candidate_rows, key=lambda x: str(x["candidate_id"])),
             "summary": {
-                "n_candidates_with_baseline": int(daily_mat.shape[1]),
+                "n_candidates_with_baseline": int(daily_mat_exec.shape[1]),
+                "n_candidates_with_baseline_raw": int(daily_mat_raw.shape[1]),
                 "n_candidates_total": int(len(candidates)),
-                "n_days": int(daily_mat.shape[0]),
+                "n_days": int(daily_mat_exec.shape[0]),
                 "benchmark_symbol": harness_cfg.benchmark_symbol,
             },
         },
+    )
+
+    validation_rows: list[dict[str, Any]] = []
+    for c in sorted(candidates, key=lambda x: str(x.candidate_id)):
+        cid = str(c.candidate_id)
+        lb = candidate_verdict.get(cid, {})
+        validation_rows.append(
+            {
+                "strategy_id": cid,
+                "cluster_id": lb.get("cluster_id"),
+                "cluster_representative": lb.get("cluster_representative", cid),
+                "dsr": lb.get("dsr"),
+                "pbo": lb.get("pbo"),
+                "spa_p": lb.get("spa_p"),
+                "mcs_inclusion": bool(lb.get("in_mcs", False)),
+                "regime_robustness": lb.get("regime_robustness"),
+                "execution_robustness": lb.get("execution_robustness"),
+                "horizon_robustness": lb.get("horizon_robustness"),
+                "robustness_score": lb.get("robustness_score", float("-inf")),
+                "reject": bool(lb.get("reject", True)),
+                "fragile": bool(lb.get("fragile", False)),
+            }
+        )
+    validation_report_path = report_root / "validation_report.json"
+    _write_json(validation_report_path, validation_rows)
+    canonical_root = report_root.parent.parent if report_root.parent.name == "module5_harness" else report_root.parent
+    canonical_validation_report_path = canonical_root / "validation_report.json"
+    _write_json(canonical_validation_report_path, validation_rows)
+
+    _ledger_write(
+        _collect_ledger_rows_from_results(
+            ledger_rows,
+            evaluation_timestamp=datetime.now(timezone.utc).isoformat(),
+        ),
+        strategy_ledger_path,
+    )
+    monitor.check_and_emit(
+        strategies_completed=int(tasks_completed),
+        tensor=feature_handles_master.array,
+        worker_status={"active": 0},
+        ledger_path=strategy_ledger_path,
+        queue_backlog=0,
+        memory_status={"ok": bool(feature_tensor.nbytes <= budget), "available_bytes": int(avail), "budget_bytes": int(budget)},
+        require_ledger_exists=True,
     )
 
     run_status = {
@@ -3847,7 +4628,16 @@ def run_weightiz_harness(
         "run_started_utc": run_started_utc.isoformat(),
         "run_finished_utc": datetime.now(timezone.utc).isoformat(),
         "git_hash": _git_hash(),
+        "git_commit": _git_hash(),
         "seed": int(harness_cfg.seed),
+        "search_seed": int(harness_cfg.seed),
+        "config_hash": _stable_hash_obj(asdict(harness_cfg)),
+        "dataset_hash": str(dataset_hash),
+        "asset_count": int(len(keep_symbols)),
+        "strategy_count": int(len(candidates)),
+        "start_time": run_started_utc.isoformat(),
+        "end_time": datetime.now(timezone.utc).isoformat(),
+        "runtime_seconds": float(time.perf_counter() - run_t0),
         "symbols_input": list(symbols),
         "symbols_kept": keep_symbols,
         "keep_idx": keep_idx.tolist(),
@@ -3880,7 +4670,8 @@ def run_weightiz_harness(
         "deadletter_path": str(deadletter_path),
         "deadletter_count": int(failure_count),
         "n_candidate_rows": int(len(candidate_rows)),
-        "daily_matrix_shape": list(daily_mat.shape),
+        "daily_matrix_shape": list(daily_mat_exec.shape),
+        "daily_matrix_shape_raw": list(daily_mat_raw.shape),
         "n_candidates_with_baseline": int(len(baseline_candidate_ids)),
         "parallel_backend": harness_cfg.parallel_backend,
         "parallel_workers_effective": int(effective_workers),
@@ -3888,8 +4679,8 @@ def run_weightiz_harness(
         "payload_arg_max_bytes": int(payload_arg_max_bytes),
         "large_payload_passing_avoided": bool(large_payload_passing_avoided),
         "robustness_score": {
-            "formula": "1*clip(dsr_median)-0.5*clip(pbo)-0.3*clip(dd_severe/dd_cap)-0.2*clip(fold_sharpe_std/std_cap)-0.2*clip(asset_concentration/conc_cap)",
-            "dsr_source": "baseline_fold_median",
+            "formula": "0.20*dsr+0.15*(1-pbo)+0.10*(1-spa_p)+0.20*regime+0.20*execution+0.15*horizon",
+            "dsr_source": "cluster_representative_exec",
             "caps": dict(ROBUSTNESS_CAPS),
         },
         "circuit_breaker": {
@@ -3910,6 +4701,13 @@ def run_weightiz_harness(
             "available_bytes": int(avail),
             "estimated_state_bytes": int(est_state),
             "budget_bytes": int(budget),
+        },
+        "feature_tensor": {
+            "cache_npz": str(tensor_npz_path),
+            "cache_manifest": str(tensor_json_path),
+            "shape": list(feature_tensor.shape),
+            "dtype": str(feature_tensor.dtype),
+            "hash": str(tensor_hash),
         },
         "micro_diagnostics": {
             "enabled": bool(harness_cfg.export_micro_diagnostics),
@@ -3946,6 +4744,7 @@ def run_weightiz_harness(
         "verdict": str(verdict_path),
         "stats_raw": str(stats_raw_path),
         "run_manifest": str(manifest_path),
+        "strategy_results": str(strategy_ledger_path),
         "run_status": str(run_status_path),
         "leaderboard_csv": str(leaderboard_csv_path),
         "leaderboard_json": str(leaderboard_json_path),
@@ -3954,6 +4753,9 @@ def run_weightiz_harness(
         "deadletter_tasks": str(deadletter_path),
         "dq_report_csv": str(dq_report_path),
         "dq_bar_flags_parquet": str(dq_bar_flags_path),
+        "validation_report": str(validation_report_path),
+        "validation_report_latest": str(canonical_validation_report_path),
+        "self_audit_report": str(self_audit_report_path),
     }
     if bool(harness_cfg.export_micro_diagnostics):
         artifact_paths["micro_diagnostics"] = str(micro_diag_path)
@@ -3964,7 +4766,7 @@ def run_weightiz_harness(
 
     return HarnessOutput(
         candidate_results=candidate_results,
-        daily_returns_matrix=daily_mat,
+        daily_returns_matrix=daily_mat_exec,
         daily_benchmark_returns=daily_bmk,
         stats_verdict=stats_verdict,
         artifact_paths=artifact_paths,
@@ -3973,4 +4775,4 @@ def run_weightiz_harness(
 
 
 if __name__ == "__main__":
-    print("MODULE5_HARNESS_READY")
+    log_event(get_logger("module5_harness"), "INFO", "module5_harness_ready", event_type="module5_ready")
