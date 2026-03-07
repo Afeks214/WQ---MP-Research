@@ -102,7 +102,7 @@ class Module4Config:
     # Compatibility-only schema fields for Cell-6 nomenclature.
     # Core Module4 trading logic remains unchanged in this patch.
     strategy_type: str = "legacy"
-    score_gate: str = ""
+    score_gate: float = 0.0
     score_gate_rule: str = ""
     deviation_signal: str = ""
     deviation_rule: str = ""
@@ -272,20 +272,8 @@ def _execute_to_target(
     if np.any(exec_needed):
         bad = exec_needed & ((~np.isfinite(price)) | (price <= 0.0))
         if np.any(bad):
-            a_bad = int(np.where(bad)[0][0])
-            px_bad = float(price[a_bad])
-            payload = dump_builder(a_bad, px_bad, str(px_source_name)) if dump_builder is not None else {
-                "t": -1,
-                "asset_index": int(a_bad),
-                "asset_symbol": "",
-                "px_source_name": str(px_source_name),
-                "px_value": px_bad,
-            }
-            raise NonFiniteExecutionPriceError(
-                reason_code=str(error_reason_code),
-                exec_px_dump=payload,
-                message=f"Non-finite/non-positive execution price at a={a_bad}: {px_bad}",
-            )
+            # Institutional behavior: missing quote => no fill (skip), never crash the run.
+            delta[bad] = 0.0
 
     for a in range(A):
         dq = float(delta[a])
@@ -293,19 +281,6 @@ def _execute_to_target(
             continue
         px = float(price[a])
         if (not np.isfinite(px)) or (px <= 0.0):
-            if strict:
-                payload = dump_builder(a, px, str(px_source_name)) if dump_builder is not None else {
-                    "t": -1,
-                    "asset_index": int(a),
-                    "asset_symbol": "",
-                    "px_source_name": str(px_source_name),
-                    "px_value": px,
-                }
-                raise NonFiniteExecutionPriceError(
-                    reason_code=str(error_reason_code),
-                    exec_px_dump=payload,
-                    message=f"Non-finite/non-positive execution price at a={a}: {px}",
-                )
             delta[a] = 0.0
             continue
 
@@ -898,34 +873,65 @@ def run_module4_strategy_funnel(
                     order = np.lexsort((sel_pool, -sel_scores))
                     top = sel_pool[order[:k]]
 
-                    atr_sel = np.maximum(atr_eff_t[top], eps)
-                    w = 1.0 / atr_sel
+                    # --- Institutional numeric guard: dynamic ATR floor + capped inverse-ATR weights ---
+                    px_sel_for_floor = np.maximum(close_t[top], tick_size[top])
+                    atr_floor_tick = 2.0 * tick_size[top]
+                    atr_floor_rel = 1e-5 * px_sel_for_floor
+                    atr_floor = np.maximum(eps, np.maximum(atr_floor_tick, atr_floor_rel))
+                    atr_sel = np.maximum(atr_eff_t[top], atr_floor)
+
+                    w_raw = 1.0 / atr_sel
+                    med_atr = float(np.median(atr_sel)) if atr_sel.size else 0.0
+                    base = max(med_atr, float(np.min(atr_floor)) if atr_floor.size else eps)
+                    w_cap = (1.0 / base) * 50.0
+                    w = np.minimum(w_raw, w_cap)
+
                     w_sum = float(np.sum(w))
-                    if w_sum > eps:
+                    if np.isfinite(w_sum) and (w_sum > eps):
                         w = w / w_sum
                         equity_now = float(cash + np.sum(pos * close_t))
                         gross_budget = max(0.0, equity_now * float(state.cfg.intraday_leverage_max))
                         raw_notional = gross_budget * w
                         cap_notional = equity_now * float(cfg4.max_asset_cap_frac)
                         alloc_notional = np.minimum(raw_notional, cap_notional)
+
+                        # NaN Guard 1: alloc_notional
+                        if not np.all(np.isfinite(alloc_notional)):
+                            alloc_notional = np.where(np.isfinite(alloc_notional), alloc_notional, 0.0)
+                        alloc_notional = np.maximum(alloc_notional, 0.0)
+
                         tot_alloc = float(np.sum(alloc_notional))
-                        if tot_alloc > gross_budget + eps:
+                        if np.isfinite(tot_alloc) and (tot_alloc > gross_budget + eps):
                             alloc_notional *= gross_budget / (tot_alloc + eps)
 
                         sign_sel = np.where(intent_long[top], 1.0, -1.0)
                         px_sel = np.maximum(close_t[top], tick_size[top])
                         desired_qty = sign_sel * (alloc_notional / (px_sel + eps))
 
+                        # NaN Guard 2: desired_qty
+                        if not np.all(np.isfinite(desired_qty)):
+                            desired_qty = np.where(np.isfinite(desired_qty), desired_qty, pos[top])
+
                         # Turnover cap (notional change cap per bar).
                         delta_qty = desired_qty - pos[top]
                         delta_notional = np.abs(delta_qty) * px_sel
                         total_delta_notional = float(np.sum(delta_notional))
                         max_turn = max(0.0, equity_now * float(cfg4.max_turnover_frac_per_bar))
-                        if total_delta_notional > max_turn + eps and total_delta_notional > eps:
-                            scale = max_turn / total_delta_notional
-                            desired_qty = pos[top] + delta_qty * scale
 
-                        target[top] = desired_qty
+                        # NaN Guard 3: turnover logic (keep scope linear)
+                        if (not np.isfinite(total_delta_notional)) or (total_delta_notional <= eps) or (not np.isfinite(max_turn)):
+                            desired_qty = pos[top]
+                        elif total_delta_notional > max_turn + eps:
+                            scale = max_turn / total_delta_notional
+                            if np.isfinite(scale) and (scale >= 0.0):
+                                desired_qty = pos[top] + delta_qty * scale
+                            else:
+                                desired_qty = pos[top]
+                    else:
+                        # Unsafe weight sum -> no-op
+                        desired_qty = pos[top]
+
+                    target[top] = desired_qty
 
         # 6) Overnight select / flatten phases
         if phase_t == phase_os:
