@@ -37,6 +37,8 @@ from weightiz_module3_structure import (
     Module3Output,
     Struct30mIdx,
 )
+from weightiz_dtype_guard import assert_float64
+from weightiz_system_logger import get_logger, log_event
 
 
 class RegimeIdx(IntEnum):
@@ -127,6 +129,15 @@ class Module4Output:
     overnight_score_ta: np.ndarray
     overnight_winner_t: np.ndarray
     kill_switch_t: np.ndarray
+
+
+@dataclass
+class Module4SignalOutput:
+    regime_primary_ta: np.ndarray
+    regime_confidence_ta: np.ndarray
+    intent_long_ta: np.ndarray
+    intent_short_ta: np.ndarray
+    target_qty_ta: np.ndarray
 
 
 class NonFiniteExecutionPriceError(RuntimeError):
@@ -450,12 +461,18 @@ def run_module4_strategy_funnel(
     """
     Run deterministic strategy engine and Zimtra funnel with in-place state mutation.
     """
+    raise RuntimeError(
+        "MODULE4_EXECUTION_FORBIDDEN_IN_CANONICAL_PATH: "
+        "use run_module4_signal_funnel + risk_engine.simulate_portfolio_from_signals"
+    )
     T = state.cfg.T
     A = state.cfg.A
     B = state.cfg.B
     eps = float(cfg4.eps)
     if run_context is None:
         run_context = {}
+    assert_float64("module4.input.scores", state.scores)
+    assert_float64("module4.input.profile_stats", state.profile_stats)
 
     # Shape checks
     _assert_shape("profile_stats", state.profile_stats, (T, A, int(ProfileStatIdx.N_FIELDS)))
@@ -1197,11 +1214,51 @@ def run_module4_strategy_funnel(
         _assert_finite_masked("state.equity", state.equity, np.ones(T, dtype=bool))
         _assert_finite_masked("state.margin_used", state.margin_used, np.ones(T, dtype=bool))
         _assert_finite_masked("state.buying_power", state.buying_power, np.ones(T, dtype=bool))
+    assert_float64("module4.output.exec_price_ta", out.exec_price_ta)
+    assert_float64("module4.output.trade_cost_ta", out.trade_cost_ta)
 
     # Reuse Module 1 hard invariants for leverage/overnight integrity.
     validate_state_hard(state)
     return out
 
 
+def run_module4_signal_funnel(
+    state: TensorState,
+    m3: Module3Output,
+    cfg4: Module4Config,
+) -> Module4SignalOutput:
+    """
+    Signal-only Module4 API for canonical orchestration.
+    This function does not mutate execution state.
+    """
+    T = state.cfg.T
+    A = state.cfg.A
+    _assert_shape("scores", state.scores, (T, A, int(ScoreIdx.N_FIELDS)))
+    _assert_shape("context_tac", m3.context_tac, (T, A, int(ContextIdx.N_FIELDS)))
+    assert_float64("module4.signal_input.scores", state.scores)
+
+    bo_l = np.asarray(state.scores[:, :, int(ScoreIdx.SCORE_BO_LONG)], dtype=np.float64)
+    bo_s = np.asarray(state.scores[:, :, int(ScoreIdx.SCORE_BO_SHORT)], dtype=np.float64)
+    confidence = np.maximum(np.abs(bo_l), np.abs(bo_s))
+    intent_long = bo_l >= float(cfg4.entry_threshold)
+    intent_short = bo_s >= float(cfg4.entry_threshold)
+    target = np.zeros((T, A), dtype=np.float64)
+    target[intent_long] = 1.0
+    target[intent_short] = -1.0
+    regime = np.full((T, A), np.int8(RegimeIdx.NEUTRAL), dtype=np.int8)
+    regime[bo_l > bo_s] = np.int8(RegimeIdx.TREND)
+    regime[bo_s > bo_l] = np.int8(RegimeIdx.B_SHAPE)
+
+    assert_float64("module4.signal_output.confidence", confidence)
+    assert_float64("module4.signal_output.target", target)
+    return Module4SignalOutput(
+        regime_primary_ta=regime,
+        regime_confidence_ta=confidence,
+        intent_long_ta=intent_long,
+        intent_short_ta=intent_short,
+        target_qty_ta=target,
+    )
+
+
 if __name__ == "__main__":
-    print("MODULE4_READY")
+    log_event(get_logger("module4"), "INFO", "module4_ready", event_type="module4_ready")
