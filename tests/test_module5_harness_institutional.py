@@ -630,6 +630,62 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
             scores = pd.to_numeric(rb["robustness_score"], errors="coerce")
             self.assertTrue(bool(np.isfinite(scores).any()))
 
+    def test_validation_report_artifact_and_extended_stats_schema(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="m5_validation_report_") as td:
+            report_dir = Path(td) / "artifacts"
+            with mock.patch.object(h, "compute_window_correlation_diagnostics", return_value=([], [])):
+                out = self._run_minimal_harness(
+                    report_dir=report_dir,
+                    harness_overrides={"daily_return_min_days": 3, "execution_latency_bars": 0},
+                )
+            self.assertIn("validation_report", out.artifact_paths)
+            p = Path(str(out.artifact_paths["validation_report"]))
+            self.assertTrue(p.exists())
+            rows = json.loads(p.read_text(encoding="utf-8"))
+            self.assertIsInstance(rows, list)
+            self.assertGreaterEqual(len(rows), 1)
+            row = dict(rows[0])
+            for k in (
+                "strategy_id",
+                "cluster_id",
+                "cluster_representative",
+                "dsr",
+                "pbo",
+                "spa_p",
+                "mcs_inclusion",
+                "regime_robustness",
+                "execution_robustness",
+                "horizon_robustness",
+                "robustness_score",
+                "reject",
+                "fragile",
+            ):
+                self.assertIn(k, row)
+
+            stats_raw = json.loads(Path(str(out.artifact_paths["stats_raw"])).read_text(encoding="utf-8"))
+            self.assertIn("cluster", stats_raw)
+            self.assertIn("regime_validation", stats_raw)
+            self.assertIn("horizon_validation", stats_raw)
+            self.assertIn("execution_validation", stats_raw)
+
+    def test_validation_report_is_deterministic_for_same_seed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="m5_validation_det_1_") as td1, tempfile.TemporaryDirectory(
+            prefix="m5_validation_det_2_"
+        ) as td2:
+            with mock.patch.object(h, "compute_window_correlation_diagnostics", return_value=([], [])):
+                out1 = self._run_minimal_harness(
+                    report_dir=Path(td1) / "artifacts",
+                    harness_overrides={"daily_return_min_days": 3, "seed": 17, "execution_latency_bars": 0},
+                )
+            with mock.patch.object(h, "compute_window_correlation_diagnostics", return_value=([], [])):
+                out2 = self._run_minimal_harness(
+                    report_dir=Path(td2) / "artifacts",
+                    harness_overrides={"daily_return_min_days": 3, "seed": 17, "execution_latency_bars": 0},
+                )
+            b1 = Path(str(out1.artifact_paths["validation_report"])).read_bytes()
+            b2 = Path(str(out2.artifact_paths["validation_report"])).read_bytes()
+            self.assertEqual(b1, b2)
+
     def test_clean_fixture_emits_no_runtime_warnings(self) -> None:
         with tempfile.TemporaryDirectory(prefix="m5_warning_regression_") as td:
             report_dir = Path(td) / "artifacts"

@@ -1,0 +1,16 @@
+weightiz_module1_core.py
+weightiz_module4_strategy_funnel.py
+weightiz_module5_harness.py
+tests/test_harness_fault_isolation.py
+tests/test_harness_nonfinite_exec_px_localized.py
+tests/test_module1_no_nan_equity_on_invalid_bars.py
+tests/test_module4_next_open_no_lookahead.py
+tests/test_module4_nonfinite_exec_px.py
+tests/test_option_a_risk_breach_state_dump.py
+configs/_generated/stage_ab_breakout_STRICT.yaml
+docs/OPTION_A_RESET_LOG.md
+docs/STAGE_AB_STRICT_REPORT.md
+docs/PART3_NONFINITE_ROOT_CAUSE_REPORT.md
+docs/PART4_DEADLETTER_POLICY_DECISION.md
+docs/PART4_SCALE_GATE_KPIS.md
+docs/PART4_STAGE_C_PLAN.md

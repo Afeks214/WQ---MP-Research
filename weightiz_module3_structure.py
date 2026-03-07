@@ -20,6 +20,8 @@ from typing import Tuple
 import numpy as np
 
 from weightiz_module1_core import Phase, ProfileStatIdx, ScoreIdx, TensorState
+from weightiz_dtype_guard import assert_float64
+from weightiz_system_logger import get_logger, log_event
 
 IB_POLICY_NO_TRADE = "NO_TRADE"
 IB_POLICY_DEGRADE = "DEGRADE"
@@ -262,6 +264,9 @@ def run_module3_structural_aggregation(state: TensorState, cfg: Module3Config) -
 
     # Input shape checks
     _assert_shape("vp", state.vp, (T, A, B))
+    assert_float64("module3.input.vp", state.vp)
+    assert_float64("module3.input.profile_stats", state.profile_stats)
+    assert_float64("module3.input.scores", state.scores)
     _assert_shape("profile_stats", state.profile_stats, (T, A, int(ProfileStatIdx.N_FIELDS)))
     _assert_shape("scores", state.scores, (T, A, int(ScoreIdx.N_FIELDS)))
     _assert_shape("bar_valid", state.bar_valid, (T, A))
@@ -787,6 +792,8 @@ def validate_module3_output(state: TensorState, out: Module3Output, cfg: Module3
     _assert_shape("context_source_t_index_ta", out.context_source_t_index_ta, (T, A))
     if out.ib_defined_ta is not None:
         _assert_shape("ib_defined_ta", out.ib_defined_ta, (T, A))
+    assert_float64("module3.output.block_features_tak", out.block_features_tak)
+    assert_float64("module3.output.context_tac", out.context_tac)
 
     # Source must be causal
     t_idx = np.arange(T, dtype=np.int64)[:, None]
@@ -882,4 +889,4 @@ def deterministic_digest_sha256_module3(out: Module3Output) -> str:
 
 if __name__ == "__main__":
     # Lightweight parser-level smoke that does not execute heavy engine logic.
-    print("MODULE3_READY")
+    log_event(get_logger("module3"), "INFO", "module3_ready", event_type="module3_ready")

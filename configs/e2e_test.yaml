@@ -63,6 +63,26 @@ harness:
   daily_return_min_days: 2
   benchmark_symbol: "SPY"
   export_micro_diagnostics: false
+  cluster_corr_threshold: 0.90
+  cluster_distance_block_size: 128
+  cluster_distance_in_memory_max_n: 500
+  execution_transaction_cost_per_trade: 0.0
+  execution_slippage_mult: 1.0
+  execution_extra_slippage_bps: 0.0
+  execution_latency_bars: 1
+  regime_vol_window: 20
+  regime_slope_window: 20
+  regime_hurst_window: 40
+  regime_min_obs_per_mask: 5
+  horizon_minutes: [1, 5, 15, 60]
+  robustness_weight_dsr: 0.20
+  robustness_weight_pbo: 0.15
+  robustness_weight_spa: 0.10
+  robustness_weight_regime: 0.20
+  robustness_weight_execution: 0.20
+  robustness_weight_horizon: 0.15
+  robustness_reject_threshold: 0.60
+  execution_fragile_threshold: 0.50
 
 stress_scenarios:
   - scenario_id: "baseline"

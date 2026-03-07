@@ -1,0 +1,21 @@
+features:
+  - name: rolling_volatility
+    window: [5, 20, 50]
+    input: returns
+    dtype: float64
+
+  - name: vwap_deviation
+    window: [5, 20]
+    input: [price, volume]
+    dtype: float64
+
+  - name: momentum
+    window: [10, 50, 200]
+    input: price
+    dtype: float64
+
+  - name: normalized_momentum
+    window: [10, 50, 200]
+    input: price
+    depends_on: momentum
+    dtype: float64

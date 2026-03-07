@@ -4,6 +4,9 @@ __pycache__/
 .venv/
 .pytest_cache/
 artifacts/
+cache/
+datasets/
+logs/
 data/
 .env
 .env.*

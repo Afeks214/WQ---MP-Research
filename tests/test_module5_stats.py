@@ -13,6 +13,7 @@ from weightiz_module5_stats import (
     psr_against_threshold,
     spa_test,
     stationary_bootstrap_indices,
+    run_full_stats,
     validate_returns_1d,
     validate_returns_2d,
     white_reality_check,
@@ -157,6 +158,28 @@ def test_pbo_edge_cases_single_and_identical_candidates():
     assert np.isfinite(float(out_a["pbo"]))
     assert out_a["pbo"] == out_b["pbo"]
     assert np.array_equal(out_a["oos_rank_of_is_best"], out_b["oos_rank_of_is_best"])
+
+
+def test_pbo_accepts_n_trials_effective_and_reports_used_value():
+    rng = np.random.default_rng(606)
+    r = rng.normal(0.0, 0.01, size=(300, 8)).astype(np.float64)
+
+    out_default = pbo_cscv(r, S=10, k=5)
+    out_neff = pbo_cscv(r, S=10, k=5, n_trials_effective=3)
+
+    assert int(out_default["n_trials_effective_used"]) == 8
+    assert int(out_neff["n_trials_effective_used"]) == 3
+    assert np.isfinite(float(out_neff["pbo"]))
+
+
+def test_run_full_stats_accepts_n_trials_effective():
+    rng = np.random.default_rng(707)
+    r = rng.normal(0.0002, 0.01, size=(360, 6)).astype(np.float64)
+    bmk = rng.normal(0.0001, 0.009, size=360).astype(np.float64)
+    out = run_full_stats(r, bmk, n_trials_effective=2)
+
+    assert int(out["dsr"]["n_trials_effective"]) == 2
+    assert int(out["pbo"]["n_trials_effective_used"]) == 2
 
 
 def test_wrc_spa_sanity_baseline_and_alpha_case():

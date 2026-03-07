@@ -17,6 +17,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+import json
+import os
+from pathlib import Path
 from typing import Optional, Tuple
 import time
 import warnings
@@ -26,12 +29,17 @@ from numpy.lib.stride_tricks import sliding_window_view
 
 from weightiz_module1_core import (
     EngineConfig,
+    FeatureEngineConfig,
     Phase,
     ProfileStatIdx,
     ScoreIdx,
     TensorState,
+    build_feature_tensor_from_arrays,
+    make_compat_feature_specs,
     validate_state_hard,
 )
+from weightiz_dtype_guard import assert_float64
+from weightiz_system_logger import get_logger, log_event
 
 
 SQRT_2PI: float = float(np.sqrt(2.0 * np.pi))
@@ -182,6 +190,152 @@ def _assert_finite(name: str, arr: np.ndarray) -> None:
     if not np.all(np.isfinite(arr)):
         bad = np.argwhere(~np.isfinite(arr))[:8]
         raise RuntimeError(f"{name} contains non-finite values at indices {bad.tolist()}")
+
+
+def validate_feature_tensor_contract(tensor: np.ndarray, metadata: dict[str, object] | None = None) -> None:
+    arr = np.asarray(tensor)
+    if arr.ndim != 4:
+        raise RuntimeError(f"FEATURE_TENSOR_SHAPE_INVALID: expected 4D [A,T,F,W], got {arr.shape}")
+    assert_float64("module2.feature_tensor", arr)
+    if np.isnan(arr).any():
+        raise RuntimeError("FEATURE_TENSOR_CONTAINS_NAN")
+    if np.isinf(arr).any():
+        raise RuntimeError("FEATURE_TENSOR_CONTAINS_INF")
+    if metadata is not None:
+        shape_meta = metadata.get("shape")
+        if isinstance(shape_meta, (list, tuple)) and tuple(shape_meta) != tuple(arr.shape):
+            raise RuntimeError(
+                f"FEATURE_TENSOR_SHAPE_MISMATCH: tensor={arr.shape} manifest={tuple(shape_meta)}"
+            )
+
+
+def build_feature_tensor_multiaxis(
+    open_ta: np.ndarray,
+    high_ta: np.ndarray,
+    low_ta: np.ndarray,
+    close_ta: np.ndarray,
+    volume_ta: np.ndarray,
+    *,
+    windows: list[int],
+) -> tuple[np.ndarray, dict[str, int], dict[str, int]]:
+    """
+    Compatibility wrapper:
+    delegates canonical [A, T, F, W] construction to Module 1 feature engine
+    while preserving the legacy Module 2 output schema.
+    """
+    open_ta = np.asarray(open_ta, dtype=np.float64)
+    high_ta = np.asarray(high_ta, dtype=np.float64)
+    low_ta = np.asarray(low_ta, dtype=np.float64)
+    close_ta = np.asarray(close_ta, dtype=np.float64)
+    volume_ta = np.asarray(volume_ta, dtype=np.float64)
+    for n, arr in [
+        ("open_ta", open_ta),
+        ("high_ta", high_ta),
+        ("low_ta", low_ta),
+        ("close_ta", close_ta),
+        ("volume_ta", volume_ta),
+    ]:
+        assert_float64(f"module2.raw.{n}", arr)
+    if not (open_ta.shape == high_ta.shape == low_ta.shape == close_ta.shape == volume_ta.shape):
+        raise RuntimeError("Module2 raw array shape mismatch while building feature tensor")
+    if len(windows) <= 0:
+        raise RuntimeError("profile_windows must be non-empty")
+    if any(int(w) <= 0 for w in windows):
+        raise RuntimeError("Invalid profile window")
+
+    specs = make_compat_feature_specs(windows)
+    engine_cfg = FeatureEngineConfig(
+        tensor_backend="ram",
+        compute_backend="numpy",
+        parallel_backend="serial",
+        use_cache=False,
+    )
+    tensor, feature_map, window_map, _meta = build_feature_tensor_from_arrays(
+        open_ta,
+        high_ta,
+        low_ta,
+        close_ta,
+        volume_ta,
+        feature_specs=specs,
+        engine_cfg=engine_cfg,
+    )
+    validate_feature_tensor_contract(tensor, {"shape": list(tensor.shape)})
+    return tensor, feature_map, window_map
+
+
+def compute_window_correlation_diagnostics(
+    tensor: np.ndarray,
+    feature_map: dict[str, int],
+    window_map: dict[str, int],
+    *,
+    warning_threshold: float = 0.98,
+    abort_threshold: float = 0.995,
+    run_dir: Path | None = None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    validate_feature_tensor_contract(tensor)
+    arr = np.asarray(tensor, dtype=np.float64)
+    A, T, F, W = arr.shape
+    rows: list[dict[str, object]] = []
+    warns: list[dict[str, object]] = []
+    names = {int(v): str(k) for k, v in feature_map.items()}
+    pair_stats: dict[tuple[int, int], dict[str, int]] = {}
+
+    for w1 in range(W):
+        for w2 in range(w1 + 1, W):
+            for f in range(F):
+                x = arr[:, :, f, w1].reshape(A * T)
+                y = arr[:, :, f, w2].reshape(A * T)
+                sx = float(np.std(x))
+                sy = float(np.std(y))
+                if sx <= 1e-14 or sy <= 1e-14:
+                    # Degenerate slices are not informative for leakage diagnostics.
+                    corr = float("nan")
+                else:
+                    corr = float(np.corrcoef(x, y)[0, 1])
+                row = {
+                    "window_pair": f"{w1}-{w2}",
+                    "window_a": int(window_map.get(str(w1), w1)),
+                    "window_b": int(window_map.get(str(w2), w2)),
+                    "feature_name": names.get(f, f"f{f}"),
+                    "correlation_value": float(corr),
+                }
+                rows.append(row)
+                if np.isfinite(corr) and corr >= float(warning_threshold):
+                    warns.append(
+                        {
+                            "type": "window_leakage_warning",
+                            "feature": row["feature_name"],
+                            "window_a": row["window_a"],
+                            "window_b": row["window_b"],
+                            "correlation": float(corr),
+                        }
+                    )
+                st = pair_stats.setdefault((w1, w2), {"total": 0, "abort_hits": 0})
+                if np.isfinite(corr):
+                    st["total"] += 1
+                    if corr >= float(abort_threshold) and np.allclose(x, y, rtol=1e-10, atol=1e-12):
+                        st["abort_hits"] += 1
+
+    if run_dir is not None:
+        try:
+            import pandas as pd
+
+            run_dir.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(rows).to_parquet(run_dir / "window_correlation_diagnostics.parquet", index=False)
+            with (run_dir / "window_leakage_warnings.jsonl").open("w", encoding="utf-8") as f:
+                for w in warns:
+                    f.write(json.dumps(w, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    # Abort only on systemic window leakage (not isolated feature-level high correlation).
+    systemic_abort = any(
+        int(st["total"]) > 0 and (int(st["abort_hits"]) / float(st["total"])) >= 0.8
+        for st in pair_stats.values()
+    )
+    if systemic_abort:
+        raise RuntimeError("WINDOW_STATISTICAL_LEAKAGE_ABORT")
+    return rows, warns
 
 
 def _as_asset_vector(name: str, value: float | np.ndarray, A: int) -> np.ndarray:
@@ -872,7 +1026,12 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
     Invalid bars are neutralized deterministically at finalize:
     vp/vp_delta/scores = 0, profile_stats = 0 with IPOC/IVAH/IVAL anchored to x=0 bin.
     """
+    if str(os.environ.get("WEIGHTIZ_WORKER_PROCESS", "")).strip().lower() in {"1", "true", "yes"}:
+        raise RuntimeError("MODULE2_WORKER_EXECUTION_FORBIDDEN")
     _validate_stage_a_inputs(state, cfg)
+    assert_float64("module2.state.open_px", state.open_px)
+    assert_float64("module2.state.close_px", state.close_px)
+    assert_float64("module2.state.volume", state.volume)
 
     t0_wall = time.perf_counter()
 
@@ -1312,12 +1471,17 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
     # Final hard checks.
     _assert_finite("vp", state.vp)
     _assert_finite("vp_delta", state.vp_delta)
+    assert_float64("module2.output.profile_stats", state.profile_stats)
+    assert_float64("module2.output.scores", state.scores)
 
     elapsed = time.perf_counter() - t0_wall
-    # Deterministic, concise telemetry.
-    print(
-        f"MODULE2_OK elapsed_sec={elapsed:.6f} "
-        f"T={T} A={A} B={B} W={W}"
+    logger = get_logger("module2")
+    log_event(
+        logger,
+        "INFO",
+        "module2_profile_complete",
+        event_type="module2_complete",
+        extra={"elapsed_sec": float(elapsed), "T": int(T), "A": int(A), "B": int(B), "W": int(W)},
     )
 
 
@@ -1484,5 +1648,14 @@ if __name__ == "__main__":
     m2_cfg = Module2Config()
     run_weightiz_profile_engine(st, m2_cfg)
 
-    print("PROFILE_STATS_FINITE", np.isfinite(st.profile_stats[np.isfinite(st.profile_stats)]).all())
-    print("SCORES_FINITE", np.isfinite(st.scores[np.isfinite(st.scores)]).all())
+    logger = get_logger("module2")
+    log_event(
+        logger,
+        "INFO",
+        "module2_smoke_complete",
+        event_type="module2_smoke",
+        extra={
+            "profile_stats_finite": bool(np.isfinite(st.profile_stats[np.isfinite(st.profile_stats)]).all()),
+            "scores_finite": bool(np.isfinite(st.scores[np.isfinite(st.scores)]).all()),
+        },
+    )

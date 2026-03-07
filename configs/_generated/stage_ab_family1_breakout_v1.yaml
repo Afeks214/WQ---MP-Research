@@ -1,0 +1,184 @@
+run_name: stage_ab_family1_breakout_v1
+symbols:
+- EEM
+- GLD
+- HYG
+- IWM
+- QQQ
+- SPY
+- TLT
+- XLE
+- XLK
+- XLU
+data:
+  root: ./data/alpaca/clean
+  format: parquet
+  path_by_symbol:
+    SPY: SPY.parquet
+    QQQ: QQQ.parquet
+    IWM: IWM.parquet
+    TLT: TLT.parquet
+    GLD: GLD.parquet
+    XLF: XLF.parquet
+    XLK: XLK.parquet
+    XLE: XLE.parquet
+    XLI: XLI.parquet
+    XLP: XLP.parquet
+    XLU: XLU.parquet
+    XLV: XLV.parquet
+    XLY: XLY.parquet
+    XLB: XLB.parquet
+    XLC: XLC.parquet
+    DIA: DIA.parquet
+    VTI: VTI.parquet
+    EEM: EEM.parquet
+    HYG: HYG.parquet
+    LQD: LQD.parquet
+  timestamp_column: timestamp
+  start: '2024-11-01T00:00:00Z'
+  end: '2024-12-31T23:59:59Z'
+engine:
+  mode: sealed
+  B: 240
+  x_min: -6.0
+  dx: 0.05
+  initial_cash: 1000000.0
+  intraday_leverage_max: 6.0
+  overnight_leverage: 2.5
+  overnight_positions_max: 1
+  daily_loss_limit_abs: 50000.0
+  seed: 17
+  fail_on_nan: true
+  tick_size_default: 0.01
+module2_configs:
+- profile_window_bars: 60
+  profile_warmup_bars: 60
+  atr_span: 14
+  atr_alpha: null
+  rvol_lookback_sessions: 20
+  va_threshold: 0.7
+  fail_on_non_finite_output: true
+module3_configs:
+- block_minutes: 15
+  include_partial_last_block: true
+  min_block_valid_ratio: 0.68
+  ib_pop_frac: 0.009
+module4_configs:
+- entry_threshold: 0.55
+  exit_threshold: 0.2
+  top_k_intraday: 1
+  max_asset_cap_frac: 0.05
+  max_turnover_frac_per_bar: 0.05
+  overnight_min_conviction: 2.0
+  hard_kill_on_daily_loss_breach: true
+  fail_on_non_finite_input: false
+  allow_cash_overnight: true
+- entry_threshold: 0.55
+  exit_threshold: 0.3
+  top_k_intraday: 2
+  max_asset_cap_frac: 0.05
+  max_turnover_frac_per_bar: 0.05
+  overnight_min_conviction: 2.0
+  hard_kill_on_daily_loss_breach: true
+  fail_on_non_finite_input: false
+  allow_cash_overnight: true
+- entry_threshold: 0.62
+  exit_threshold: 0.2
+  top_k_intraday: 1
+  max_asset_cap_frac: 0.05
+  max_turnover_frac_per_bar: 0.05
+  overnight_min_conviction: 2.0
+  hard_kill_on_daily_loss_breach: true
+  fail_on_non_finite_input: false
+  allow_cash_overnight: true
+- entry_threshold: 0.62
+  exit_threshold: 0.3
+  top_k_intraday: 2
+  max_asset_cap_frac: 0.05
+  max_turnover_frac_per_bar: 0.05
+  overnight_min_conviction: 2.0
+  hard_kill_on_daily_loss_breach: true
+  fail_on_non_finite_input: false
+  allow_cash_overnight: true
+harness:
+  seed: 97
+  timezone: America/New_York
+  freq: 1min
+  min_asset_coverage: 0.8
+  purge_bars: 30
+  embargo_bars: 15
+  wf_train_sessions: 15
+  wf_test_sessions: 5
+  wf_step_sessions: 5
+  cpcv_slices: 2
+  cpcv_k_test: 1
+  parallel_backend: process_pool
+  parallel_workers: 4
+  stress_profile: baseline_only
+  max_ram_utilization_frac: 0.7
+  enforce_lookahead_guard: true
+  report_dir: ./artifacts/module5_harness
+  fail_on_non_finite: true
+  daily_return_min_days: 5
+  benchmark_symbol: SPY
+  export_micro_diagnostics: true
+stress_scenarios:
+- scenario_id: baseline
+  name: baseline
+  missing_burst_prob: 0.0
+  missing_burst_min: 0
+  missing_burst_max: 0
+  jitter_sigma_bps: 0.0
+  slippage_mult: 1.0
+  enabled: true
+- scenario_id: mild
+  name: mild
+  missing_burst_prob: 0.0005
+  missing_burst_min: 2
+  missing_burst_max: 5
+  jitter_sigma_bps: 1.5
+  slippage_mult: 1.5
+  enabled: false
+- scenario_id: severe
+  name: severe
+  missing_burst_prob: 0.001
+  missing_burst_min: 3
+  missing_burst_max: 8
+  jitter_sigma_bps: 3.0
+  slippage_mult: 2.0
+  enabled: false
+candidates:
+  mode: manual
+  specs:
+  - candidate_id: stageA_c00
+    m2_idx: 0
+    m3_idx: 0
+    m4_idx: 0
+    enabled_assets: all
+    tags:
+    - stageA
+    - breakout
+  - candidate_id: stageA_c01
+    m2_idx: 0
+    m3_idx: 0
+    m4_idx: 1
+    enabled_assets: all
+    tags:
+    - stageA
+    - breakout
+  - candidate_id: stageA_c02
+    m2_idx: 0
+    m3_idx: 0
+    m4_idx: 2
+    enabled_assets: all
+    tags:
+    - stageA
+    - breakout
+  - candidate_id: stageA_c03
+    m2_idx: 0
+    m3_idx: 0
+    m4_idx: 3
+    enabled_assets: all
+    tags:
+    - stageA
+    - breakout

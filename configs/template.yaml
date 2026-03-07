@@ -234,6 +234,32 @@ harness:
   micro_diag_export_funnel: true
   micro_diag_max_rows: 5000000
 
+  # Institutional validation engine controls.
+  cluster_corr_threshold: 0.90
+  cluster_distance_block_size: 256
+  cluster_distance_in_memory_max_n: 2500
+
+  execution_transaction_cost_per_trade: 0.0
+  execution_slippage_mult: 1.0
+  execution_extra_slippage_bps: 0.0
+  execution_latency_bars: 1
+
+  regime_vol_window: 60
+  regime_slope_window: 60
+  regime_hurst_window: 120
+  regime_min_obs_per_mask: 20
+
+  horizon_minutes: [1, 5, 15, 60]
+
+  robustness_weight_dsr: 0.20
+  robustness_weight_pbo: 0.15
+  robustness_weight_spa: 0.10
+  robustness_weight_regime: 0.20
+  robustness_weight_execution: 0.20
+  robustness_weight_horizon: 0.15
+  robustness_reject_threshold: 0.60
+  execution_fragile_threshold: 0.50
+
 # Optional explicit stress scenarios. If provided, these override harness.stress_profile defaults.
 stress_scenarios:
   - scenario_id: "baseline"

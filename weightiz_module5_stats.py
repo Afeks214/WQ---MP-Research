@@ -381,6 +381,7 @@ def pbo_cscv(
     returns_matrix: np.ndarray,
     S: int = 10,
     k: int = 5,
+    n_trials_effective: int | None = None,
     periods_per_year: int = 252,
     eps: float = 1e-12,
 ) -> dict[str, np.ndarray | float | int]:
@@ -396,8 +397,17 @@ def pbo_cscv(
             "n_combinations": 0,
             "S": int(S),
             "k": int(k),
+            "n_trials_effective_used": 1,
             "insufficient_candidates": True,
         }
+
+    if n_trials_effective is None:
+        n_eff_used = int(N)
+    else:
+        n_eff_raw = int(n_trials_effective)
+        if n_eff_raw < 1:
+            raise RuntimeError(f"n_trials_effective must be >=1, got {n_eff_raw}")
+        n_eff_used = int(max(1, min(N, n_eff_raw)))
 
     s_int = int(S)
     k_int = int(k)
@@ -452,7 +462,7 @@ def pbo_cscv(
     ranks[rows, order] = np.arange(1, N + 1, dtype=np.int64)[None, :]
     oos_rank = ranks[np.arange(M, dtype=np.int64), is_best_idx]  # (M,)
 
-    u = oos_rank.astype(np.float64) / float(N + 1)
+    u = oos_rank.astype(np.float64) / float(n_eff_used + 1)
     u_clip = np.clip(u, float(eps), 1.0 - float(eps))
     lam = np.log(u_clip / (1.0 - u_clip))
     pbo = float(np.mean(lam <= 0.0))
@@ -466,6 +476,7 @@ def pbo_cscv(
         "n_combinations": int(M),
         "S": int(S),
         "k": int(k),
+        "n_trials_effective_used": int(n_eff_used),
         "insufficient_candidates": False,
     }
 
@@ -725,6 +736,7 @@ def run_full_stats(
     losses: np.ndarray | None = None,
     bootstrap_spec: BootstrapSpec | dict[str, Any] | None = None,
     cpcv_params: dict[str, int] | None = None,
+    n_trials_effective: int | None = None,
 ) -> dict[str, Any]:
     """
     Convenience wrapper to run the full Module 5 statistical battery with one call.
@@ -735,6 +747,7 @@ def run_full_stats(
     - losses: (T,N) or (T,) losses; if None, defaults to -returns_matrix.
     - bootstrap_spec: BootstrapSpec or dict(B, avg_block_len, seed).
     - cpcv_params: dict(S, k).
+    - n_trials_effective: optional effective strategy count used by DSR/PBO.
     """
     r = np.asarray(returns_matrix, dtype=np.float64)
     if r.ndim == 1:
@@ -774,8 +787,8 @@ def run_full_stats(
     S = int(cpcv.get("S", 10))
     k = int(cpcv.get("k", 5))
 
-    dsr = deflated_sharpe_ratio(r)
-    pbo = pbo_cscv(r, S=S, k=k)
+    dsr = deflated_sharpe_ratio(r, n_trials=n_trials_effective)
+    pbo = pbo_cscv(r, S=S, k=k, n_trials_effective=n_trials_effective)
     wrc = white_reality_check(
         r,
         bmk,

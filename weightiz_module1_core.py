@@ -20,12 +20,17 @@ Design principles:
 
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Dict, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 import datetime as dt
 import hashlib
+import json
+import os
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 from zoneinfo import ZoneInfo
 
 
@@ -963,6 +968,879 @@ def validate_loaded_market_slice(state: TensorState, t_start: int, t_end: int) -
         raise RuntimeError("Volume violation: negative volume")
     if np.any(a <= 0):
         raise RuntimeError("ATR floor violation: atr_floor <= 0")
+
+
+# -----------------------------------------------------------------------------
+# Feature engine (declarative, deterministic, NumPy-first)
+# -----------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FeatureSpec:
+    name: str
+    windows: Tuple[int, ...]
+    input_fields: Tuple[str, ...]
+    dtype: str = "float64"
+    dependencies: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class FeatureEngineConfig:
+    tensor_backend: str = "ram"  # "ram" | "memmap"
+    compute_backend: str = "numpy"  # "numpy" | "cupy"
+    parallel_backend: str = "serial"  # "serial" | "process_pool"
+    seed: int = 17
+    cache_dir: str = "artifacts/feature_cache"
+    artifacts_dir: str = "artifacts"
+    memmap_path: str = "artifacts/feature_tensor.memmap"
+    max_workers: int = 1
+    ffill_gap_limit: int = 3
+    mad_clip_k: float = 8.0
+    drop_corrupted_rows: bool = False
+    use_cache: bool = True
+
+
+def _stable_dumps(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _ensure_feature_specs(feature_specs: Sequence[FeatureSpec]) -> list[FeatureSpec]:
+    out: list[FeatureSpec] = []
+    seen: set[str] = set()
+    for spec in feature_specs:
+        if not isinstance(spec, FeatureSpec):
+            raise RuntimeError(f"Invalid feature spec type: {type(spec)!r}")
+        name = str(spec.name).strip()
+        if name == "":
+            raise RuntimeError("Feature name must be non-empty")
+        if name in seen:
+            raise RuntimeError(f"Duplicate feature name in registry: {name}")
+        seen.add(name)
+        if str(spec.dtype).strip().lower() != "float64":
+            raise RuntimeError(f"Feature '{name}' dtype must be float64")
+        if len(spec.windows) == 0:
+            raise RuntimeError(f"Feature '{name}' requires at least one window")
+        if any(int(w) <= 0 for w in spec.windows):
+            raise RuntimeError(f"Feature '{name}' windows must be > 0")
+        out.append(
+            FeatureSpec(
+                name=name,
+                windows=tuple(sorted(set(int(w) for w in spec.windows))),
+                input_fields=tuple(str(x).strip().lower() for x in spec.input_fields if str(x).strip() != ""),
+                dtype="float64",
+                dependencies=tuple(sorted(set(str(x).strip() for x in spec.dependencies if str(x).strip() != ""))),
+            )
+        )
+    return out
+
+
+def _feature_specs_payload(feature_specs: Sequence[FeatureSpec]) -> list[dict[str, Any]]:
+    specs = _ensure_feature_specs(feature_specs)
+    payload: list[dict[str, Any]] = []
+    for s in specs:
+        payload.append(
+            {
+                "name": s.name,
+                "windows": [int(w) for w in s.windows],
+                "input_fields": [str(x) for x in s.input_fields],
+                "dtype": "float64",
+                "dependencies": [str(x) for x in s.dependencies],
+            }
+        )
+    return payload
+
+
+def feature_registry_hash(feature_specs: Sequence[FeatureSpec]) -> str:
+    payload = _feature_specs_payload(feature_specs)
+    return hashlib.sha256(_stable_dumps(payload).encode("utf-8")).hexdigest()
+
+
+def _parse_csv_or_list(v: Any, *, field_name: str) -> tuple[str, ...]:
+    if isinstance(v, str):
+        parts = [p.strip() for p in v.split(",")]
+    elif isinstance(v, (list, tuple)):
+        parts = [str(x).strip() for x in v]
+    else:
+        raise RuntimeError(f"feature registry field '{field_name}' must be string or list")
+    parts = [p for p in parts if p != ""]
+    if len(parts) == 0:
+        raise RuntimeError(f"feature registry field '{field_name}' cannot be empty")
+    return tuple(parts)
+
+
+def _parse_windows(v: Any) -> tuple[int, ...]:
+    if isinstance(v, int):
+        wins = [int(v)]
+    elif isinstance(v, (list, tuple)):
+        wins = [int(x) for x in v]
+    else:
+        raise RuntimeError("feature registry 'window/windows' must be int or list[int]")
+    if len(wins) == 0:
+        raise RuntimeError("feature registry windows cannot be empty")
+    if any(int(w) <= 0 for w in wins):
+        raise RuntimeError("feature registry windows must be > 0")
+    return tuple(sorted(set(int(w) for w in wins)))
+
+
+def load_feature_registry(path: str | os.PathLike[str]) -> list[FeatureSpec]:
+    try:
+        import yaml
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("pyyaml is required to load feature registry") from exc
+
+    p = Path(path).expanduser().resolve()
+    if not p.exists():
+        raise RuntimeError(f"Feature registry file not found: {p}")
+    raw = yaml.safe_load(p.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise RuntimeError("Feature registry must be a YAML mapping")
+    features = raw.get("features")
+    if not isinstance(features, list) or len(features) == 0:
+        raise RuntimeError("Feature registry must contain non-empty 'features' list")
+
+    out: list[FeatureSpec] = []
+    allowed = {"name", "window", "windows", "input", "input_fields", "dtype", "dependencies", "depends_on"}
+    for i, item in enumerate(features):
+        if not isinstance(item, dict):
+            raise RuntimeError(f"features[{i}] must be a mapping")
+        extra = sorted(set(item.keys()) - allowed)
+        if extra:
+            raise RuntimeError(f"features[{i}] contains unknown fields: {extra}")
+
+        if "name" not in item:
+            raise RuntimeError(f"features[{i}] missing required field 'name'")
+        name = str(item["name"]).strip()
+        if name == "":
+            raise RuntimeError(f"features[{i}] has empty name")
+
+        w_raw = item["windows"] if "windows" in item else item.get("window")
+        if w_raw is None:
+            raise RuntimeError(f"features[{i}] missing required field 'window/windows'")
+        windows = _parse_windows(w_raw)
+
+        in_raw = item["input_fields"] if "input_fields" in item else item.get("input")
+        if in_raw is None:
+            raise RuntimeError(f"features[{i}] missing required field 'input/input_fields'")
+        input_fields = tuple(x.lower() for x in _parse_csv_or_list(in_raw, field_name="input"))
+
+        dep_raw = item["dependencies"] if "dependencies" in item else item.get("depends_on", [])
+        if dep_raw in (None, ""):
+            dep_raw = []
+        dependencies = _parse_csv_or_list(dep_raw, field_name="dependencies") if dep_raw != [] else ()
+
+        dtype = str(item.get("dtype", "float64")).strip().lower()
+        if dtype != "float64":
+            raise RuntimeError(f"features[{i}] dtype must be float64")
+
+        out.append(
+            FeatureSpec(
+                name=name,
+                windows=windows,
+                input_fields=input_fields,
+                dtype="float64",
+                dependencies=tuple(str(x).strip() for x in dependencies),
+            )
+        )
+    return _ensure_feature_specs(out)
+
+
+def build_feature_dag(feature_specs: Sequence[FeatureSpec]) -> dict[str, set[str]]:
+    specs = _ensure_feature_specs(feature_specs)
+    names = {s.name for s in specs}
+    dag: dict[str, set[str]] = {}
+    for s in specs:
+        deps = set(s.dependencies)
+        missing = sorted(d for d in deps if d not in names)
+        if missing:
+            raise RuntimeError(f"Feature '{s.name}' has unknown dependencies: {missing}")
+        dag[s.name] = deps
+    return dag
+
+
+def resolve_feature_execution_order(dag: Mapping[str, Iterable[str]]) -> list[str]:
+    nodes = sorted(str(k) for k in dag.keys())
+    dep_map: dict[str, set[str]] = {n: set(str(d) for d in dag[n]) for n in nodes}
+    indeg: dict[str, int] = {n: len(dep_map[n]) for n in nodes}
+    out_adj: dict[str, set[str]] = {n: set() for n in nodes}
+    for n in nodes:
+        for d in dep_map[n]:
+            if d not in out_adj:
+                raise RuntimeError(f"Dependency graph references unknown node: {d}")
+            out_adj[d].add(n)
+
+    ready = sorted([n for n, k in indeg.items() if k == 0])
+    order: list[str] = []
+    while ready:
+        n = ready.pop(0)
+        order.append(n)
+        for m in sorted(out_adj[n]):
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                ready.append(m)
+        ready.sort()
+
+    if len(order) != len(nodes):
+        cycle_nodes = sorted([n for n in nodes if indeg[n] > 0])
+        raise RuntimeError(f"Cyclic feature dependency graph detected: {cycle_nodes}")
+    return order
+
+
+def rolling_view(array: np.ndarray, window: int) -> np.ndarray:
+    arr = np.asarray(array, dtype=np.float64)
+    w = int(window)
+    if w <= 0:
+        raise RuntimeError("rolling_view window must be > 0")
+    if arr.ndim not in {1, 2}:
+        raise RuntimeError(f"rolling_view expects 1D or 2D array, got ndim={arr.ndim}")
+    if arr.ndim == 1:
+        if arr.shape[0] < w:
+            raise RuntimeError("rolling_view window exceeds array length")
+        return sliding_window_view(arr, window_shape=w, axis=0)
+    if arr.shape[1] < w:
+        raise RuntimeError("rolling_view window exceeds time dimension")
+    return sliding_window_view(arr, window_shape=w, axis=1)
+
+
+def _safe_mad_clip(arr_ta: np.ndarray, mad_clip_k: float) -> tuple[np.ndarray, int]:
+    arr = np.asarray(arr_ta, dtype=np.float64).copy()
+    med = np.nanmedian(arr, axis=0)
+    mad = np.nanmedian(np.abs(arr - med[None, :]), axis=0)
+    scale = np.maximum(1.4826 * mad, 1e-12)
+    lo = med - float(mad_clip_k) * scale
+    hi = med + float(mad_clip_k) * scale
+    finite = np.isfinite(arr)
+    clipped = np.clip(arr, lo[None, :], hi[None, :])
+    n = int(np.sum(finite & (arr != clipped)))
+    arr[finite] = clipped[finite]
+    return arr, n
+
+
+def _forward_fill_small_gaps(arr_ta: np.ndarray, max_gap: int) -> tuple[np.ndarray, int]:
+    arr = np.asarray(arr_ta, dtype=np.float64).copy()
+    T, A = arr.shape
+    filled = 0
+    for a in range(A):
+        x = arr[:, a]
+        bad = ~np.isfinite(x)
+        if not np.any(bad):
+            continue
+        idx = np.where(bad)[0]
+        if idx.size == 0:
+            continue
+        seg_start = idx[0]
+        prev = idx[0]
+        for k in range(1, idx.size + 1):
+            boundary = (k == idx.size) or (idx[k] != prev + 1)
+            if boundary:
+                seg_end = prev + 1
+                seg_len = seg_end - seg_start
+                if seg_start > 0 and seg_len <= int(max_gap) and np.isfinite(x[seg_start - 1]):
+                    x[seg_start:seg_end] = x[seg_start - 1]
+                    filled += seg_len
+                if k < idx.size:
+                    seg_start = idx[k]
+                    prev = idx[k]
+            else:
+                prev = idx[k]
+        arr[:, a] = x
+    return arr, int(filled)
+
+
+def sanitize_market_data(data: Mapping[str, np.ndarray], cfg: FeatureEngineConfig | None = None) -> tuple[dict[str, np.ndarray], list[dict[str, object]]]:
+    c = cfg if cfg is not None else FeatureEngineConfig()
+    required = ("open", "high", "low", "close", "volume")
+    out: dict[str, np.ndarray] = {}
+    logs: list[dict[str, object]] = []
+
+    for k in required:
+        if k not in data:
+            raise RuntimeError(f"sanitize_market_data missing required field: {k}")
+        arr = np.asarray(data[k], dtype=np.float64)
+        if arr.ndim != 2:
+            raise RuntimeError(f"sanitize_market_data field '{k}' must be 2D [T,A], got {arr.shape}")
+        out[k] = arr.copy()
+
+    T, A = out["close"].shape
+    for k in required:
+        if out[k].shape != (T, A):
+            raise RuntimeError(f"sanitize_market_data shape mismatch for '{k}': {out[k].shape} vs {(T, A)}")
+
+    if "ts_ns" in data:
+        ts_ns = np.asarray(data["ts_ns"], dtype=np.int64).copy()
+        if ts_ns.shape != (T,):
+            raise RuntimeError(f"sanitize_market_data ts_ns shape mismatch: {ts_ns.shape} vs {(T,)}")
+        _assert_monotonic_ts_ns(ts_ns)
+        out["ts_ns"] = ts_ns
+        if T > 1:
+            d = np.diff(ts_ns)
+            med = int(np.median(d))
+            if med > 0:
+                gap_idx = np.where(d > med)[0]
+                if gap_idx.size > 0:
+                    logs.append(
+                        {
+                            "event": "timestamp_gaps_detected",
+                            "count": int(gap_idx.size),
+                            "first_index": int(gap_idx[0]),
+                            "median_delta_ns": int(med),
+                        }
+                    )
+
+    bar_valid = np.asarray(data.get("bar_valid", np.ones((T, A), dtype=bool)), dtype=bool).copy()
+    if bar_valid.shape != (T, A):
+        raise RuntimeError(f"sanitize_market_data bar_valid shape mismatch: {bar_valid.shape} vs {(T, A)}")
+
+    for k in required:
+        n_bad_before = int(np.sum(~np.isfinite(out[k])))
+        filled_arr, n_ffill = _forward_fill_small_gaps(out[k], max_gap=int(c.ffill_gap_limit))
+        clipped_arr, n_clip = _safe_mad_clip(filled_arr, mad_clip_k=float(c.mad_clip_k))
+        out[k] = clipped_arr
+        n_bad_after = int(np.sum(~np.isfinite(clipped_arr)))
+        if n_bad_before > 0 or n_ffill > 0 or n_clip > 0 or n_bad_after > 0:
+            logs.append(
+                {
+                    "event": "sanitize_field",
+                    "field": k,
+                    "non_finite_before": int(n_bad_before),
+                    "forward_filled": int(n_ffill),
+                    "outliers_clipped": int(n_clip),
+                    "non_finite_after": int(n_bad_after),
+                }
+            )
+
+    finite_mask = np.isfinite(out["open"]) & np.isfinite(out["high"]) & np.isfinite(out["low"]) & np.isfinite(out["close"]) & np.isfinite(out["volume"])
+    phys_mask = (out["high"] >= out["low"]) & (out["high"] >= out["open"]) & (out["high"] >= out["close"]) & (out["low"] <= out["open"]) & (out["low"] <= out["close"]) & (out["volume"] >= 0.0)
+    clean_mask = finite_mask & phys_mask
+    bar_valid &= clean_mask
+
+    n_invalid = int(np.sum(~bar_valid))
+    if n_invalid > 0:
+        logs.append({"event": "corrupted_points_masked", "count": int(n_invalid)})
+
+    if bool(c.drop_corrupted_rows):
+        keep_t = np.all(bar_valid, axis=1)
+        dropped = int(np.sum(~keep_t))
+        if dropped > 0:
+            for k in ("open", "high", "low", "close", "volume", "bar_valid"):
+                arr = bar_valid if k == "bar_valid" else out[k]
+                out[k] = arr[keep_t]
+            if "ts_ns" in out:
+                out["ts_ns"] = out["ts_ns"][keep_t]
+            logs.append({"event": "dropped_corrupted_rows", "count": dropped})
+            return out, logs
+
+    out["bar_valid"] = bar_valid
+    return out, logs
+
+
+def _resolve_backend(compute_backend: str) -> tuple[Any, str]:
+    backend = str(compute_backend).strip().lower()
+    if backend not in {"numpy", "cupy"}:
+        raise RuntimeError(f"Unsupported compute backend: {compute_backend}")
+    if backend == "numpy":
+        return np, "numpy"
+    try:
+        import cupy as cp  # type: ignore
+    except Exception:
+        return np, "numpy"
+    return cp, "cupy"
+
+
+def _rolling_sum_prefix(x_aw: Any, w: int, xp: Any) -> Any:
+    w = int(w)
+    if w <= 0:
+        raise RuntimeError("rolling window must be > 0")
+    T = int(x_aw.shape[1])
+    c = xp.cumsum(x_aw, axis=1, dtype=x_aw.dtype)
+    out = c.copy()
+    if w < T:
+        out[:, w:] = c[:, w:] - c[:, :-w]
+    return out
+
+
+def _rolling_mean_prefix(x_aw: Any, w: int, xp: Any) -> Any:
+    T = int(x_aw.shape[1])
+    s = _rolling_sum_prefix(x_aw, int(w), xp)
+    denom = xp.minimum(xp.arange(1, T + 1), int(w)).astype(x_aw.dtype)
+    return s / denom[None, :]
+
+
+def _rolling_std_prefix(x_aw: Any, w: int, xp: Any) -> Any:
+    m = _rolling_mean_prefix(x_aw, int(w), xp)
+    m2 = _rolling_mean_prefix(x_aw * x_aw, int(w), xp)
+    var = xp.maximum(m2 - m * m, 0.0)
+    return xp.sqrt(var)
+
+
+def _as_aw_inputs(data_ta: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+    out: dict[str, np.ndarray] = {}
+    for k, v in data_ta.items():
+        if k in {"ts_ns"}:
+            continue
+        arr = np.asarray(v)
+        if arr.ndim == 2:
+            out[k] = np.ascontiguousarray(arr.T.astype(np.float64, copy=False))
+    if "returns" not in out and "close" in out:
+        close = out["close"]
+        ret = np.zeros_like(close, dtype=np.float64)
+        ret[:, 1:] = np.diff(close, axis=1) / np.maximum(close[:, :-1], 1e-12)
+        out["returns"] = ret
+    if "hl_spread" not in out and {"high", "low", "close"} <= set(out.keys()):
+        out["hl_spread"] = (out["high"] - out["low"]) / np.maximum(out["close"], 1e-12)
+    if "price" not in out and "close" in out:
+        out["price"] = out["close"]
+    return out
+
+
+def _compute_feature_window_numpy(
+    *,
+    spec: FeatureSpec,
+    w: int,
+    inputs_aw: Mapping[str, np.ndarray],
+    deps: Mapping[str, Mapping[int, np.ndarray]],
+) -> np.ndarray:
+    name = spec.name
+    w = int(w)
+
+    if name in {"rolling_volatility", "roll_std_ret"}:
+        src = np.asarray(inputs_aw.get("returns"), dtype=np.float64)
+        return _rolling_std_prefix(src, w, np)
+    if name in {"momentum"}:
+        price = np.asarray(inputs_aw.get("price", inputs_aw.get("close")), dtype=np.float64)
+        idx = np.arange(price.shape[1], dtype=np.int64)
+        start = np.maximum(idx - (w - 1), 0)
+        base = price[:, start]
+        return price / (base + 1e-12) - 1.0
+    if name in {"normalized_momentum"}:
+        if "momentum" not in deps or int(w) not in deps["momentum"]:
+            raise RuntimeError("normalized_momentum requires dependency 'momentum' with matching window")
+        mom = np.asarray(deps["momentum"][int(w)], dtype=np.float64)
+        scale = _rolling_std_prefix(mom, w, np)
+        return mom / (scale + 1e-12)
+    if name in {"vwap_deviation"}:
+        px = np.asarray(inputs_aw.get("price", inputs_aw.get("close")), dtype=np.float64)
+        vol = np.asarray(inputs_aw.get("volume"), dtype=np.float64)
+        vwap = _rolling_sum_prefix(px * vol, w, np) / np.maximum(_rolling_sum_prefix(vol, w, np), 1e-12)
+        return px / np.maximum(vwap, 1e-12) - 1.0
+    if name in {"roll_mean_ret"}:
+        src = np.asarray(inputs_aw.get("returns"), dtype=np.float64)
+        return _rolling_mean_prefix(src, w, np)
+    if name in {"roll_mean_hl_spread"}:
+        src = np.asarray(inputs_aw.get("hl_spread"), dtype=np.float64)
+        return _rolling_mean_prefix(src, w, np)
+    if name in {"roll_mean_close"}:
+        src = np.asarray(inputs_aw.get("close"), dtype=np.float64)
+        return _rolling_mean_prefix(src, w, np)
+    if name in {"roll_std_close"}:
+        src = np.asarray(inputs_aw.get("close"), dtype=np.float64)
+        return _rolling_std_prefix(src, w, np)
+    if name in {"roll_mean_vol"}:
+        src = np.asarray(inputs_aw.get("volume"), dtype=np.float64)
+        return _rolling_mean_prefix(src, w, np)
+
+    if name.startswith("roll_mean_"):
+        if len(spec.input_fields) == 0:
+            raise RuntimeError(f"Feature '{name}' requires input_fields")
+        src = np.asarray(inputs_aw.get(spec.input_fields[0]), dtype=np.float64)
+        return _rolling_mean_prefix(src, w, np)
+    if name.startswith("roll_std_"):
+        if len(spec.input_fields) == 0:
+            raise RuntimeError(f"Feature '{name}' requires input_fields")
+        src = np.asarray(inputs_aw.get(spec.input_fields[0]), dtype=np.float64)
+        return _rolling_std_prefix(src, w, np)
+    raise RuntimeError(f"Unsupported feature kernel: {name}")
+
+
+def _compute_feature_windows_numpy(
+    *,
+    spec: FeatureSpec,
+    inputs_aw: Mapping[str, np.ndarray],
+    deps: Mapping[str, Mapping[int, np.ndarray]],
+) -> tuple[str, dict[int, np.ndarray]]:
+    out: dict[int, np.ndarray] = {}
+    for w in spec.windows:
+        arr = _compute_feature_window_numpy(spec=spec, w=int(w), inputs_aw=inputs_aw, deps=deps)
+        out[int(w)] = np.asarray(arr, dtype=np.float64)
+    return spec.name, out
+
+
+def _compute_feature_windows_gpu(
+    *,
+    spec: FeatureSpec,
+    inputs_aw: Mapping[str, np.ndarray],
+    deps: Mapping[str, Mapping[int, np.ndarray]],
+    cp: Any,
+) -> tuple[str, dict[int, np.ndarray]]:
+    xp_inputs = {k: cp.asarray(np.asarray(v, dtype=np.float64)) for k, v in inputs_aw.items()}
+    xp_deps: dict[str, dict[int, Any]] = {}
+    for k, d in deps.items():
+        xp_deps[k] = {int(w): cp.asarray(np.asarray(v, dtype=np.float64)) for w, v in d.items()}
+
+    out: dict[int, np.ndarray] = {}
+    for w in spec.windows:
+        name = spec.name
+        if name in {"rolling_volatility", "roll_std_ret"}:
+            arr = _rolling_std_prefix(xp_inputs["returns"], int(w), cp)
+        elif name in {"momentum"}:
+            price = xp_inputs.get("price", xp_inputs.get("close"))
+            idx = cp.arange(price.shape[1], dtype=cp.int64)
+            start = cp.maximum(idx - (int(w) - 1), 0)
+            base = price[:, start]
+            arr = price / (base + 1e-12) - 1.0
+        elif name in {"normalized_momentum"}:
+            if "momentum" not in xp_deps or int(w) not in xp_deps["momentum"]:
+                raise RuntimeError("normalized_momentum requires dependency 'momentum' with matching window")
+            mom = xp_deps["momentum"][int(w)]
+            scale = _rolling_std_prefix(mom, int(w), cp)
+            arr = mom / (scale + 1e-12)
+        elif name in {"vwap_deviation"}:
+            px = xp_inputs.get("price", xp_inputs.get("close"))
+            vol = xp_inputs["volume"]
+            vwap = _rolling_sum_prefix(px * vol, int(w), cp) / cp.maximum(_rolling_sum_prefix(vol, int(w), cp), 1e-12)
+            arr = px / cp.maximum(vwap, 1e-12) - 1.0
+        elif name in {"roll_mean_ret"}:
+            arr = _rolling_mean_prefix(xp_inputs["returns"], int(w), cp)
+        elif name in {"roll_mean_hl_spread"}:
+            arr = _rolling_mean_prefix(xp_inputs["hl_spread"], int(w), cp)
+        elif name in {"roll_mean_close"}:
+            arr = _rolling_mean_prefix(xp_inputs["close"], int(w), cp)
+        elif name in {"roll_std_close"}:
+            arr = _rolling_std_prefix(xp_inputs["close"], int(w), cp)
+        elif name in {"roll_mean_vol"}:
+            arr = _rolling_mean_prefix(xp_inputs["volume"], int(w), cp)
+        elif name.startswith("roll_mean_"):
+            arr = _rolling_mean_prefix(xp_inputs[spec.input_fields[0]], int(w), cp)
+        elif name.startswith("roll_std_"):
+            arr = _rolling_std_prefix(xp_inputs[spec.input_fields[0]], int(w), cp)
+        else:
+            raise RuntimeError(f"Unsupported feature kernel: {name}")
+        out[int(w)] = cp.asnumpy(arr).astype(np.float64, copy=False)
+    return spec.name, out
+
+
+def _feature_worker_job(
+    spec_payload: dict[str, Any],
+    inputs_aw: dict[str, np.ndarray],
+    deps: dict[str, dict[int, np.ndarray]],
+    seed: int,
+) -> tuple[str, dict[int, np.ndarray]]:
+    np.random.seed(int(seed))
+    spec = FeatureSpec(
+        name=str(spec_payload["name"]),
+        windows=tuple(int(x) for x in spec_payload["windows"]),
+        input_fields=tuple(str(x) for x in spec_payload["input_fields"]),
+        dtype="float64",
+        dependencies=tuple(str(x) for x in spec_payload["dependencies"]),
+    )
+    return _compute_feature_windows_numpy(spec=spec, inputs_aw=inputs_aw, deps=deps)
+
+
+def _dataset_hash_from_data(data_ta: Mapping[str, np.ndarray], feature_specs: Sequence[FeatureSpec], ts_ns: np.ndarray | None = None) -> str:
+    h = hashlib.sha256()
+    for key in sorted(data_ta.keys()):
+        if key == "ts_ns":
+            continue
+        arr = np.ascontiguousarray(np.asarray(data_ta[key]))
+        h.update(key.encode("utf-8"))
+        h.update(str(arr.dtype).encode("utf-8"))
+        h.update(np.asarray(arr.shape, dtype=np.int64).tobytes())
+        buf = arr.view(np.uint8).ravel()
+        step = 8 * 1024 * 1024
+        for i in range(0, buf.size, step):
+            h.update(buf[i : i + step].tobytes())
+    if ts_ns is not None:
+        ts = np.ascontiguousarray(np.asarray(ts_ns, dtype=np.int64))
+        h.update(ts.view(np.uint8).tobytes())
+    h.update(feature_registry_hash(feature_specs).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _cache_key(dataset_hash: str, registry_hash: str) -> str:
+    return hashlib.sha256(f"{dataset_hash}|{registry_hash}".encode("utf-8")).hexdigest()[:24]
+
+
+def _atomic_save_npz(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("wb") as f:
+        np.savez_compressed(f, **payload)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
+def _allocate_tensor(A: int, T: int, F: int, W: int, cfg: FeatureEngineConfig) -> tuple[np.ndarray, Path | None]:
+    backend = str(cfg.tensor_backend).strip().lower()
+    if backend == "ram":
+        return np.zeros((A, T, F, W), dtype=np.float64), None
+    if backend != "memmap":
+        raise RuntimeError(f"Unsupported tensor backend: {cfg.tensor_backend}")
+
+    p = Path(cfg.memmap_path).expanduser()
+    if not p.is_absolute():
+        p = (Path.cwd() / p).resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if p.exists():
+        p.unlink(missing_ok=True)
+    arr = np.memmap(p, mode="w+", dtype=np.float64, shape=(A, T, F, W))
+    arr[:] = 0.0
+    arr.flush()
+    return arr, p
+
+
+def build_feature_tensor(
+    data: Mapping[str, np.ndarray],
+    feature_specs: Sequence[FeatureSpec],
+    *,
+    engine_cfg: FeatureEngineConfig | None = None,
+    ts_ns: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, int], dict[str, int], dict[str, Any]]:
+    cfg = engine_cfg if engine_cfg is not None else FeatureEngineConfig()
+    specs = _ensure_feature_specs(feature_specs)
+    dag = build_feature_dag(specs)
+    order = resolve_feature_execution_order(dag)
+    spec_by_name = {s.name: s for s in specs}
+    ordered_specs = [spec_by_name[n] for n in order]
+
+    sanitized_ta, sanitize_logs = sanitize_market_data(
+        {
+            "open": np.asarray(data["open"], dtype=np.float64),
+            "high": np.asarray(data["high"], dtype=np.float64),
+            "low": np.asarray(data["low"], dtype=np.float64),
+            "close": np.asarray(data["close"], dtype=np.float64),
+            "volume": np.asarray(data["volume"], dtype=np.float64),
+            "bar_valid": np.asarray(data.get("bar_valid", np.ones_like(np.asarray(data["close"], dtype=np.float64), dtype=bool)), dtype=bool),
+            "ts_ns": np.asarray(ts_ns if ts_ns is not None else data.get("ts_ns", np.arange(np.asarray(data["close"]).shape[0], dtype=np.int64)), dtype=np.int64),
+        },
+        cfg,
+    )
+    if "bar_valid" not in sanitized_ta:
+        raise RuntimeError("sanitize_market_data must produce bar_valid")
+    T, A = sanitized_ta["close"].shape
+
+    all_windows = sorted(set(int(w) for s in ordered_specs for w in s.windows))
+    if len(all_windows) == 0:
+        raise RuntimeError("No windows found for feature tensor build")
+
+    feature_map = {s.name: i for i, s in enumerate(ordered_specs)}
+    window_map = {str(i): int(w) for i, w in enumerate(all_windows)}
+    window_to_idx = {int(w): i for i, w in enumerate(all_windows)}
+
+    registry_hash = feature_registry_hash(ordered_specs)
+    dataset_hash = _dataset_hash_from_data(sanitized_ta, ordered_specs, ts_ns=sanitized_ta.get("ts_ns"))
+    key = _cache_key(dataset_hash, registry_hash)
+    cache_dir = Path(cfg.cache_dir).expanduser().resolve()
+    cache_path = cache_dir / f"feature_tensor_{key}.npz"
+    memmap_path = Path(cfg.memmap_path).expanduser()
+    if not memmap_path.is_absolute():
+        memmap_path = (Path.cwd() / memmap_path).resolve()
+
+    if bool(cfg.use_cache) and cache_path.exists():
+        with np.load(cache_path, allow_pickle=False) as d:
+            meta_raw = d.get("metadata")
+            if meta_raw is None:
+                raise RuntimeError("Feature cache missing metadata")
+            meta = json.loads(str(meta_raw[0]))
+            if "tensor" in d.files:
+                tensor = np.asarray(d["tensor"], dtype=np.float64)
+            elif str(meta.get("backend", "")).lower() == "memmap":
+                mm_path = Path(str(meta.get("memmap_path", memmap_path))).expanduser().resolve()
+                shape = tuple(int(x) for x in meta["shape"])
+                tensor = np.memmap(mm_path, mode="r", dtype=np.float64, shape=shape)
+            else:
+                raise RuntimeError("Invalid cached feature tensor format")
+        if tuple(tensor.shape) != (A, T, len(ordered_specs), len(all_windows)):
+            raise RuntimeError("Cached feature tensor shape mismatch")
+        if tensor.dtype != np.float64:
+            raise RuntimeError("Cached feature tensor dtype mismatch")
+        if np.any(~np.isfinite(np.asarray(tensor))):
+            raise RuntimeError("Cached feature tensor contains non-finite values")
+        tensor.flags.writeable = False
+        return tensor, feature_map, window_map, {
+            "cache_hit": True,
+            "cache_path": str(cache_path),
+            "registry_hash": registry_hash,
+            "dataset_hash": dataset_hash,
+            "sanitize_logs": sanitize_logs,
+            "compute_backend_effective": str(meta.get("compute_backend_effective", "numpy")),
+            "feature_order": [s.name for s in ordered_specs],
+        }
+
+    tensor, tensor_memmap_path = _allocate_tensor(A, T, len(ordered_specs), len(all_windows), cfg)
+
+    clean_ta = {k: np.where(np.isfinite(v), np.asarray(v, dtype=np.float64), 0.0) for k, v in sanitized_ta.items() if k in {"open", "high", "low", "close", "volume", "bar_valid"}}
+    clean_aw = _as_aw_inputs(clean_ta)
+    for k in ("open", "high", "low", "close", "volume", "returns", "hl_spread", "price"):
+        if k in clean_aw:
+            clean_aw[k] = np.where(np.isfinite(clean_aw[k]), clean_aw[k], 0.0).astype(np.float64, copy=False)
+
+    backend_mod, backend_name = _resolve_backend(cfg.compute_backend)
+    if backend_name == "cupy" and str(cfg.parallel_backend).strip().lower() == "process_pool":
+        backend_mod, backend_name = np, "numpy"
+
+    feature_results: dict[str, dict[int, np.ndarray]] = {}
+    pending = set(order)
+    worker_seed_base = int(cfg.seed)
+    while pending:
+        ready = [n for n in order if n in pending and dag[n].issubset(feature_results.keys())]
+        if len(ready) == 0:
+            raise RuntimeError("Unable to resolve feature execution order during compute")
+
+        if str(cfg.parallel_backend).strip().lower() == "process_pool" and backend_name == "numpy" and len(ready) > 1:
+            max_workers = int(max(1, cfg.max_workers))
+            jobs: list[tuple[str, dict[int, np.ndarray]]] = []
+            with ProcessPoolExecutor(max_workers=max_workers) as ex:
+                futs = []
+                for j, name in enumerate(sorted(ready)):
+                    spec = spec_by_name[name]
+                    dep = {d: feature_results[d] for d in spec.dependencies}
+                    payload = {
+                        "name": spec.name,
+                        "windows": [int(w) for w in spec.windows],
+                        "input_fields": [str(x) for x in spec.input_fields],
+                        "dependencies": [str(x) for x in spec.dependencies],
+                    }
+                    futs.append(ex.submit(_feature_worker_job, payload, dict(clean_aw), dep, worker_seed_base + j))
+                for f in futs:
+                    jobs.append(f.result())
+            jobs.sort(key=lambda x: x[0])
+            for name, out_w in jobs:
+                feature_results[name] = out_w
+                pending.remove(name)
+        else:
+            for name in sorted(ready):
+                spec = spec_by_name[name]
+                dep = {d: feature_results[d] for d in spec.dependencies}
+                if backend_name == "cupy":
+                    out_name, out_w = _compute_feature_windows_gpu(spec=spec, inputs_aw=clean_aw, deps=dep, cp=backend_mod)
+                else:
+                    out_name, out_w = _compute_feature_windows_numpy(spec=spec, inputs_aw=clean_aw, deps=dep)
+                feature_results[out_name] = out_w
+                pending.remove(name)
+
+    for s in ordered_specs:
+        fi = feature_map[s.name]
+        for w in s.windows:
+            wi = window_to_idx[int(w)]
+            arr_aw = np.asarray(feature_results[s.name][int(w)], dtype=np.float64)
+            if arr_aw.shape != (A, T):
+                raise RuntimeError(
+                    f"Feature '{s.name}' window {w} shape mismatch: got {arr_aw.shape}, expected {(A, T)}"
+                )
+            tensor[:, :, fi, wi] = arr_aw
+
+    arr_tensor = np.asarray(tensor)
+    if np.any(~np.isfinite(arr_tensor)):
+        bad = np.argwhere(~np.isfinite(arr_tensor))[0]
+        raise RuntimeError(
+            f"Feature tensor contains non-finite values at [a,t,f,w]={bad.tolist()}"
+        )
+    if arr_tensor.dtype != np.float64:
+        raise RuntimeError("Feature tensor dtype must be float64")
+
+    if isinstance(tensor, np.memmap):
+        tensor.flush()
+    tensor.flags.writeable = False
+
+    meta = {
+        "shape": [int(x) for x in tensor.shape],
+        "dtype": "float64",
+        "backend": str(cfg.tensor_backend).strip().lower(),
+        "compute_backend_effective": backend_name,
+        "dataset_hash": dataset_hash,
+        "registry_hash": registry_hash,
+        "feature_order": [s.name for s in ordered_specs],
+        "window_values": [int(w) for w in all_windows],
+        "memmap_path": str(tensor_memmap_path) if tensor_memmap_path is not None else "",
+    }
+
+    if bool(cfg.use_cache):
+        cache_payload: dict[str, Any] = {"metadata": np.asarray([json.dumps(meta, sort_keys=True)], dtype=np.str_)}
+        if str(cfg.tensor_backend).strip().lower() == "ram":
+            cache_payload["tensor"] = np.asarray(tensor, dtype=np.float64)
+        _atomic_save_npz(cache_path, cache_payload)
+
+    return tensor, feature_map, window_map, {
+        "cache_hit": False,
+        "cache_path": str(cache_path),
+        "registry_hash": registry_hash,
+        "dataset_hash": dataset_hash,
+        "sanitize_logs": sanitize_logs,
+        "compute_backend_effective": backend_name,
+        "feature_order": [s.name for s in ordered_specs],
+        "window_values": [int(w) for w in all_windows],
+    }
+
+
+def make_compat_feature_specs(windows: Sequence[int]) -> list[FeatureSpec]:
+    wins = tuple(sorted(set(int(w) for w in windows)))
+    if len(wins) == 0:
+        raise RuntimeError("windows must be non-empty")
+    return [
+        FeatureSpec(name="roll_mean_ret", windows=wins, input_fields=("returns",)),
+        FeatureSpec(name="roll_std_ret", windows=wins, input_fields=("returns",)),
+        FeatureSpec(name="roll_mean_hl_spread", windows=wins, input_fields=("hl_spread",)),
+        FeatureSpec(name="roll_mean_close", windows=wins, input_fields=("close",)),
+        FeatureSpec(name="roll_std_close", windows=wins, input_fields=("close",)),
+        FeatureSpec(name="roll_mean_vol", windows=wins, input_fields=("volume",)),
+    ]
+
+
+def build_feature_tensor_from_arrays(
+    open_ta: np.ndarray,
+    high_ta: np.ndarray,
+    low_ta: np.ndarray,
+    close_ta: np.ndarray,
+    volume_ta: np.ndarray,
+    *,
+    feature_specs: Sequence[FeatureSpec],
+    engine_cfg: FeatureEngineConfig | None = None,
+    ts_ns: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, int], dict[str, int], dict[str, Any]]:
+    o = np.asarray(open_ta, dtype=np.float64)
+    h = np.asarray(high_ta, dtype=np.float64)
+    l = np.asarray(low_ta, dtype=np.float64)
+    c = np.asarray(close_ta, dtype=np.float64)
+    v = np.asarray(volume_ta, dtype=np.float64)
+    if not (o.shape == h.shape == l.shape == c.shape == v.shape):
+        raise RuntimeError("Raw array shape mismatch for feature tensor build")
+    if o.ndim != 2:
+        raise RuntimeError("Raw arrays must be 2D [T,A]")
+    T, A = o.shape
+    bar_valid = np.isfinite(o) & np.isfinite(h) & np.isfinite(l) & np.isfinite(c) & np.isfinite(v)
+    data = {
+        "open": o,
+        "high": h,
+        "low": l,
+        "close": c,
+        "volume": v,
+        "bar_valid": bar_valid,
+    }
+    if ts_ns is not None:
+        ts = np.asarray(ts_ns, dtype=np.int64)
+        if ts.shape != (T,):
+            raise RuntimeError(f"ts_ns shape mismatch: got {ts.shape}, expected {(T,)}")
+        data["ts_ns"] = ts
+    return build_feature_tensor(data, feature_specs, engine_cfg=engine_cfg, ts_ns=np.asarray(data.get("ts_ns")) if "ts_ns" in data else None)
+
+
+def build_feature_tensor_from_state(
+    state: TensorState,
+    *,
+    feature_specs: Sequence[FeatureSpec] | None = None,
+    registry_path: str | os.PathLike[str] = "feature_registry.yaml",
+    engine_cfg: FeatureEngineConfig | None = None,
+) -> tuple[np.ndarray, dict[str, int], dict[str, int], dict[str, Any]]:
+    specs = list(feature_specs) if feature_specs is not None else load_feature_registry(registry_path)
+    return build_feature_tensor_from_arrays(
+        state.open_px,
+        state.high_px,
+        state.low_px,
+        state.close_px,
+        state.volume,
+        feature_specs=specs,
+        engine_cfg=engine_cfg,
+        ts_ns=state.ts_ns,
+    )
 
 
 # -----------------------------------------------------------------------------
