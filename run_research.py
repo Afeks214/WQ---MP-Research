@@ -32,7 +32,7 @@ except Exception as exc:  # pragma: no cover
     raise RuntimeError("pyyaml is required. Install with: pip install pyyaml") from exc
 
 try:
-    from pydantic import BaseModel, ConfigDict, Field, model_validator
+    from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 except Exception as exc:  # pragma: no cover
     raise RuntimeError("pydantic>=2 is required. Install with: pip install 'pydantic>=2'") from exc
 
@@ -49,7 +49,7 @@ from weightiz_module5_harness import (
 from weightiz_self_audit import run_full_self_audit
 from weightiz_architecture_guard import run_architecture_consistency_check
 from weightiz_validation_suite import run_preflight_validation_suite
-from weightiz_system_logger import get_logger
+from weightiz_system_logger import get_logger, log_event
 
 
 def _require_pandas() -> Any:
@@ -185,8 +185,23 @@ class Module4ConfigModel(BaseModel):
     # this strict model is the real validator used by _load_config -> RunConfigModel.
     model_config = ConfigDict(extra="forbid")
 
+    fail_on_non_finite_input: bool = True
+    fail_on_non_finite_output: bool = True
+    eps: float = 1e-12
+    enforce_causal_source_validation: bool = True
+    enforce_window_causal_sanity: bool = True
+    window_selection_mode: str = "multi_window"
+    fixed_window_index: int = 0
+    anchor_window_index: int = 0
+    max_volatility: float = float("inf")
+    max_spread: float = float("inf")
+    min_liquidity: float = 0.0
+    regime_confidence_min: float = 0.55
     entry_threshold: float = 0.55
     exit_threshold: float = 0.25
+    conviction_scale: float = 1.0
+    conviction_clip: float = 1.0
+    max_abs_weight: float = 1.0
     top_k_intraday: int = 5
     max_asset_cap_frac: float = 0.3
     max_turnover_frac_per_bar: float = 0.35
@@ -205,9 +220,7 @@ class Module4ConfigModel(BaseModel):
     slippage_bps_high_rvol: float = 1.5
     stress_slippage_mult: float = 1.0
     hard_kill_on_daily_loss_breach: bool = True
-    fail_on_non_finite_input: bool = True
-    fail_on_non_finite_output: bool = True
-    eps: float = 1e-12
+    enable_degraded_bridge_mode: bool = True
 
     # Additive compatibility fields for Cell-6 nomenclature.
     strategy_type: str = "legacy"
@@ -290,6 +303,71 @@ class HarnessConfigModel(BaseModel):
     robustness_weight_horizon: float = 0.15
     robustness_reject_threshold: float = 0.60
     execution_fragile_threshold: float = 0.50
+
+    @field_validator("horizon_minutes", mode="before")
+    @classmethod
+    def validate_horizon_minutes_input(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            raise ValueError("harness.horizon_minutes must be a list of positive integers")
+        for entry in value:
+            if isinstance(entry, bool) or not isinstance(entry, int):
+                raise ValueError("harness.horizon_minutes entries must be positive integers")
+        return value
+
+    @model_validator(mode="after")
+    def validate_institutional_controls(self) -> "HarnessConfigModel":
+        if not (0.0 <= float(self.cluster_corr_threshold) <= 1.0):
+            raise ValueError("harness.cluster_corr_threshold must be in [0,1]")
+        if int(self.cluster_distance_block_size) < 1:
+            raise ValueError("harness.cluster_distance_block_size must be >=1")
+        if int(self.cluster_distance_in_memory_max_n) < 1:
+            raise ValueError("harness.cluster_distance_in_memory_max_n must be >=1")
+        if float(self.execution_transaction_cost_per_trade) < 0.0:
+            raise ValueError("harness.execution_transaction_cost_per_trade must be >=0")
+        if float(self.execution_slippage_mult) < 0.0:
+            raise ValueError("harness.execution_slippage_mult must be >=0")
+        if float(self.execution_extra_slippage_bps) < 0.0:
+            raise ValueError("harness.execution_extra_slippage_bps must be >=0")
+        if int(self.execution_latency_bars) < 0:
+            raise ValueError("harness.execution_latency_bars must be >=0")
+        if int(self.regime_vol_window) < 2:
+            raise ValueError("harness.regime_vol_window must be >=2")
+        if int(self.regime_slope_window) < 2:
+            raise ValueError("harness.regime_slope_window must be >=2")
+        if int(self.regime_hurst_window) < 8:
+            raise ValueError("harness.regime_hurst_window must be >=8")
+        if int(self.regime_min_obs_per_mask) < 1:
+            raise ValueError("harness.regime_min_obs_per_mask must be >=1")
+        if len(self.horizon_minutes) == 0:
+            raise ValueError("harness.horizon_minutes must be non-empty")
+        seen: set[int] = set()
+        for raw_horizon in self.horizon_minutes:
+            if isinstance(raw_horizon, bool):
+                raise ValueError("harness.horizon_minutes entries must be positive integers")
+            horizon = int(raw_horizon)
+            if horizon <= 0:
+                raise ValueError("harness.horizon_minutes entries must be positive integers")
+            if horizon in seen:
+                raise ValueError("harness.horizon_minutes must not contain duplicates")
+            seen.add(horizon)
+        weights = {
+            "harness.robustness_weight_dsr": float(self.robustness_weight_dsr),
+            "harness.robustness_weight_pbo": float(self.robustness_weight_pbo),
+            "harness.robustness_weight_spa": float(self.robustness_weight_spa),
+            "harness.robustness_weight_regime": float(self.robustness_weight_regime),
+            "harness.robustness_weight_execution": float(self.robustness_weight_execution),
+            "harness.robustness_weight_horizon": float(self.robustness_weight_horizon),
+        }
+        for name, value in weights.items():
+            if not (0.0 <= value <= 1.0):
+                raise ValueError(f"{name} must be in [0,1]")
+        if abs(sum(weights.values()) - 1.0) > 1e-12:
+            raise ValueError("harness robustness weights must sum to 1.0 within tolerance 1e-12")
+        if not (0.0 <= float(self.robustness_reject_threshold) <= 1.0):
+            raise ValueError("harness.robustness_reject_threshold must be in [0,1]")
+        if not (0.0 <= float(self.execution_fragile_threshold) <= 1.0):
+            raise ValueError("harness.execution_fragile_threshold must be in [0,1]")
+        return self
 
 
 class SearchConfigModel(BaseModel):
@@ -899,15 +977,7 @@ def main() -> None:
     with (run_dir / "run_summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    logger.info(
-        "run_complete",
-        extra={
-            "event_type": "run_complete",
-            "run_id": str(run_id),
-            "strategy_id": "",
-            "worker_id": "",
-        },
-    )
+    log_event(logger, "INFO", "run_complete", event_type="run_complete")
 
 
 if __name__ == "__main__":

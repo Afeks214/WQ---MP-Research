@@ -29,7 +29,8 @@ def test_runtime_monitor_emits_health_rows(tmp_path: Path) -> None:
     p = tmp_path / "runtime_health_checks.jsonl"
     assert p.exists()
     txt = p.read_text(encoding="utf-8")
-    assert "tensor_valid" in txt
+    assert "diagnostic_feature_tensor_valid" in txt
+    assert "diagnostics_cache_only" in txt
 
 
 def test_runtime_monitor_raises_on_shape_mismatch(tmp_path: Path) -> None:

@@ -70,6 +70,38 @@ class TestStrategyEmbedding(unittest.TestCase):
             self.assertTrue(p.exists())
             self.assertTrue(np.all(np.isfinite(np.asarray(d, dtype=np.float64))))
 
+    def test_single_strategy_and_zero_variance_column_are_supported(self) -> None:
+        one = np.zeros((30, 1), dtype=np.float64)
+        out = cluster_strategies_hierarchical_threshold(one, corr_threshold=0.90, seed=7)
+        self.assertEqual(np.asarray(out["cluster_labels"]).tolist(), [0])
+        self.assertEqual(np.asarray(out["cluster_representatives"]).tolist(), [0])
+
+        r = np.column_stack(
+            [
+                np.zeros(80, dtype=np.float64),
+                np.linspace(-0.01, 0.01, 80, dtype=np.float64),
+            ]
+        )
+        d = np.asarray(compute_correlation_distance(r, block_size=8, in_memory_max_n=1000), dtype=np.float64)
+        self.assertTrue(np.all(np.isfinite(d)))
+        self.assertEqual(float(d[0, 0]), 0.0)
+
+    def test_isolated_strategies_remain_separate_and_order_is_stable(self) -> None:
+        t = np.linspace(0.0, 8.0 * np.pi, 320, dtype=np.float64)
+        r = np.column_stack(
+            [
+                0.01 * np.sin(t),
+                0.01 * np.cos(t),
+                0.01 * np.sin(2.0 * t + 0.2),
+            ]
+        ).astype(np.float64)
+        out_a = cluster_strategies_hierarchical_threshold(r, corr_threshold=0.99, seed=5)
+        out_b = cluster_strategies_hierarchical_threshold(r[:, [2, 0, 1]], corr_threshold=0.99, seed=5)
+        self.assertEqual(int(out_a["n_eff"]), 3)
+        self.assertEqual(int(out_b["n_eff"]), 3)
+        self.assertEqual(sorted(np.asarray(out_a["cluster_representatives"]).tolist()), [0, 1, 2])
+        self.assertEqual(sorted(np.asarray(out_b["cluster_representatives"]).tolist()), [0, 1, 2])
+
 
 if __name__ == "__main__":
     unittest.main()

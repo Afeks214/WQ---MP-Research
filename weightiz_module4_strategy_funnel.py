@@ -62,9 +62,36 @@ class OrderFlagBit(IntEnum):
 
 @dataclass(frozen=True)
 class Module4Config:
+    # Decision-layer runtime safety
+    fail_on_non_finite_input: bool = True
+    fail_on_non_finite_output: bool = True
+    eps: float = 1e-12
+    enforce_causal_source_validation: bool = True
+    enforce_window_causal_sanity: bool = True
+
+    # Window adapter
+    window_selection_mode: str = "multi_window"
+    fixed_window_index: int = 0
+    anchor_window_index: int = 0
+
+    # Optional pre-intent risk filters
+    max_volatility: float = np.inf
+    max_spread: float = np.inf
+    min_liquidity: float = 0.0
+
+    # Regime decision control
+    regime_confidence_min: float = 0.55
+
     # Signal thresholds
     entry_threshold: float = 0.55
     exit_threshold: float = 0.25
+
+    # Conviction controls
+    conviction_scale: float = 1.0
+    conviction_clip: float = 1.0
+
+    # Allocation controls
+    max_abs_weight: float = 1.0
 
     # Allocation
     top_k_intraday: int = 5
@@ -94,15 +121,13 @@ class Module4Config:
     # Risk behavior
     hard_kill_on_daily_loss_breach: bool = True
 
-    # Runtime strictness
-    fail_on_non_finite_input: bool = True
-    fail_on_non_finite_output: bool = True
-    eps: float = 1e-12
+    # Bridge control
+    enable_degraded_bridge_mode: bool = True
 
     # Compatibility-only schema fields for Cell-6 nomenclature.
-    # Core Module4 trading logic remains unchanged in this patch.
+    # Core Module4 decision logic ignores these fields.
     strategy_type: str = "legacy"
-    score_gate: float = 0.0
+    score_gate: str = ""
     score_gate_rule: str = ""
     deviation_signal: str = ""
     deviation_rule: str = ""
@@ -131,13 +156,37 @@ class Module4Output:
     kill_switch_t: np.ndarray
 
 
-@dataclass
+@dataclass(frozen=True)
 class Module4SignalOutput:
     regime_primary_ta: np.ndarray
     regime_confidence_ta: np.ndarray
     intent_long_ta: np.ndarray
     intent_short_ta: np.ndarray
     target_qty_ta: np.ndarray
+
+    def __post_init__(self) -> None:
+        regime = np.asarray(self.regime_primary_ta)
+        confidence = np.asarray(self.regime_confidence_ta)
+        intent_long = np.asarray(self.intent_long_ta)
+        intent_short = np.asarray(self.intent_short_ta)
+        target_qty = np.asarray(self.target_qty_ta)
+
+        if regime.ndim != 2:
+            raise RuntimeError(f"regime_primary_ta must be [T,A], got shape={regime.shape}")
+        T, A = regime.shape
+        checks = [
+            ("regime_confidence_ta", confidence, np.float64),
+            ("intent_long_ta", intent_long, np.bool_),
+            ("intent_short_ta", intent_short, np.bool_),
+            ("target_qty_ta", target_qty, np.float64),
+        ]
+        if regime.dtype != np.int8:
+            raise RuntimeError(f"regime_primary_ta dtype must be int8, got {regime.dtype}")
+        for name, arr, dtype in checks:
+            if arr.shape != (T, A):
+                raise RuntimeError(f"{name} must be [T,A], got shape={arr.shape}")
+            if arr.dtype != dtype:
+                raise RuntimeError(f"{name} dtype must be {dtype}, got {arr.dtype}")
 
 
 class NonFiniteExecutionPriceError(RuntimeError):
@@ -1237,32 +1286,100 @@ def run_module4_signal_funnel(
     Signal-only Module4 API for canonical orchestration.
     This function does not mutate execution state.
     """
-    T = state.cfg.T
-    A = state.cfg.A
+    from module4.contracts import build_module4_input_contracts
+    from module4.strategy_funnel_engine import run_module4_funnel
+
+    T = int(state.cfg.T)
+    A = int(state.cfg.A)
     _assert_shape("scores", state.scores, (T, A, int(ScoreIdx.N_FIELDS)))
-    _assert_shape("context_tac", m3.context_tac, (T, A, int(ContextIdx.N_FIELDS)))
+    _assert_shape("profile_stats", state.profile_stats, (T, A, int(ProfileStatIdx.N_FIELDS)))
     assert_float64("module4.signal_input.scores", state.scores)
+    assert_float64("module4.signal_input.profile_stats", state.profile_stats)
 
-    bo_l = np.asarray(state.scores[:, :, int(ScoreIdx.SCORE_BO_LONG)], dtype=np.float64)
-    bo_s = np.asarray(state.scores[:, :, int(ScoreIdx.SCORE_BO_SHORT)], dtype=np.float64)
-    confidence = np.maximum(np.abs(bo_l), np.abs(bo_s))
-    intent_long = bo_l >= float(cfg4.entry_threshold)
-    intent_short = bo_s >= float(cfg4.entry_threshold)
-    target = np.zeros((T, A), dtype=np.float64)
-    target[intent_long] = 1.0
-    target[intent_short] = -1.0
-    regime = np.full((T, A), np.int8(RegimeIdx.NEUTRAL), dtype=np.int8)
-    regime[bo_l > bo_s] = np.int8(RegimeIdx.TREND)
-    regime[bo_s > bo_l] = np.int8(RegimeIdx.B_SHAPE)
+    if getattr(m3, "structure_tensor", None) is not None:
+        structure_tensor = np.asarray(m3.structure_tensor, dtype=np.float64)
+    elif getattr(m3, "block_features_tak", None) is not None:
+        structure_tensor = np.swapaxes(np.asarray(m3.block_features_tak, dtype=np.float64), 0, 1)[:, :, :, None]
+    else:
+        raise RuntimeError("MODULE4_BRIDGE_MISSING_STRUCTURE_TENSOR")
 
-    assert_float64("module4.signal_output.confidence", confidence)
-    assert_float64("module4.signal_output.target", target)
+    if getattr(m3, "context_tensor", None) is not None:
+        context_tensor = np.asarray(m3.context_tensor, dtype=np.float64)
+    elif getattr(m3, "context_tac", None) is not None:
+        context_tensor = np.swapaxes(np.asarray(m3.context_tac, dtype=np.float64), 0, 1)[:, :, :, None]
+    else:
+        raise RuntimeError("MODULE4_BRIDGE_MISSING_CONTEXT_TENSOR")
+
+    degraded_mode_mask_at = np.zeros((A, T), dtype=bool)
+    alpha_signal_tensor = np.zeros((A, T, 1), dtype=np.float64)
+    if not bool(cfg4.enable_degraded_bridge_mode):
+        raise RuntimeError("MODULE4_BRIDGE_MISSING_ALPHA_TENSOR")
+    degraded_mode_mask_at |= True
+
+    if getattr(m3, "profile_fingerprint_tensor", None) is not None:
+        profile_fingerprint_tensor = np.asarray(m3.profile_fingerprint_tensor, dtype=np.float64)
+    else:
+        if not bool(cfg4.enable_degraded_bridge_mode):
+            raise RuntimeError("MODULE4_BRIDGE_MISSING_FINGERPRINT_TENSOR")
+        profile_fingerprint_tensor = np.zeros((A, T, 1, 1), dtype=np.float64)
+        degraded_mode_mask_at |= True
+
+    if getattr(m3, "profile_regime_tensor", None) is not None:
+        profile_regime_tensor = np.asarray(m3.profile_regime_tensor, dtype=np.float64)
+    else:
+        if not bool(cfg4.enable_degraded_bridge_mode):
+            raise RuntimeError("MODULE4_BRIDGE_MISSING_PROFILE_REGIME_TENSOR")
+        profile_regime_tensor = np.zeros((A, T, 1, 1), dtype=np.float64)
+        degraded_mode_mask_at |= True
+
+    if getattr(m3, "context_valid_ta", None) is not None:
+        context_valid_ta = np.asarray(m3.context_valid_ta, dtype=bool)
+    else:
+        context_valid_ta = np.all(np.isfinite(np.asarray(context_tensor, dtype=np.float64)), axis=(2, 3)).T
+    _assert_shape("context_valid_ta", context_valid_ta, (T, A))
+    tradable_mask = np.asarray(state.bar_valid, dtype=bool) & context_valid_ta
+
+    source_time_index_at = None
+    if getattr(m3, "context_source_index_atw", None) is not None:
+        src_atw = np.asarray(m3.context_source_index_atw, dtype=np.int64)
+        if src_atw.ndim != 3:
+            raise RuntimeError("MODULE4_BRIDGE_BAD_CONTEXT_SOURCE_INDEX_ATW")
+        t_grid = np.broadcast_to(np.arange(T, dtype=np.int64)[None, :, None], src_atw.shape)
+        if np.any(src_atw > t_grid):
+            bad = np.argwhere(src_atw > t_grid)[0]
+            raise RuntimeError(
+                "CAUSALITY_VIOLATION: context_source_index_atw contains forward-looking index "
+                f"at a={int(bad[0])}, t={int(bad[1])}, w={int(bad[2])}"
+            )
+        source_time_index_at = np.max(src_atw, axis=2)
+    elif getattr(m3, "context_source_t_index_ta", None) is not None:
+        source_time_index_at = np.swapaxes(np.asarray(m3.context_source_t_index_ta, dtype=np.int64), 0, 1)
+
+    contracts = build_module4_input_contracts(
+        alpha_signal_tensor=alpha_signal_tensor,
+        score_tensor=np.swapaxes(np.asarray(state.scores, dtype=np.float64), 0, 1),
+        profile_stat_tensor=np.swapaxes(np.asarray(state.profile_stats, dtype=np.float64), 0, 1),
+        structure_tensor=structure_tensor,
+        context_tensor=context_tensor,
+        profile_fingerprint_tensor=profile_fingerprint_tensor,
+        profile_regime_tensor=profile_regime_tensor,
+        tradable_mask=np.swapaxes(np.asarray(tradable_mask, dtype=bool), 0, 1),
+        phase_code=np.asarray(state.phase, dtype=np.int64),
+        asset_enabled_mask=np.ones(A, dtype=bool),
+        source_time_index_at=source_time_index_at,
+        fail_on_non_finite_input=bool(cfg4.fail_on_non_finite_input),
+    )
+    decision = run_module4_funnel(
+        contracts,
+        cfg4,
+        degraded_mode_mask_at=degraded_mode_mask_at,
+    )
     return Module4SignalOutput(
-        regime_primary_ta=regime,
-        regime_confidence_ta=confidence,
-        intent_long_ta=intent_long,
-        intent_short_ta=intent_short,
-        target_qty_ta=target,
+        regime_primary_ta=np.ascontiguousarray(decision.regime_id.T, dtype=np.int8),
+        regime_confidence_ta=np.ascontiguousarray(decision.regime_confidence.T, dtype=np.float64),
+        intent_long_ta=np.ascontiguousarray(decision.intent_long.T, dtype=bool),
+        intent_short_ta=np.ascontiguousarray(decision.intent_short.T, dtype=bool),
+        target_qty_ta=np.ascontiguousarray(decision.target_weight.T, dtype=np.float64),
     )
 
 

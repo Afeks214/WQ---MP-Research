@@ -10,6 +10,7 @@ except Exception:  # pragma: no cover
     yaml = None  # type: ignore[assignment]
 
 from run_research import _load_config
+from weightiz_module4_strategy_funnel import Module4Config
 
 
 @unittest.skipIf(yaml is None, "pyyaml not available")
@@ -100,3 +101,54 @@ class TestModule4ConfigSchemaCompat(unittest.TestCase):
         parsed = _load_config(path)
         m4 = parsed.module4_configs[0]
         self.assertAlmostEqual(m4.entry_threshold, 0.73)
+
+    def test_new_decision_layer_fields_validate(self) -> None:
+        cfg = self._base_cfg()
+        cfg["module4_configs"] = [
+            {
+                "window_selection_mode": "multi_window",
+                "fixed_window_index": 0,
+                "anchor_window_index": 1,
+                "max_volatility": 2.0,
+                "max_spread": 0.05,
+                "min_liquidity": 0.2,
+                "regime_confidence_min": 0.6,
+                "conviction_scale": 1.25,
+                "conviction_clip": 0.9,
+                "max_abs_weight": 0.8,
+                "enable_degraded_bridge_mode": True,
+            }
+        ]
+        path = self._write_cfg(cfg)
+        parsed = _load_config(path)
+        m4 = parsed.module4_configs[0]
+        self.assertEqual(m4.window_selection_mode, "multi_window")
+        self.assertAlmostEqual(m4.regime_confidence_min, 0.6)
+        self.assertAlmostEqual(m4.max_abs_weight, 0.8)
+
+    def test_runtime_and_loader_module4_schema_keys_match(self) -> None:
+        runtime_fields = set(Module4Config.__dataclass_fields__.keys())
+        loader_fields = set(type(_load_config(self._write_cfg(self._base_cfg())).module4_configs[0]).model_fields.keys())
+        self.assertEqual(runtime_fields, loader_fields)
+
+    def test_regime_classifier_fields_parse_with_locked_defaults(self) -> None:
+        cfg = self._base_cfg()
+        cfg["module4_configs"] = [
+            {
+                "trend_spread_min": 0.07,
+                "trend_poc_drift_min_abs": 0.42,
+                "neutral_poc_drift_max_abs": 0.12,
+                "shape_skew_min_abs": 0.5,
+                "regime_confidence_min": 0.66,
+                "eps": 1e-10,
+            }
+        ]
+        path = self._write_cfg(cfg)
+        parsed = _load_config(path)
+        m4 = parsed.module4_configs[0]
+        self.assertAlmostEqual(m4.trend_spread_min, 0.07)
+        self.assertAlmostEqual(m4.trend_poc_drift_min_abs, 0.42)
+        self.assertAlmostEqual(m4.neutral_poc_drift_max_abs, 0.12)
+        self.assertAlmostEqual(m4.shape_skew_min_abs, 0.5)
+        self.assertAlmostEqual(m4.regime_confidence_min, 0.66)
+        self.assertAlmostEqual(m4.eps, 1e-10)

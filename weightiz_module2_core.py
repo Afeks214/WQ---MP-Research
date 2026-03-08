@@ -40,9 +40,28 @@ from weightiz_module1_core import (
 )
 from weightiz_dtype_guard import assert_float64
 from weightiz_system_logger import get_logger, log_event
+from module2.market_profile_engine import (
+    build_code_hash,
+    build_config_signature,
+    build_dataset_hash,
+    build_spec_version,
+    load_golden_manifest,
+    run_streaming_profile_engine,
+    verify_golden_manifest,
+)
 
 
 SQRT_2PI: float = float(np.sqrt(2.0 * np.pi))
+
+
+def _worker_execution_forbidden() -> bool:
+    worker_process = str(os.environ.get("WEIGHTIZ_WORKER_PROCESS", "")).strip().lower() in {"1", "true", "yes"}
+    harness_override = str(os.environ.get("WEIGHTIZ_ALLOW_CANONICAL_HARNESS_MODULE2", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    return bool(worker_process and (not harness_override))
 
 
 def _nanmedian_silent(arr: np.ndarray, axis: Optional[int] = None) -> np.ndarray:
@@ -145,6 +164,18 @@ class Module2Config:
 
     # Runtime checks
     fail_on_non_finite_output: bool = True
+
+    # Revised architecture runtime controls (additive, backward-compatible).
+    storage_mode: str = "metrics_only"  # metrics_only | full_profile | forensic_windowed
+    parallel_backend: str = "serial"  # serial | process_pool
+    max_workers: int = 1
+    seed: int = 17
+    forensic_window_indices: tuple[int, ...] = ()
+    golden_required: bool = False
+    golden_manifest_path: str | None = None
+    golden_reference_path: str | None = None
+    spec_path: str | None = None
+    spec_id: str = "main-3"
 
 
 @dataclass
@@ -1026,7 +1057,7 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
     Invalid bars are neutralized deterministically at finalize:
     vp/vp_delta/scores = 0, profile_stats = 0 with IPOC/IVAH/IVAL anchored to x=0 bin.
     """
-    if str(os.environ.get("WEIGHTIZ_WORKER_PROCESS", "")).strip().lower() in {"1", "true", "yes"}:
+    if _worker_execution_forbidden():
         raise RuntimeError("MODULE2_WORKER_EXECUTION_FORBIDDEN")
     _validate_stage_a_inputs(state, cfg)
     assert_float64("module2.state.open_px", state.open_px)
@@ -1598,6 +1629,117 @@ def compute_profile_taxonomy_snapshot(
         out[:, int(DayTypeIdx.DOUBLE_DISTRIBUTION)] = dd
 
     return out
+
+
+# -----------------------------------------------------------------------------
+# Revised streaming adapter (public API preserved)
+# -----------------------------------------------------------------------------
+
+def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
+    """
+    Run the deterministic profile engine through the revised streaming backend.
+
+    Public contract remains unchanged:
+    - writes rvol, atr_floor, vp, vp_delta, profile_stats, scores in-place
+    - keeps worker execution guard
+    """
+    if _worker_execution_forbidden():
+        raise RuntimeError("MODULE2_WORKER_EXECUTION_FORBIDDEN")
+
+    _validate_stage_a_inputs(state, cfg)
+    assert_float64("module2.state.open_px", state.open_px)
+    assert_float64("module2.state.close_px", state.close_px)
+    assert_float64("module2.state.volume", state.volume)
+
+    t0_wall = time.perf_counter()
+
+    # Outputs may be frozen from a prior run; restore mutability for in-place writes.
+    state.vp.flags.writeable = True
+    state.vp_delta.flags.writeable = True
+    state.profile_stats.flags.writeable = True
+    state.scores.flags.writeable = True
+
+    physics = precompute_market_physics(state, cfg)
+    _, open_use, high_use, low_use, close_use, vol_use, valid = _build_canonical_use_arrays(state)
+
+    state.rvol[:, :] = physics.rvol
+    state.atr_floor[:, :] = physics.atr_eff
+
+    if bool(cfg.golden_required):
+        if not cfg.golden_manifest_path:
+            raise RuntimeError("GOLDEN_REPLAY_MANIFEST_REQUIRED")
+        dataset_hash = build_dataset_hash(
+            ts_ns=np.asarray(state.ts_ns, dtype=np.int64),
+            symbols=tuple(state.symbols),
+            arrays={
+                "open": open_use,
+                "high": high_use,
+                "low": low_use,
+                "close": close_use,
+                "volume": vol_use,
+            },
+        )
+        code_hash = build_code_hash(
+            [
+                str(Path(__file__).resolve()),
+                str((Path(__file__).resolve().parent / "module2" / "market_profile_engine.py").resolve()),
+                str((Path(__file__).resolve().parent / "module2" / "market_profile_kernels.py").resolve()),
+            ]
+        )
+        spec_version = build_spec_version(spec_path=cfg.spec_path, spec_id=str(cfg.spec_id))
+        cfg_sig = build_config_signature(cfg)
+        manifest = load_golden_manifest(cfg.golden_manifest_path)
+        verify_golden_manifest(
+            manifest=manifest,
+            dataset_hash=dataset_hash,
+            code_hash=code_hash,
+            spec_version=spec_version,
+            config_signature=cfg_sig,
+        )
+
+    mode = _engine_mode(state)
+    run_streaming_profile_engine(
+        state=state,
+        cfg=cfg,
+        physics=physics,
+        mode=mode,
+        open_use=open_use,
+        high_use=high_use,
+        low_use=low_use,
+        close_use=close_use,
+        vol_use=vol_use,
+        valid=valid,
+        build_poc_rank_fn=_build_poc_rank,
+        compute_value_area_fn=compute_value_area_greedy,
+        rolling_median_mad_fn=_rolling_median_mad_causal,
+        profile_stat_idx=ProfileStatIdx,
+        score_idx=ScoreIdx,
+        phase_enum=Phase,
+        collect_forensics=False,
+    )
+
+    _assert_finite("vp", state.vp)
+    _assert_finite("vp_delta", state.vp_delta)
+    assert_float64("module2.output.profile_stats", state.profile_stats)
+    assert_float64("module2.output.scores", state.scores)
+
+    elapsed = time.perf_counter() - t0_wall
+    logger = get_logger("module2")
+    log_event(
+        logger,
+        "INFO",
+        "module2_profile_complete",
+        event_type="module2_complete",
+        extra={
+            "elapsed_sec": float(elapsed),
+            "T": int(state.cfg.T),
+            "A": int(state.cfg.A),
+            "B": int(state.cfg.B),
+            "W": int(cfg.profile_window_bars),
+            "storage_mode": str(cfg.storage_mode),
+            "parallel_backend": str(cfg.parallel_backend),
+        },
+    )
 
 
 # -----------------------------------------------------------------------------

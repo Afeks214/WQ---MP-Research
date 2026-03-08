@@ -172,6 +172,27 @@ def test_pbo_accepts_n_trials_effective_and_reports_used_value():
     assert np.isfinite(float(out_neff["pbo"]))
 
 
+@pytest.mark.parametrize("n_trials_effective, expected", [(None, 8), (1, 1), (8, 8)])
+def test_pbo_effective_trial_semantics(n_trials_effective, expected):
+    rng = np.random.default_rng(1606)
+    r = rng.normal(0.0, 0.01, size=(300, 8)).astype(np.float64)
+
+    kwargs = {} if n_trials_effective is None else {"n_trials_effective": n_trials_effective}
+    out = pbo_cscv(r, S=10, k=5, **kwargs)
+
+    assert int(out["n_trials_effective_used"]) == expected
+    assert np.isfinite(float(out["pbo"]))
+
+
+@pytest.mark.parametrize("bad_value", [0, -1, 9, True, 2.5, np.array([2]), np.array([1, 2]), "3"])
+def test_pbo_rejects_invalid_effective_trial_count(bad_value):
+    rng = np.random.default_rng(1707)
+    r = rng.normal(0.0, 0.01, size=(300, 8)).astype(np.float64)
+
+    with pytest.raises(RuntimeError, match="n_trials_effective"):
+        pbo_cscv(r, S=10, k=5, n_trials_effective=bad_value)
+
+
 def test_run_full_stats_accepts_n_trials_effective():
     rng = np.random.default_rng(707)
     r = rng.normal(0.0002, 0.01, size=(360, 6)).astype(np.float64)
@@ -180,6 +201,30 @@ def test_run_full_stats_accepts_n_trials_effective():
 
     assert int(out["dsr"]["n_trials_effective"]) == 2
     assert int(out["pbo"]["n_trials_effective_used"]) == 2
+
+
+def test_run_full_stats_rejects_invalid_effective_trial_count():
+    rng = np.random.default_rng(808)
+    r = rng.normal(0.0002, 0.01, size=(360, 6)).astype(np.float64)
+    bmk = rng.normal(0.0001, 0.009, size=360).astype(np.float64)
+
+    with pytest.raises(RuntimeError, match="n_trials_effective"):
+        run_full_stats(r, bmk, n_trials_effective=7)
+
+
+def test_run_full_stats_determinism_preserved_with_effective_trial_override():
+    rng = np.random.default_rng(909)
+    r = rng.normal(0.0002, 0.01, size=(360, 6)).astype(np.float64)
+    bmk = rng.normal(0.0001, 0.009, size=360).astype(np.float64)
+
+    out_a = run_full_stats(r, bmk, n_trials_effective=2)
+    out_b = run_full_stats(r, bmk, n_trials_effective=2)
+
+    assert int(out_a["dsr"]["n_trials_effective"]) == 2
+    assert int(out_a["pbo"]["n_trials_effective_used"]) == 2
+    assert np.array_equal(np.asarray(out_a["dsr"]["dsr"]), np.asarray(out_b["dsr"]["dsr"]))
+    assert np.array_equal(np.asarray(out_a["pbo"]["lambda_logits"]), np.asarray(out_b["pbo"]["lambda_logits"]))
+    assert float(out_a["pbo"]["pbo"]) == float(out_b["pbo"]["pbo"])
 
 
 def test_wrc_spa_sanity_baseline_and_alpha_case():

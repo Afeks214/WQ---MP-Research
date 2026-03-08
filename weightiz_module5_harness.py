@@ -6,9 +6,14 @@ Validation harness and research orchestrator:
 - Pandas IO boundary for minute OHLCV ingestion/alignment.
 - Leakage-safe WF/CPCV split generation with purge+embargo.
 - Adversarial stress perturbations on cloned tensor states.
-- Deterministic orchestration of Module 2 -> Module 3 -> Module 4.
+- Deterministic orchestration of stressed state -> Module 2 -> Module 3 -> Module 4.
 - Close-to-close daily return compression for candidate equity (overnight PnL preserved).
 - Artifact export and statistical verdict wiring to Module 5 Part 1.
+
+Important truth surfaces:
+- Worker compute authority is the stressed cloned TensorState path.
+- The published feature tensor and shared-memory store are diagnostics/cache only.
+- Process-pool candidate splitting disables cross-candidate grouped reuse for post-M2/post-M3 caches.
 
 Architecture map:
 1) Split construction: `_generate_wf_splits`, `_generate_cpcv_splits`.
@@ -743,7 +748,9 @@ def _init_worker_context(
         "m3_configs": m3_configs,
         "m4_configs": m4_configs,
         "harness_cfg": harness_cfg,
-        "worker_feature_source": "shared_memory",
+        # The shared feature tensor is published for diagnostics/cache visibility only.
+        # Worker execution remains authoritative on the stressed cloned TensorState path.
+        "shared_feature_tensor_role": "diagnostics_cache_only",
         "feature_registry": feature_registry,
         "feature_handles": feature_handles,
         "run_id": str(run_id),
@@ -753,8 +760,6 @@ def _init_worker_context(
 def _run_group_task_from_context(group: _GroupTask) -> list[dict[str, Any]]:
     if _WORKER_CONTEXT is None:
         raise RuntimeError("Worker context not initialized")
-    if str(_WORKER_CONTEXT.get("worker_feature_source", "")) != "shared_memory":
-        raise RuntimeError("worker_feature_source must be shared_memory")
     return _run_group_task(
         group=group,
         base_state=_WORKER_CONTEXT["base_state"],
@@ -774,6 +779,34 @@ def _assert_finite(name: str, arr: np.ndarray) -> None:
         raise RuntimeError(f"{name} contains non-finite values at indices {bad.tolist()}")
 
 
+def _recompute_module2_on_stressed_state(state: TensorState, cfg: Module2Config) -> None:
+    env_key = "WEIGHTIZ_ALLOW_CANONICAL_HARNESS_MODULE2"
+    prev = os.environ.get(env_key)
+    os.environ[env_key] = "1"
+    try:
+        run_weightiz_profile_engine(state, cfg)
+    finally:
+        if prev is None:
+            os.environ.pop(env_key, None)
+        else:
+            os.environ[env_key] = prev
+
+    expected_profile_shape = (int(state.cfg.T), int(state.cfg.A), int(ProfileStatIdx.N_FIELDS))
+    expected_score_shape = (int(state.cfg.T), int(state.cfg.A), int(ScoreIdx.N_FIELDS))
+    if tuple(np.asarray(state.profile_stats).shape) != expected_profile_shape:
+        raise RuntimeError(
+            f"stressed module2 profile_stats shape mismatch: got {np.asarray(state.profile_stats).shape}, "
+            f"expected {expected_profile_shape}"
+        )
+    if tuple(np.asarray(state.scores).shape) != expected_score_shape:
+        raise RuntimeError(
+            f"stressed module2 scores shape mismatch: got {np.asarray(state.scores).shape}, "
+            f"expected {expected_score_shape}"
+        )
+    assert_float64("harness.stressed_module2.profile_stats", np.asarray(state.profile_stats, dtype=np.float64))
+    assert_float64("harness.stressed_module2.scores", np.asarray(state.scores, dtype=np.float64))
+
+
 def _clone_state(state: TensorState) -> TensorState:
     # Deep copy preserves strict immutability of base_state across workers/tasks.
     return copy.deepcopy(state)
@@ -781,6 +814,14 @@ def _clone_state(state: TensorState) -> TensorState:
 
 def _clone_m3(m3: Module3Output) -> Module3Output:
     return Module3Output(
+        structure_tensor=m3.structure_tensor.copy(),
+        context_tensor=m3.context_tensor.copy(),
+        profile_fingerprint_tensor=m3.profile_fingerprint_tensor.copy(),
+        profile_regime_tensor=m3.profile_regime_tensor.copy(),
+        context_valid_atw=None if m3.context_valid_atw is None else m3.context_valid_atw.copy(),
+        context_source_index_atw=(
+            None if m3.context_source_index_atw is None else m3.context_source_index_atw.copy()
+        ),
         block_id_t=m3.block_id_t.copy(),
         block_seq_t=m3.block_seq_t.copy(),
         block_end_flag_t=m3.block_end_flag_t.copy(),
@@ -1697,6 +1738,35 @@ def _apply_pre_m4_invariants(state: TensorState, m3: Module3Output) -> list[str]
     state.bar_valid[:, :] = updated_bar
     _set_placeholders_from_bar_valid(state)
 
+    valid_at = np.asarray(state.bar_valid, dtype=bool).T
+    updated_m3_at, m3_flags = assert_or_flag_finite(
+        features={
+            "structure_tensor": np.asarray(m3.structure_tensor, dtype=np.float64),
+            "context_tensor": np.asarray(m3.context_tensor, dtype=np.float64),
+            "profile_fingerprint_tensor": np.asarray(m3.profile_fingerprint_tensor, dtype=np.float64),
+            "profile_regime_tensor": np.asarray(m3.profile_regime_tensor, dtype=np.float64),
+        },
+        valid_mask=valid_at,
+        context="pre_m4_m3_window",
+    )
+    if int(m3_flags.get("invalid_count", 0)) > 0:
+        reasons.append("INVARIANT_PRE_M4_M3_WINDOW_NONFINITE")
+    state.bar_valid[:, :] = np.asarray(state.bar_valid, dtype=bool) & updated_m3_at.T
+    _set_placeholders_from_bar_valid(state)
+    valid_at = np.asarray(state.bar_valid, dtype=bool).T
+    m3.structure_tensor[:, :, :, :] = np.where(valid_at[:, :, None, None], m3.structure_tensor, 0.0)
+    m3.context_tensor[:, :, :, :] = np.where(valid_at[:, :, None, None], m3.context_tensor, 0.0)
+    m3.profile_fingerprint_tensor[:, :, :, :] = np.where(
+        valid_at[:, :, None, None],
+        m3.profile_fingerprint_tensor,
+        0.0,
+    )
+    m3.profile_regime_tensor[:, :, :, :] = np.where(valid_at[:, :, None, None], m3.profile_regime_tensor, 0.0)
+    if m3.context_valid_atw is not None:
+        m3.context_valid_atw[:, :, :] = np.where(valid_at[:, :, None], m3.context_valid_atw, False)
+    if m3.context_source_index_atw is not None:
+        m3.context_source_index_atw[:, :, :] = np.where(valid_at[:, :, None], m3.context_source_index_atw, -1)
+
     updated_ctx, ctx_flags = assert_or_flag_finite(
         features={"context_tac": np.asarray(m3.context_tac, dtype=np.float64)},
         valid_mask=np.asarray(m3.context_valid_ta, dtype=bool),
@@ -2091,8 +2161,13 @@ def _split_group_tasks_by_candidate(
 ) -> list[_GroupTask]:
     """
     Deterministic process-pool chunking:
-    split large grouped candidate batches into fixed-size chunks so
-    progress/checkpoints advance earlier under heavy compute.
+    split grouped candidate batches into fixed-size chunks for simpler payloads,
+    earlier checkpoints, and stronger failure isolation.
+
+    Important truth surface:
+    when process-pool mode uses candidate-sized chunks, cross-candidate reuse of
+    the stressed post-M2/post-M3 cache is not active for that execution mode.
+    Serial mode retains grouped reuse inside a _GroupTask.
     """
     n = int(max(1, chunk_size))
     out: list[_GroupTask] = []
@@ -2481,7 +2556,9 @@ def _run_group_task(
     )
     rng = np.random.default_rng(group_seed)
 
-    # Build post-M3 cache for this (split, scenario, m2, m3) key.
+    # Build the stressed post-M2/post-M3 cache for this concrete group unit.
+    # Candidate execution authority is the stressed cloned TensorState, not the
+    # shared diagnostics feature tensor published by the parent process.
     cached_state = _clone_state(base_state)
     active_t = _apply_split_domain_mask(cached_state, split)
 
@@ -2495,6 +2572,7 @@ def _run_group_task(
         _assert_active_domain_ohlc(cached_state, active_t)
         _validate_loaded_market_slice_active_domain(cached_state, active_t)
 
+    _recompute_module2_on_stressed_state(cached_state, m2_configs[group.m2_idx])
     post_m2_reasons = _apply_post_m2_invariants(cached_state, active_t)
     m3_out_cached = run_module3_structural_aggregation(cached_state, m3_configs[group.m3_idx])
     post_m3_reasons = _apply_post_m3_invariants(m3_out_cached)
@@ -2660,6 +2738,9 @@ def _run_group_task(
                     "session_ids": sess_ids,
                     "session_ids_exec": sess_ids,
                     "session_ids_raw": sess_ids_raw,
+                    # Compatibility contract: daily_returns remains execution-adjusted.
+                    # The explicit execution-adjusted alias is daily_returns_exec.
+                    # The raw no-latency/no-extra-friction series is daily_returns_raw.
                     "daily_returns": daily_ret_exec,
                     "daily_returns_exec": daily_ret_exec,
                     "daily_returns_raw": daily_ret_raw,
@@ -2772,6 +2853,12 @@ def _write_json(path: Path, obj: Any) -> None:
         json.dump(_to_jsonable(obj), f, ensure_ascii=False, indent=2)
 
 
+def _write_frozen_module5_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(_to_jsonable(obj), f, ensure_ascii=False, indent=2, sort_keys=True)
+
+
 def _atomic_write_parquet(df: Any, path: Path) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     df.to_parquet(tmp, index=False)
@@ -2847,7 +2934,9 @@ def _apply_latency_to_target_qty(target_qty_ta: np.ndarray, latency_bars: int) -
 
 def _resample_returns_horizon(returns_1d: np.ndarray, horizon: int) -> np.ndarray:
     r = np.asarray(returns_1d, dtype=np.float64)
-    h = int(max(1, horizon))
+    h = int(horizon)
+    if h <= 0:
+        raise RuntimeError(f"horizon must be >=1, got {h}")
     if r.size == 0:
         return np.zeros(0, dtype=np.float64)
     if h == 1:
@@ -3187,6 +3276,65 @@ def _aggregate_candidate_baseline_matrix(
     return common, mat_exec, bmk, baseline_ids, series_exec
 
 
+def _validate_institutional_harness_config(harness_cfg: Module5HarnessConfig) -> None:
+    if not (0.0 <= float(harness_cfg.cluster_corr_threshold) <= 1.0):
+        raise RuntimeError(f"cluster_corr_threshold must be in [0,1], got {harness_cfg.cluster_corr_threshold}")
+    if int(harness_cfg.cluster_distance_block_size) < 1:
+        raise RuntimeError(
+            f"cluster_distance_block_size must be >=1, got {int(harness_cfg.cluster_distance_block_size)}"
+        )
+    if int(harness_cfg.cluster_distance_in_memory_max_n) < 1:
+        raise RuntimeError(
+            "cluster_distance_in_memory_max_n must be >=1, "
+            f"got {int(harness_cfg.cluster_distance_in_memory_max_n)}"
+        )
+    if float(harness_cfg.execution_transaction_cost_per_trade) < 0.0:
+        raise RuntimeError("execution_transaction_cost_per_trade must be >=0")
+    if float(harness_cfg.execution_slippage_mult) < 0.0:
+        raise RuntimeError("execution_slippage_mult must be >=0")
+    if float(harness_cfg.execution_extra_slippage_bps) < 0.0:
+        raise RuntimeError("execution_extra_slippage_bps must be >=0")
+    if int(harness_cfg.execution_latency_bars) < 0:
+        raise RuntimeError("execution_latency_bars must be >=0")
+    if int(harness_cfg.regime_vol_window) < 2:
+        raise RuntimeError("regime_vol_window must be >=2")
+    if int(harness_cfg.regime_slope_window) < 2:
+        raise RuntimeError("regime_slope_window must be >=2")
+    if int(harness_cfg.regime_hurst_window) < 8:
+        raise RuntimeError("regime_hurst_window must be >=8")
+    if int(harness_cfg.regime_min_obs_per_mask) < 1:
+        raise RuntimeError("regime_min_obs_per_mask must be >=1")
+    if len(harness_cfg.horizon_minutes) == 0:
+        raise RuntimeError("horizon_minutes must be non-empty")
+    seen: set[int] = set()
+    for value in harness_cfg.horizon_minutes:
+        if isinstance(value, (bool, np.bool_)):
+            raise RuntimeError("horizon_minutes entries must be positive integers")
+        horizon = int(value)
+        if horizon <= 0:
+            raise RuntimeError(f"horizon_minutes entries must be >0, got {horizon}")
+        if horizon in seen:
+            raise RuntimeError(f"horizon_minutes must not contain duplicates, got {horizon}")
+        seen.add(horizon)
+    weights = {
+        "robustness_weight_dsr": float(harness_cfg.robustness_weight_dsr),
+        "robustness_weight_pbo": float(harness_cfg.robustness_weight_pbo),
+        "robustness_weight_spa": float(harness_cfg.robustness_weight_spa),
+        "robustness_weight_regime": float(harness_cfg.robustness_weight_regime),
+        "robustness_weight_execution": float(harness_cfg.robustness_weight_execution),
+        "robustness_weight_horizon": float(harness_cfg.robustness_weight_horizon),
+    }
+    for name, value in weights.items():
+        if not (0.0 <= value <= 1.0):
+            raise RuntimeError(f"{name} must be in [0,1], got {value}")
+    if abs(sum(weights.values()) - 1.0) > 1e-12:
+        raise RuntimeError("robustness weights must sum to 1.0 within tolerance 1e-12")
+    if not (0.0 <= float(harness_cfg.robustness_reject_threshold) <= 1.0):
+        raise RuntimeError("robustness_reject_threshold must be in [0,1]")
+    if not (0.0 <= float(harness_cfg.execution_fragile_threshold) <= 1.0):
+        raise RuntimeError("execution_fragile_threshold must be in [0,1]")
+
+
 def _compute_stats_verdict(
     daily_returns_matrix_exec: np.ndarray,
     daily_returns_matrix_raw: np.ndarray,
@@ -3292,9 +3440,7 @@ def _compute_stats_verdict(
     regime_robustness = float(np.mean(np.asarray(regime_scores, dtype=np.float64))) if regime_scores else 0.5
 
     # Multi-horizon validation on representative strategies.
-    horizon_list = [int(h) for h in harness_cfg.horizon_minutes if int(h) > 0]
-    if not horizon_list:
-        horizon_list = [1]
+    horizon_list = [int(h) for h in harness_cfg.horizon_minutes]
     horizon_details: dict[str, Any] = {}
     horizon_scores: list[float] = []
     for h in horizon_list:
@@ -3350,6 +3496,9 @@ def _compute_stats_verdict(
     rep_pos_by_col = {int(col): int(i) for i, col in enumerate(cluster_reps.tolist())}
 
     leaderboard: list[dict[str, Any]] = []
+    # Representative-level validation metrics are projected deterministically to
+    # every member of the same execution-return cluster. Cluster members therefore
+    # share the representative's verdict fields by contract.
     for j, cid in enumerate(candidate_ids):
         cidx = int(j)
         cl_id = int(cluster_labels[cidx]) if cidx < cluster_labels.size else int(cidx)
@@ -3389,6 +3538,7 @@ def _compute_stats_verdict(
                 "pass": pass_flag,
             }
         )
+    leaderboard = sorted(leaderboard, key=lambda x: str(x["candidate_id"]))
 
     return {
         "dsr": dsr,
@@ -3892,6 +4042,8 @@ def run_weightiz_harness(
     if len(m2_configs) != 1:
         raise RuntimeError("ARCHITECTURE_CONSISTENCY_FAILURE: canonical path requires exactly one module2 config")
 
+    _validate_institutional_harness_config(harness_cfg)
+
     run_started_utc = datetime.now(timezone.utc)
     run_id = run_started_utc.strftime("run_%Y%m%d_%H%M%S")
     report_root = Path(harness_cfg.report_dir).resolve() / run_id
@@ -3970,22 +4122,12 @@ def run_weightiz_harness(
         feature_manifest = asdict(feature_manifest_obj)
 
     validate_feature_tensor_contract(feature_tensor, feature_manifest)
-    try:
-        compute_window_correlation_diagnostics(
-            feature_tensor,
-            feature_map={str(k): int(v) for k, v in feature_manifest.get("feature_map", {}).items()},
-            window_map={str(k): int(v) for k, v in feature_manifest.get("window_map", {}).items()},
-            run_dir=report_root,
-        )
-    except RuntimeError as exc:
-        if "WINDOW_STATISTICAL_LEAKAGE_ABORT" not in str(exc):
-            raise
-        log_event(
-            logger,
-            "WARNING",
-            "window_statistical_leakage_abort_overridden",
-            event_type="window_leakage_override",
-        )
+    compute_window_correlation_diagnostics(
+        feature_tensor,
+        feature_map={str(k): int(v) for k, v in feature_manifest.get("feature_map", {}).items()},
+        window_map={str(k): int(v) for k, v in feature_manifest.get("window_map", {}).items()},
+        run_dir=report_root,
+    )
     tensor_bytes = estimate_tensor_bytes(*feature_tensor.shape)
     avail_ram = _available_memory_bytes()
     enforce_memory_safety(tensor_bytes, avail_ram)
@@ -4082,6 +4224,14 @@ def run_weightiz_harness(
                 "tasks_total": int(tasks_submitted),
                 "failures_so_far": int(failure_count),
                 "elapsed_seconds": float(elapsed),
+                "compute_authority": compute_authority,
+                "feature_tensor_role": feature_tensor_role,
+                "execution_topology": {
+                    "mode": str(execution_mode_now),
+                    "process_pool_candidate_split": bool(use_process_pool),
+                    "grouped_post_m2_reuse_active": bool(not use_process_pool),
+                    "grouped_post_m3_reuse_active": bool(not use_process_pool),
+                },
                 "updated_utc": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -4115,6 +4265,18 @@ def run_weightiz_harness(
     )
     progress_interval_seconds = int(max(1, harness_cfg.progress_interval_seconds))
     last_progress_log = time.perf_counter()
+    feature_tensor_role = {
+        "role": "diagnostics_cache_only",
+        "shared_memory_published": True,
+        "used_in_worker_compute": False,
+    }
+    compute_authority = {
+        "candidate_execution_authority": "stressed_tensor_state",
+        "module2_authority": "recomputed_on_stressed_state",
+        "module3_authority": "stressed_state_post_module2",
+        "module4_authority": "stressed_state_plus_module3_output",
+        "risk_engine_signal_authority": "module4_signal_output.target_qty_ta",
+    }
     _write_run_status_checkpoint("running", execution_mode)
 
     def _maybe_emit_progress(active_workers: int) -> None:
@@ -4134,7 +4296,10 @@ def run_weightiz_harness(
                 "strategies_completed": int(tasks_completed),
                 "workers_active": int(active_workers),
                 "avg_strategy_time_sec": float(avg_strategy_time),
-                "shm_memory_usage_gb": float(shm_mem_gb),
+                "diagnostic_feature_tensor_memory_gb": float(shm_mem_gb),
+                "feature_tensor_worker_role": str(feature_tensor_role["role"]),
+                "grouped_post_m2_reuse_active": bool(not use_process_pool),
+                "grouped_post_m3_reuse_active": bool(not use_process_pool),
                 "elapsed_runtime_sec": float(elapsed),
             },
         )
@@ -4362,6 +4527,37 @@ def run_weightiz_harness(
                 "quick_run_stats_error": f"{type(exc).__name__}: {exc}",
             }
         elif not aborted:
+            if not first_exception_class:
+                first_exception_class = type(exc).__name__
+                first_exception_message = str(exc)
+                first_exception_hash = _error_hash(first_exception_class, first_exception_message)
+            _write_json(
+                run_status_path,
+                {
+                    "run_id": run_id,
+                    "phase": "failed_pre_aggregation",
+                    "execution_mode": str(execution_mode),
+                    "groups_done": int(groups_completed),
+                    "groups_total": int(len(group_tasks)),
+                    "tasks_done": int(tasks_completed),
+                    "tasks_total": int(tasks_submitted),
+                    "failures_so_far": int(failure_count),
+                    "compute_authority": compute_authority,
+                    "feature_tensor_role": feature_tensor_role,
+                    "execution_topology": {
+                        "mode": str(execution_mode),
+                        "process_pool_candidate_split": bool(use_process_pool),
+                        "grouped_post_m2_reuse_active": bool(not use_process_pool),
+                        "grouped_post_m3_reuse_active": bool(not use_process_pool),
+                    },
+                    "updated_utc": datetime.now(timezone.utc).isoformat(),
+                    "first_exception": {
+                        "class": first_exception_class,
+                        "message": first_exception_message,
+                        "error_hash": first_exception_hash,
+                    },
+                },
+            )
             raise
         else:
             if not first_exception_class:
@@ -4405,6 +4601,12 @@ def run_weightiz_harness(
             "scenario_id": r.get("scenario_id"),
             "status": r.get("status"),
             "error": r.get("error", ""),
+            "session_ids": r.get("session_ids"),
+            "session_ids_exec": r.get("session_ids_exec"),
+            "session_ids_raw": r.get("session_ids_raw"),
+            "daily_returns": r.get("daily_returns"),
+            "daily_returns_exec": r.get("daily_returns_exec"),
+            "daily_returns_raw": r.get("daily_returns_raw"),
             "m2_idx": r.get("m2_idx"),
             "m3_idx": r.get("m3_idx"),
             "m4_idx": r.get("m4_idx"),
@@ -4479,7 +4681,12 @@ def run_weightiz_harness(
     daily_df = pdx.DataFrame(daily_cols)
     daily_df.to_parquet(daily_path, index=False)
 
-    _write_json(stats_raw_path, stats_verdict)
+    stats_verdict_to_write = dict(stats_verdict)
+    stats_verdict_to_write["leaderboard"] = sorted(
+        list(stats_verdict.get("leaderboard", [])),
+        key=lambda x: str(x.get("candidate_id", "")),
+    )
+    _write_frozen_module5_json(stats_raw_path, stats_verdict_to_write)
 
     if bool(harness_cfg.export_micro_diagnostics):
         micro_df.to_parquet(micro_diag_path, index=False)
@@ -4566,11 +4773,14 @@ def run_weightiz_harness(
                 "fragile": bool(lb.get("fragile", False)),
             }
         )
+    validation_rows = sorted(validation_rows, key=lambda x: str(x["strategy_id"]))
     validation_report_path = report_root / "validation_report.json"
-    _write_json(validation_report_path, validation_rows)
+    _write_frozen_module5_json(validation_report_path, validation_rows)
+    # Canonical latest validation_report path is deterministic: the run-scoped
+    # report is copied to the fixed parent-level latest path on every successful run.
     canonical_root = report_root.parent.parent if report_root.parent.name == "module5_harness" else report_root.parent
     canonical_validation_report_path = canonical_root / "validation_report.json"
-    _write_json(canonical_validation_report_path, validation_rows)
+    _write_frozen_module5_json(canonical_validation_report_path, validation_rows)
 
     _ledger_write(
         _collect_ledger_rows_from_results(
@@ -4619,6 +4829,14 @@ def run_weightiz_harness(
             "progress_every_groups": int(quick_settings.progress_every_groups),
             "baseline_only": bool(quick_settings.baseline_only),
             "disable_cpcv": bool(quick_settings.disable_cpcv),
+        },
+        "compute_authority": compute_authority,
+        "feature_tensor_role": feature_tensor_role,
+        "execution_topology": {
+            "mode": str(execution_mode),
+            "process_pool_candidate_split": bool(use_process_pool),
+            "grouped_post_m2_reuse_active": bool(not use_process_pool),
+            "grouped_post_m3_reuse_active": bool(not use_process_pool),
         },
     }
     _write_json(run_status_path, run_status)
@@ -4678,6 +4896,14 @@ def run_weightiz_harness(
         "payload_safe": bool(payload_safe),
         "payload_arg_max_bytes": int(payload_arg_max_bytes),
         "large_payload_passing_avoided": bool(large_payload_passing_avoided),
+        "compute_authority": compute_authority,
+        "feature_tensor_role": feature_tensor_role,
+        "execution_topology": {
+            "mode": str(execution_mode),
+            "process_pool_candidate_split": bool(use_process_pool),
+            "grouped_post_m2_reuse_active": bool(not use_process_pool),
+            "grouped_post_m3_reuse_active": bool(not use_process_pool),
+        },
         "robustness_score": {
             "formula": "0.20*dsr+0.15*(1-pbo)+0.10*(1-spa_p)+0.20*regime+0.20*execution+0.15*horizon",
             "dsr_source": "cluster_representative_exec",
@@ -4708,6 +4934,8 @@ def run_weightiz_harness(
             "shape": list(feature_tensor.shape),
             "dtype": str(feature_tensor.dtype),
             "hash": str(tensor_hash),
+            "compute_authoritative": False,
+            "worker_role": "diagnostics_cache_only",
         },
         "micro_diagnostics": {
             "enabled": bool(harness_cfg.export_micro_diagnostics),

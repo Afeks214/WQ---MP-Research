@@ -15,6 +15,7 @@ from weightiz_dtype_guard import assert_float64
 class RuntimeMonitor:
     run_id: str
     run_dir: Path
+    # Diagnostics/cache tensor only; this monitor does not imply worker compute authority.
     expected_tensor_shape: tuple[int, int, int, int]
     expected_worker_count: int
     health_check_interval: int = 50
@@ -101,7 +102,8 @@ class RuntimeMonitor:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "run_id": str(self.run_id),
             "strategies_completed": int(strategies_completed),
-            "tensor_valid": bool(tensor_valid),
+            "diagnostic_feature_tensor_valid": bool(tensor_valid),
+            "diagnostic_feature_tensor_role": "diagnostics_cache_only",
             "worker_status": worker_status,
             "ledger_status": ledger_status,
             "memory_status": memory_status,

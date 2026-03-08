@@ -305,9 +305,7 @@ def deflated_sharpe_ratio(
     if n_trials is None:
         n_eff = effective_num_trials_from_corr(r, min_trials=1, eps=eps)
     else:
-        n_eff = int(n_trials)
-        if n_eff < 1:
-            raise RuntimeError(f"n_trials must be >=1, got {n_eff}")
+        n_eff = _validate_effective_trial_count(n_trials, N=N)
 
     emz = expected_max_z(n_eff)
     sr_mean = float(np.mean(sr_daily))
@@ -377,6 +375,30 @@ def build_cscv_incidence(S: int = 10, k: int = 5) -> np.ndarray:
     return inc
 
 
+def _validate_effective_trial_count(n_trials_effective: Any, *, N: int) -> int:
+    if np.ndim(n_trials_effective) != 0:
+        raise RuntimeError("n_trials_effective must be a scalar integer-like value")
+    if isinstance(n_trials_effective, (bool, np.bool_)):
+        raise RuntimeError("n_trials_effective must not be bool")
+
+    scalar = np.asarray(n_trials_effective)
+    if np.issubdtype(scalar.dtype, np.integer):
+        n_eff = int(scalar)
+    elif np.issubdtype(scalar.dtype, np.floating):
+        value = float(scalar)
+        if not np.isfinite(value) or not float(value).is_integer():
+            raise RuntimeError("n_trials_effective must be integer-like")
+        n_eff = int(value)
+    else:
+        raise RuntimeError("n_trials_effective must be integer-like")
+
+    if n_eff <= 0:
+        raise RuntimeError(f"n_trials_effective must be >=1, got {n_eff}")
+    if n_eff > int(N):
+        raise RuntimeError(f"n_trials_effective must be <= candidate count N={int(N)}, got {n_eff}")
+    return int(n_eff)
+
+
 def pbo_cscv(
     returns_matrix: np.ndarray,
     S: int = 10,
@@ -404,10 +426,7 @@ def pbo_cscv(
     if n_trials_effective is None:
         n_eff_used = int(N)
     else:
-        n_eff_raw = int(n_trials_effective)
-        if n_eff_raw < 1:
-            raise RuntimeError(f"n_trials_effective must be >=1, got {n_eff_raw}")
-        n_eff_used = int(max(1, min(N, n_eff_raw)))
+        n_eff_used = _validate_effective_trial_count(n_trials_effective, N=N)
 
     s_int = int(S)
     k_int = int(k)

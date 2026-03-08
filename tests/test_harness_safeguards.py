@@ -204,9 +204,15 @@ class TestHarnessSafeguards(unittest.TestCase):
         cfg["harness"]["parallel_backend"] = "process_pool"
         cfg["harness"]["parallel_workers"] = 2
 
-        _, summary = self._run_cfg(cfg)
+        run_dir, summary = self._run_cfg(cfg)
         self.assertTrue(bool(summary.get("payload_safe", False)))
         self.assertTrue(bool(summary.get("large_payload_passing_avoided", False)))
+        manifest = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
+        self.assertIn("compute_authority", manifest)
+        self.assertEqual(
+            manifest["feature_tensor_role"]["role"],
+            "diagnostics_cache_only",
+        )
 
 
 if __name__ == "__main__":
