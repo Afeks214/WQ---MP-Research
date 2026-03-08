@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
-import hashlib
 import json
 import logging
 import os
@@ -67,6 +65,11 @@ from app.config_builders import (
     build_module4_configs as _cfg_build_module4_configs,
     build_stress_scenarios as _cfg_build_stress_scenarios,
     resolve_tick_size as _cfg_resolve_tick_size,
+)
+from app.runtime_support import (
+    append_run_registry as _runtime_append_run_registry,
+    ensure_dashboard_handoff as _runtime_ensure_dashboard_handoff,
+    resolved_config_sha256 as _runtime_resolved_config_sha256,
 )
 
 
@@ -213,47 +216,23 @@ def _append_run_registry(
     pass_count: int,
     resolved_config_sha256: str,
 ) -> None:
-    artifacts_root.mkdir(parents=True, exist_ok=True)
-
-    entry = {
-        "run_id": run_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "path": str(run_dir.resolve()),
-        "symbols": symbols,
-        "n_candidates": int(n_candidates),
-        "pass_count": int(pass_count),
-        "resolved_config_sha256": str(resolved_config_sha256),
-    }
-
-    index_path = artifacts_root / "run_index.jsonl"
-    with index_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-    latest_path = artifacts_root / ".latest_run"
-    latest_path.write_text(str(run_dir.resolve()) + "\n", encoding="utf-8")
+    return _runtime_append_run_registry(
+        artifacts_root=artifacts_root,
+        run_id=run_id,
+        run_dir=run_dir,
+        symbols=symbols,
+        n_candidates=n_candidates,
+        pass_count=pass_count,
+        resolved_config_sha256=resolved_config_sha256,
+    )
 
 
 def _resolved_config_sha256(cfg: RunConfigModel) -> str:
-    payload = cfg.model_dump(mode="json")
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
+    return _runtime_resolved_config_sha256(cfg)
 
 
 def _ensure_dashboard_handoff(artifacts_root: Path, run_dir: Path) -> Path:
-    module5_root = artifacts_root / "module5_harness"
-    module5_root.mkdir(parents=True, exist_ok=True)
-    target = module5_root / run_dir.name
-    if target.resolve() == run_dir.resolve():
-        return target
-    if target.exists() or target.is_symlink():
-        return target
-    try:
-        target.symlink_to(run_dir.resolve(), target_is_directory=True)
-    except Exception:
-        # Fallback: create directory marker with absolute pointer.
-        target.mkdir(parents=True, exist_ok=True)
-        (target / ".run_path").write_text(str(run_dir.resolve()) + "\n", encoding="utf-8")
-    return target
+    return _runtime_ensure_dashboard_handoff(artifacts_root, run_dir)
 
 
 def _load_config(path: Path) -> RunConfigModel:
