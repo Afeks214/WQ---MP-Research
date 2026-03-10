@@ -55,6 +55,22 @@ try:
 except Exception:  # pragma: no cover - runtime guard
     pd = None  # type: ignore[assignment]
 
+_MANIFEST_REQUIRED_KEYS = (
+    "git_commit",
+    "config_hash",
+    "dataset_hash",
+    "search_seed",
+    "asset_count",
+    "strategy_count",
+    "runtime_seconds",
+    "start_time",
+    "end_time",
+)
+_MANIFEST_TRUTH_SURFACES = (
+    "dataset_hash",
+    "feature_tensor",
+)
+
 from module5.harness.aggregation import (
     aggregate_candidate_baseline_matrices as _aggregation_aggregate_candidate_baseline_matrices,
     aggregate_candidate_baseline_matrix as _aggregation_aggregate_candidate_baseline_matrix,
@@ -119,6 +135,22 @@ from module5.harness.ingestion import (
     ingest_master_aligned as _ingest_ingest_master_aligned,
     load_asset_frame as _ingest_load_asset_frame,
     validate_utc_minute_index as _ingest_validate_utc_minute_index,
+)
+from module5.harness.metrics_support import (
+    apply_latency_to_target_qty as _metrics_apply_latency_to_target_qty,
+    asset_notional_concentration_from_trade_payloads as _metrics_asset_notional_concentration_from_trade_payloads,
+    asset_pnl_concentration_from_result_rows as _metrics_asset_pnl_concentration_from_result_rows,
+    clip01 as _metrics_clip01,
+    cum_return as _metrics_cum_return,
+    effective_benchmark_for_horizon as _metrics_effective_benchmark_for_horizon,
+    extract_final_equity as _metrics_extract_final_equity,
+    margin_exposure_stats_from_equity_payloads as _metrics_margin_exposure_stats_from_equity_payloads,
+    max_drawdown_from_returns as _metrics_max_drawdown_from_returns,
+    resample_returns_horizon as _metrics_resample_returns_horizon,
+    sharpe_daily as _metrics_sharpe_daily,
+    slice_score_from_stats as _metrics_slice_score_from_stats,
+    trade_count_from_payload as _metrics_trade_count_from_payload,
+    turnover_from_trade_payload as _metrics_turnover_from_trade_payload,
 )
 from module5.harness.invariants import (
     apply_enabled_assets as _inv_apply_enabled_assets,
@@ -226,6 +258,7 @@ ROBUSTNESS_CAPS: dict[str, float] = {
 @dataclass(frozen=True)
 class Module5HarnessConfig:
     seed: int = 97
+    research_mode: str = "standard"
     timezone: str = "America/New_York"
     freq: str = "1min"
     min_asset_coverage: float = 0.80
@@ -1481,173 +1514,59 @@ def _collect_ledger_rows_from_results(rows: list[dict[str, Any]], evaluation_tim
 
 
 def _clip01(x: float) -> float:
-    if not np.isfinite(x):
-        return 1.0
-    return float(min(max(float(x), 0.0), 1.0))
+    return _metrics_clip01(x)
 
 
 def _apply_latency_to_target_qty(target_qty_ta: np.ndarray, latency_bars: int) -> np.ndarray:
-    tgt = np.asarray(target_qty_ta, dtype=np.float64)
-    if tgt.ndim != 2:
-        raise RuntimeError(f"target_qty_ta must be 2D, got ndim={tgt.ndim}")
-    lag = int(max(0, latency_bars))
-    if lag <= 0:
-        return tgt.copy()
-    t, a = tgt.shape
-    out = np.zeros((t, a), dtype=np.float64)
-    if lag < t:
-        out[lag:, :] = tgt[:-lag, :]
-    return out
+    return _metrics_apply_latency_to_target_qty(target_qty_ta, latency_bars)
 
 
 def _resample_returns_horizon(returns_1d: np.ndarray, horizon: int) -> np.ndarray:
-    r = np.asarray(returns_1d, dtype=np.float64)
-    h = int(horizon)
-    if h <= 0:
-        raise RuntimeError(f"horizon must be >=1, got {h}")
-    if r.size == 0:
-        return np.zeros(0, dtype=np.float64)
-    if h == 1:
-        return r.copy()
-    n = int(r.size // h)
-    if n <= 0:
-        return np.zeros(0, dtype=np.float64)
-    x = r[: n * h].reshape(n, h)
-    return np.prod(1.0 + x, axis=1) - 1.0
+    return _metrics_resample_returns_horizon(returns_1d, horizon)
 
 
 def _slice_score_from_stats(dsr: dict[str, Any], pbo: dict[str, Any], spa: dict[str, Any]) -> float:
-    dsr_arr = np.asarray(dsr.get("dsr", np.zeros(0, dtype=np.float64)), dtype=np.float64)
-    dsr_score = _clip01(float(np.mean(dsr_arr))) if dsr_arr.size > 0 else 0.5
-    pbo_val = float(pbo.get("pbo", np.nan))
-    pbo_score = _clip01(1.0 - pbo_val) if np.isfinite(pbo_val) else 0.5
-    spa_p = float(spa.get("p_value", np.nan))
-    spa_score = _clip01(1.0 - spa_p) if np.isfinite(spa_p) else 0.5
-    return float((dsr_score + pbo_score + spa_score) / 3.0)
+    return _metrics_slice_score_from_stats(dsr, pbo, spa)
 
 
 def _effective_benchmark_for_horizon(benchmark: np.ndarray, horizon: int) -> np.ndarray:
-    return _resample_returns_horizon(np.asarray(benchmark, dtype=np.float64), horizon=int(horizon))
+    return _metrics_effective_benchmark_for_horizon(benchmark, horizon)
 
 
 def _cum_return(ret_1d: np.ndarray) -> float:
-    r = np.asarray(ret_1d, dtype=np.float64)
-    if r.size == 0:
-        return 0.0
-    return float(np.prod(1.0 + r) - 1.0)
+    return _metrics_cum_return(ret_1d)
 
 
 def _max_drawdown_from_returns(ret_1d: np.ndarray) -> float:
-    r = np.asarray(ret_1d, dtype=np.float64)
-    if r.size == 0:
-        return 0.0
-    eq = np.cumprod(1.0 + r)
-    peak = np.maximum.accumulate(eq)
-    dd = np.where(peak > 0.0, eq / peak - 1.0, 0.0)
-    return float(abs(np.min(dd)))
+    return _metrics_max_drawdown_from_returns(ret_1d)
 
 
 def _sharpe_daily(ret_1d: np.ndarray, eps: float = 1e-12) -> float:
-    r = np.asarray(ret_1d, dtype=np.float64)
-    if r.size < 2:
-        return 0.0
-    mu = float(np.mean(r))
-    sd = float(np.std(r, ddof=1))
-    return float(mu / (sd + float(eps)))
+    return _metrics_sharpe_daily(ret_1d, eps=eps)
 
 
 def _turnover_from_trade_payload(trade_payload: dict[str, np.ndarray] | None, initial_cash: float) -> float:
-    if not trade_payload:
-        return 0.0
-    qty = np.asarray(trade_payload.get("filled_qty", np.zeros(0, dtype=np.float64)), dtype=np.float64)
-    px = np.asarray(trade_payload.get("exec_price", np.zeros(0, dtype=np.float64)), dtype=np.float64)
-    if qty.size == 0 or px.size == 0 or qty.size != px.size:
-        return 0.0
-    notional = float(np.sum(np.abs(qty * px)))
-    return float(notional / max(float(initial_cash), 1e-12))
+    return _metrics_turnover_from_trade_payload(trade_payload, initial_cash)
 
 
 def _trade_count_from_payload(trade_payload: dict[str, np.ndarray] | None) -> int:
-    if not trade_payload:
-        return 0
-    qty = np.asarray(trade_payload.get("filled_qty", np.zeros(0, dtype=np.float64)), dtype=np.float64)
-    if qty.size == 0:
-        return 0
-    return int(np.sum(np.abs(qty) > 1e-12))
+    return _metrics_trade_count_from_payload(trade_payload)
 
 
 def _extract_final_equity(row: dict[str, Any]) -> float:
-    payload = row.get("equity_payload")
-    if not isinstance(payload, dict):
-        return float("nan")
-    eq = np.asarray(payload.get("equity", np.zeros(0, dtype=np.float64)), dtype=np.float64)
-    if eq.size == 0:
-        return float("nan")
-    return float(eq[-1])
+    return _metrics_extract_final_equity(row)
 
 
 def _margin_exposure_stats_from_equity_payloads(payloads: list[dict[str, np.ndarray]]) -> dict[str, float]:
-    if not payloads:
-        return {"avg_margin_used_frac": 0.0, "peak_margin_used_frac": 0.0}
-    vals: list[np.ndarray] = []
-    for p in payloads:
-        eq = np.asarray(p.get("equity", np.zeros(0, dtype=np.float64)), dtype=np.float64)
-        mg = np.asarray(p.get("margin_used", np.zeros(0, dtype=np.float64)), dtype=np.float64)
-        if eq.size == 0 or mg.size == 0 or eq.size != mg.size:
-            continue
-        frac = np.abs(mg) / np.maximum(np.abs(eq), 1e-12)
-        vals.append(frac.astype(np.float64))
-    if not vals:
-        return {"avg_margin_used_frac": 0.0, "peak_margin_used_frac": 0.0}
-    allf = np.concatenate(vals, axis=0)
-    return {
-        "avg_margin_used_frac": float(np.mean(allf)),
-        "peak_margin_used_frac": float(np.max(allf)),
-    }
+    return _metrics_margin_exposure_stats_from_equity_payloads(payloads)
 
 
 def _asset_notional_concentration_from_trade_payloads(payloads: list[dict[str, np.ndarray]]) -> float:
-    if not payloads:
-        return 0.0
-    acc: dict[str, float] = {}
-    for p in payloads:
-        sym = np.asarray(p.get("symbol", np.zeros(0, dtype=object)), dtype=object)
-        qty = np.asarray(p.get("filled_qty", np.zeros(0, dtype=np.float64)), dtype=np.float64)
-        px = np.asarray(p.get("exec_price", np.zeros(0, dtype=np.float64)), dtype=np.float64)
-        if sym.size == 0 or qty.size == 0 or px.size == 0:
-            continue
-        n = min(sym.size, qty.size, px.size)
-        for i in range(n):
-            s = str(sym[i])
-            v = float(abs(float(qty[i]) * float(px[i])))
-            acc[s] = acc.get(s, 0.0) + v
-    if not acc:
-        return 0.0
-    total = float(sum(acc.values()))
-    if total <= 0.0:
-        return 0.0
-    return float(max(acc.values()) / total)
+    return _metrics_asset_notional_concentration_from_trade_payloads(payloads)
 
 
 def _asset_pnl_concentration_from_result_rows(rows: list[dict[str, Any]]) -> float:
-    acc: dict[str, float] = {}
-    for r in rows:
-        payload = r.get("asset_pnl_by_symbol", {})
-        if not isinstance(payload, dict):
-            continue
-        for k, v in payload.items():
-            sym = str(k)
-            vv = float(v)
-            if not np.isfinite(vv):
-                continue
-            acc[sym] = acc.get(sym, 0.0) + vv
-    if not acc:
-        return 0.0
-    abs_vals = np.asarray([abs(float(v)) for v in acc.values()], dtype=np.float64)
-    total_abs = float(np.sum(abs_vals))
-    if total_abs <= 1e-12:
-        return 0.0
-    return float(np.max(abs_vals) / total_abs)
+    return _metrics_asset_pnl_concentration_from_result_rows(rows)
 
 
 def _split_mode(split_id: str) -> str:
@@ -1700,6 +1619,9 @@ def _aggregate_candidate_baseline_matrix(
 
 
 def _validate_institutional_harness_config(harness_cfg: Module5HarnessConfig) -> None:
+    research_mode = str(harness_cfg.research_mode).strip().lower()
+    if research_mode not in {"standard", "discovery"}:
+        raise RuntimeError(f"research_mode must be 'standard' or 'discovery', got {harness_cfg.research_mode!r}")
     if not (0.0 <= float(harness_cfg.cluster_corr_threshold) <= 1.0):
         raise RuntimeError(f"cluster_corr_threshold must be in [0,1], got {harness_cfg.cluster_corr_threshold}")
     if int(harness_cfg.cluster_distance_block_size) < 1:
@@ -1835,6 +1757,12 @@ def _build_candidate_artifacts(
         asset_notional_concentration_from_trade_payloads_fn=_asset_notional_concentration_from_trade_payloads,
         robustness_caps=ROBUSTNESS_CAPS,
     )
+
+
+def _bounded_active_worker_count(*, pending_count: int, effective_workers: int) -> int:
+    pending = int(max(0, pending_count))
+    workers = int(max(1, effective_workers))
+    return int(min(pending, workers))
 
 
 def run_weightiz_harness(
@@ -2161,10 +2089,14 @@ def run_weightiz_harness(
                     timeout=float(pool_heartbeat_seconds),
                     return_when=FIRST_COMPLETED,
                 )
+                active_workers = _bounded_active_worker_count(
+                    pending_count=len(pending),
+                    effective_workers=effective_workers,
+                )
                 if not done:
                     _write_run_status_checkpoint("running", execution_mode)
-                    _maybe_emit_progress(active_workers=len(pending))
-                    _maybe_health_check(active_workers=len(pending), queue_backlog=len(pending))
+                    _maybe_emit_progress(active_workers=active_workers)
+                    _maybe_health_check(active_workers=active_workers, queue_backlog=len(pending))
                     continue
                 for fut in sorted(done, key=lambda f: str(futs[f].group_id)):
                     g = futs[fut]
@@ -2194,8 +2126,8 @@ def run_weightiz_harness(
                             break
                     if (groups_completed % int(checkpoint_every_groups) == 0) or (groups_completed == len(group_tasks)):
                         _write_run_status_checkpoint("running", execution_mode)
-                    _maybe_emit_progress(active_workers=len(pending))
-                    _maybe_health_check(active_workers=len(pending), queue_backlog=len(pending))
+                    _maybe_emit_progress(active_workers=active_workers)
+                    _maybe_health_check(active_workers=active_workers, queue_backlog=len(pending))
                     if aborted:
                         break
                 if aborted:

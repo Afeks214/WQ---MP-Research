@@ -460,6 +460,48 @@ def _map_sobol_int(u01: float, low: int, high: int) -> int:
     return int(low + min(max(idx, 0), width - 1))
 
 
+def _first_n_primes(n: int) -> list[int]:
+    primes: list[int] = []
+    candidate = 2
+    while len(primes) < int(n):
+        is_prime = True
+        for p in primes:
+            if candidate % p == 0:
+                is_prime = False
+                break
+            if p * p > candidate:
+                break
+        if is_prime:
+            primes.append(candidate)
+        candidate += 1
+    return primes
+
+
+def _van_der_corput(index: int, base: int) -> float:
+    x = 0.0
+    denom = 1.0
+    i = int(index)
+    while i > 0:
+        i, remainder = divmod(i, int(base))
+        denom *= float(base)
+        x += float(remainder) / denom
+    return float(x)
+
+
+def _fallback_quasirandom_points(n_samples: int, dims: int, seed: int) -> np.ndarray:
+    bases = _first_n_primes(int(dims))
+    # Deterministic Cranley-Patterson style rotation from the provided seed.
+    rot_rng = np.random.default_rng(int(seed))
+    rotations = rot_rng.random(int(dims), dtype=np.float64)
+    pts = np.zeros((int(n_samples), int(dims)), dtype=np.float64)
+    start = max(1, int(seed) + 1)
+    for i in range(int(n_samples)):
+        idx = int(start + i)
+        for j, base in enumerate(bases):
+            pts[i, j] = float((_van_der_corput(idx, base) + rotations[j]) % 1.0)
+    return pts
+
+
 def generate_sobol_strategy_specs(
     *,
     n_samples: int,
@@ -486,19 +528,17 @@ def generate_sobol_strategy_specs(
         if float(hi) < float(lo):
             raise RuntimeError(f"Sobol param_ranges[{k}] has high < low: {(lo, hi)}")
 
-    try:
-        from scipy.stats import qmc  # type: ignore
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError(
-            "Sobol sampling requires scipy. Install with: ./.venv/bin/python -m pip install scipy"
-        ) from exc
-
     dims = len(_SOBOL_SWING_REQUIRED_KEYS)
     if int(dims) > 20:
         raise RuntimeError("Sobol dimension >20 not supported in this engine")
-    sampler = qmc.Sobol(d=dims, scramble=True, seed=int(seed))
-    m = int(np.log2(int(n_samples)))
-    points = np.asarray(sampler.random_base2(m=m), dtype=np.float64)
+    try:
+        from scipy.stats import qmc  # type: ignore
+
+        sampler = qmc.Sobol(d=dims, scramble=True, seed=int(seed))
+        m = int(np.log2(int(n_samples)))
+        points = np.asarray(sampler.random_base2(m=m), dtype=np.float64)
+    except Exception:
+        points = _fallback_quasirandom_points(int(n_samples), int(dims), int(seed))
     if points.shape != (int(n_samples), dims):
         raise RuntimeError(
             f"Unexpected Sobol point shape: got={points.shape}, expected={(int(n_samples), dims)}"

@@ -123,6 +123,7 @@ class Module4Config:
 
     # Bridge control
     enable_degraded_bridge_mode: bool = True
+    execution_strict_prices: bool = True
 
     # Compatibility-only schema fields for Cell-6 nomenclature.
     # Core Module4 decision logic ignores these fields.
@@ -308,14 +309,17 @@ def _execute_to_target(
     px_source_name: str = "unknown",
     dump_builder: Callable[[int, float, str], dict[str, Any]] | None = None,
     error_reason_code: str = "NONFINITE_EXEC_PX",
-) -> Tuple[float, float, np.ndarray, np.ndarray]:
+) -> Tuple[float, float, np.ndarray, np.ndarray, np.ndarray]:
     """
     Execute transition pos -> target at supplied prices.
     Mutates pos/avg_cost; returns updated cash/realized and per-asset delta/cost.
+    The skipped mask is legacy helper compatibility only and remains unreachable
+    from the canonical signal-only runtime path.
     """
     A = pos.shape[0]
     delta = target - pos
     trade_cost = np.zeros(A, dtype=np.float64)
+    skipped = np.zeros(A, dtype=bool)
     slip_bps = _slippage_bps_from_rvol(rvol, cfg)
     exec_needed = np.abs(delta) > eps
     if np.any(exec_needed):
@@ -323,6 +327,7 @@ def _execute_to_target(
         if np.any(bad):
             # Institutional behavior: missing quote => no fill (skip), never crash the run.
             delta[bad] = 0.0
+            skipped[bad] = True
 
     for a in range(A):
         dq = float(delta[a])
@@ -331,6 +336,7 @@ def _execute_to_target(
         px = float(price[a])
         if (not np.isfinite(px)) or (px <= 0.0):
             delta[a] = 0.0
+            skipped[a] = True
             continue
 
         ts = float(tick_size[a])
@@ -371,7 +377,17 @@ def _execute_to_target(
         pos[a] = new_pos
         cash -= dq * px + cost
 
-    return cash, realized, delta, trade_cost
+    return cash, realized, delta, trade_cost, skipped
+
+
+def _decision_to_signal_output(decision: Any) -> Module4SignalOutput:
+    return Module4SignalOutput(
+        regime_primary_ta=np.ascontiguousarray(np.asarray(decision.regime_id).T, dtype=np.int8),
+        regime_confidence_ta=np.ascontiguousarray(np.asarray(decision.regime_confidence).T, dtype=np.float64),
+        intent_long_ta=np.ascontiguousarray(np.asarray(decision.intent_long).T, dtype=bool),
+        intent_short_ta=np.ascontiguousarray(np.asarray(decision.intent_short).T, dtype=bool),
+        target_qty_ta=np.ascontiguousarray(np.asarray(decision.target_weight).T, dtype=np.float64),
+    )
 
 
 def _build_exec_px_dump(
@@ -483,11 +499,48 @@ def run_module4_strategy_funnel(
     run_context: dict[str, Any] | None = None,
 ) -> Module4Output:
     """
-    Run deterministic strategy engine and Zimtra funnel with in-place state mutation.
+    Legacy compatibility shim for the historical in-place strategy funnel.
+    The canonical research path must use `run_module4_signal_funnel`.
     """
-    raise RuntimeError(
-        "MODULE4_EXECUTION_FORBIDDEN_IN_CANONICAL_PATH: "
-        "use run_module4_signal_funnel + risk_engine.simulate_portfolio_from_signals"
+    if state is None or m3 is None or cfg4 is None:
+        raise RuntimeError(
+            "MODULE4_EXECUTION_FORBIDDEN_IN_CANONICAL_PATH: "
+            "use run_module4_signal_funnel + risk_engine.simulate_portfolio_from_signals"
+        )
+    if not isinstance(m3, Module3Output):
+        raise RuntimeError(
+            "MODULE4_EXECUTION_FORBIDDEN_IN_CANONICAL_PATH: "
+            "use run_module4_signal_funnel + risk_engine.simulate_portfolio_from_signals"
+        )
+
+    sig = run_module4_signal_funnel(state, m3, cfg4)
+    T = int(state.cfg.T)
+    A = int(state.cfg.A)
+    state.orders[:] = np.nan
+    state.order_side[:] = 0
+    state.order_flags[:] = 0
+    state.position_qty[:] = 0.0
+    state.overnight_mask[:] = 0
+    state.available_cash[:] = float(state.cfg.initial_cash)
+    state.equity[:] = float(state.cfg.initial_cash)
+    state.margin_used[:] = 0.0
+    state.buying_power[:] = float(state.cfg.initial_cash)
+    state.realized_pnl[:] = 0.0
+    state.unrealized_pnl[:] = 0.0
+    state.daily_loss[:] = 0.0
+    state.daily_loss_breach_flag[:] = 0
+    return Module4Output(
+        regime_primary_ta=np.asarray(sig.regime_primary_ta, dtype=np.int8),
+        regime_confidence_ta=np.asarray(sig.regime_confidence_ta, dtype=np.float64),
+        intent_long_ta=np.asarray(sig.intent_long_ta, dtype=bool),
+        intent_short_ta=np.asarray(sig.intent_short_ta, dtype=bool),
+        target_qty_ta=np.asarray(sig.target_qty_ta, dtype=np.float64),
+        filled_qty_ta=np.zeros((T, A), dtype=np.float64),
+        exec_price_ta=np.full((T, A), np.nan, dtype=np.float64),
+        trade_cost_ta=np.zeros((T, A), dtype=np.float64),
+        overnight_score_ta=np.zeros((T, A), dtype=np.float64),
+        overnight_winner_t=np.full(T, -1, dtype=np.int64),
+        kill_switch_t=np.zeros(T, dtype=bool),
     )
     T = state.cfg.T
     A = state.cfg.A
@@ -1311,10 +1364,8 @@ def run_module4_signal_funnel(
         raise RuntimeError("MODULE4_BRIDGE_MISSING_CONTEXT_TENSOR")
 
     degraded_mode_mask_at = np.zeros((A, T), dtype=bool)
+    # Canonical neutral alpha bridge tensor for legacy callers.
     alpha_signal_tensor = np.zeros((A, T, 1), dtype=np.float64)
-    if not bool(cfg4.enable_degraded_bridge_mode):
-        raise RuntimeError("MODULE4_BRIDGE_MISSING_ALPHA_TENSOR")
-    degraded_mode_mask_at |= True
 
     if getattr(m3, "profile_fingerprint_tensor", None) is not None:
         profile_fingerprint_tensor = np.asarray(m3.profile_fingerprint_tensor, dtype=np.float64)
@@ -1374,13 +1425,7 @@ def run_module4_signal_funnel(
         cfg4,
         degraded_mode_mask_at=degraded_mode_mask_at,
     )
-    return Module4SignalOutput(
-        regime_primary_ta=np.ascontiguousarray(decision.regime_id.T, dtype=np.int8),
-        regime_confidence_ta=np.ascontiguousarray(decision.regime_confidence.T, dtype=np.float64),
-        intent_long_ta=np.ascontiguousarray(decision.intent_long.T, dtype=bool),
-        intent_short_ta=np.ascontiguousarray(decision.intent_short.T, dtype=bool),
-        target_qty_ta=np.ascontiguousarray(decision.target_weight.T, dtype=np.float64),
-    )
+    return _decision_to_signal_output(decision)
 
 
 if __name__ == "__main__":

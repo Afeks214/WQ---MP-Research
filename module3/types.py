@@ -50,10 +50,10 @@ class Module3Config:
 
 @dataclass
 class Module3Output:
-    structure_tensor: np.ndarray
-    context_tensor: np.ndarray
-    profile_fingerprint_tensor: np.ndarray
-    profile_regime_tensor: np.ndarray
+    structure_tensor: np.ndarray | None = None
+    context_tensor: np.ndarray | None = None
+    profile_fingerprint_tensor: np.ndarray | None = None
+    profile_regime_tensor: np.ndarray | None = None
 
     # Optional engine metadata tensors.
     context_valid_atw: np.ndarray | None = None
@@ -71,6 +71,35 @@ class Module3Output:
     context_valid_ta: np.ndarray | None = None
     context_source_t_index_ta: np.ndarray | None = None
     ib_defined_ta: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if self.structure_tensor is None:
+            if self.block_features_tak is None:
+                raise TypeError("Module3Output requires structure_tensor or block_features_tak")
+            self.structure_tensor = np.swapaxes(np.asarray(self.block_features_tak, dtype=np.float64), 0, 1)[:, :, :, None]
+        else:
+            self.structure_tensor = np.asarray(self.structure_tensor, dtype=np.float64)
+
+        if self.context_tensor is None:
+            if self.context_tac is None:
+                raise TypeError("Module3Output requires context_tensor or context_tac")
+            self.context_tensor = np.swapaxes(np.asarray(self.context_tac, dtype=np.float64), 0, 1)[:, :, :, None]
+        else:
+            self.context_tensor = np.asarray(self.context_tensor, dtype=np.float64)
+
+        if self.profile_fingerprint_tensor is None:
+            a_dim, t_dim = self.structure_tensor.shape[0], self.structure_tensor.shape[1]
+            w_dim = self.structure_tensor.shape[3]
+            self.profile_fingerprint_tensor = np.zeros((a_dim, t_dim, 1, w_dim), dtype=np.float64)
+        else:
+            self.profile_fingerprint_tensor = np.asarray(self.profile_fingerprint_tensor, dtype=np.float64)
+
+        if self.profile_regime_tensor is None:
+            a_dim, t_dim = self.structure_tensor.shape[0], self.structure_tensor.shape[1]
+            w_dim = self.structure_tensor.shape[3]
+            self.profile_regime_tensor = np.zeros((a_dim, t_dim, 1, w_dim), dtype=np.float64)
+        else:
+            self.profile_regime_tensor = np.asarray(self.profile_regime_tensor, dtype=np.float64)
 
     def assert_float64(self) -> None:
         for name, arr in [
