@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
+.ipynb_checkpoints/
 artifacts/
 cache/
 datasets/
@@ -11,3 +12,6 @@ data/
 .env
 .env.*
 *.secrets
+*.tmp
+*.bak
+*.orig
