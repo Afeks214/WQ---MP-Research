@@ -27,6 +27,7 @@ Architecture map:
 from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+import dataclasses
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 import atexit
@@ -729,8 +730,45 @@ def _clone_m3(m3: Module3Output) -> Module3Output:
     )
 
 
+def _tensor_nbytes_total(obj: Any, _seen: set[int] | None = None) -> int:
+    if _seen is None:
+        _seen = set()
+    oid = id(obj)
+    if oid in _seen:
+        return 0
+    _seen.add(oid)
+    if isinstance(obj, np.ndarray):
+        return int(obj.nbytes)
+    if dataclasses.is_dataclass(obj):
+        total = 0
+        for field in dataclasses.fields(obj):
+            total += _tensor_nbytes_total(getattr(obj, field.name), _seen)
+        return int(total)
+    if isinstance(obj, dict):
+        return int(sum(_tensor_nbytes_total(v, _seen) for v in obj.values()))
+    if isinstance(obj, (list, tuple)):
+        return int(sum(_tensor_nbytes_total(v, _seen) for v in obj))
+    return 0
+
+
 def _available_memory_bytes() -> int:
-    # Unix/macOS fast path.
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            return int(parts[1]) * 1024
+        except Exception:
+            pass
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        return page_size * pages
+    except Exception:
+        pass
+    # Unix/macOS total-RAM fallback.
     try:
         page_size = int(os.sysconf("SC_PAGE_SIZE"))
         pages = int(os.sysconf("SC_PHYS_PAGES"))
@@ -739,13 +777,12 @@ def _available_memory_bytes() -> int:
         return 8 * 1024 * 1024 * 1024
 
 
-def _estimate_state_bytes(T: int, A: int, B: int) -> int:
-    # Conservative rough estimate for one full tensor state + outputs.
-    core = T * A * B * 8 * 3  # vp, vp_delta, temp profile buffers
-    ta = T * A * 8 * 24
-    t = T * 8 * 16
-    overhead = 128 * 1024 * 1024
-    return int(core + ta + t + overhead)
+def _estimate_state_bytes(base_state: TensorState) -> int:
+    # Use real ndarray footprint from the current state, then budget for the
+    # stressed clone and task-local buffers in process-pool execution.
+    state_bytes = max(1, _tensor_nbytes_total(base_state))
+    overhead = 512 * 1024 * 1024
+    return int(state_bytes * 2 + overhead)
 
 
 
@@ -1218,6 +1255,8 @@ def _run_group_task(
 
     outputs: list[dict[str, Any]] = []
 
+    single_candidate_task = len(group.candidate_indices) == 1
+
     for ci in group.candidate_indices:
         c = candidates[ci]
         task_id = f"{c.candidate_id}|{split.split_id}|{scenario.scenario_id}"
@@ -1232,8 +1271,15 @@ def _run_group_task(
                 if u < float(harness_cfg.test_fail_ratio):
                     raise RuntimeError("InjectedTaskFailure: ratio")
 
-            st = _clone_state(cached_state)
-            m3c = _clone_m3(m3_out_cached)
+            if single_candidate_task:
+                # Process-pool execution already split this group to one
+                # candidate, so reusing the stressed clone avoids a second
+                # full-state deep copy without weakening isolation.
+                st = cached_state
+                m3c = m3_out_cached
+            else:
+                st = _clone_state(cached_state)
+                m3c = _clone_m3(m3_out_cached)
             _apply_enabled_assets(st, m3c, c.enabled_assets_mask)
             pre_m4_reasons = _apply_pre_m4_invariants(st, m3c)
             quality_reason_codes = sorted(set(post_m2_reasons + post_m3_reasons + pre_m4_reasons))
@@ -1920,7 +1966,7 @@ def run_weightiz_harness(
 
     # RAM policy: reduce worker count if projected footprint is too high.
     avail = _available_memory_bytes()
-    est_state = _estimate_state_bytes(base_state.cfg.T, base_state.cfg.A, base_state.cfg.B)
+    est_state = _estimate_state_bytes(base_state)
     requested_workers = int(max(1, harness_cfg.parallel_workers))
     max_workers = int(requested_workers)
     budget = int(float(harness_cfg.max_ram_utilization_frac) * float(avail))

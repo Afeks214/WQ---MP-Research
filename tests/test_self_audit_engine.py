@@ -49,8 +49,8 @@ def test_self_audit_fails_on_illegal_module4_execution() -> None:
 
 def test_self_audit_fails_when_module2_appears_in_worker() -> None:
     bad_harness = _src("weightiz_module5_harness.py").replace(
-        "st = _clone_state(cached_state)",
-        "st = _clone_state(cached_state)\n            run_weightiz_profile_engine(st, m2_configs[group.m2_idx])",
+        "m4_sig: Module4SignalOutput = run_module4_signal_funnel(",
+        "run_weightiz_profile_engine(st, m2_configs[group.m2_idx])\n            m4_sig: Module4SignalOutput = run_module4_signal_funnel(",
         1,
     )
     with pytest.raises(RuntimeError, match="SELF_AUDIT_FAILURE"):

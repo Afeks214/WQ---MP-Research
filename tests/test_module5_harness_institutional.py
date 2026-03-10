@@ -784,6 +784,135 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
             self.assertFalse(bool(run_status.get("execution_topology", {}).get("grouped_post_m2_reuse_active", True)))
             self.assertFalse(bool(run_status.get("execution_topology", {}).get("grouped_post_m3_reuse_active", True)))
 
+    def test_single_candidate_group_reuses_stressed_clone(self) -> None:
+        T, A = 12, 2
+        base_state = preallocate_state(
+            ts_ns=self._utc_minute_ns("2024-01-03T14:30:00", periods=T),
+            cfg=self._cfg(T=T, A=A),
+            symbols=("S1", "S2"),
+        )
+        t = np.arange(T, dtype=np.float64)[:, None]
+        a = np.arange(A, dtype=np.float64)[None, :]
+        base_state.open_px[:, :] = 100.0 + 0.01 * t + 0.05 * a
+        base_state.high_px[:, :] = base_state.open_px + 0.02
+        base_state.low_px[:, :] = base_state.open_px - 0.02
+        base_state.close_px[:, :] = base_state.open_px + 0.01
+        base_state.volume[:, :] = 1000.0 + t + a
+        base_state.bar_valid[:, :] = True
+        validate_state_hard(base_state)
+
+        split = h.SplitSpec(
+            split_id="wf_000",
+            mode="wf",
+            train_idx=np.arange(0, 6, dtype=np.int64),
+            test_idx=np.arange(6, T, dtype=np.int64),
+            purge_idx=np.zeros(0, dtype=np.int64),
+            embargo_idx=np.zeros(0, dtype=np.int64),
+            session_train_bounds=(0, 0),
+            session_test_bounds=(0, 0),
+            purge_bars=0,
+            embargo_bars=0,
+            total_bars=T,
+        )
+        scenario = h.StressScenario(
+            scenario_id="baseline",
+            name="baseline",
+            missing_burst_prob=0.0,
+            missing_burst_min=0,
+            missing_burst_max=0,
+            jitter_sigma_bps=0.0,
+            slippage_mult=1.0,
+            enabled=True,
+        )
+        candidate = h.CandidateSpec(
+            candidate_id="cand0",
+            m2_idx=0,
+            m3_idx=0,
+            m4_idx=0,
+            enabled_assets_mask=np.ones(A, dtype=bool),
+            tags=(),
+        )
+        group = h._GroupTask(
+            group_id="g0",
+            split_idx=0,
+            scenario_idx=0,
+            m2_idx=0,
+            m3_idx=0,
+            candidate_indices=(0,),
+        )
+        harness_cfg = h.Module5HarnessConfig(seed=41, fail_on_non_finite=True)
+        m2_cfgs = [Module2Config(profile_window_bars=3, profile_warmup_bars=3)]
+        m3_cfgs = [Module3Config(block_minutes=5, min_block_valid_bars=1, min_block_valid_ratio=0.0)]
+        m4_cfgs = [Module4Config()]
+
+        clone_counts = {"state": 0, "m3": 0}
+        orig_clone_state = h._clone_state
+        orig_clone_m3 = h._clone_m3
+
+        def wrap_clone_state(state: h.TensorState) -> h.TensorState:
+            clone_counts["state"] += 1
+            return orig_clone_state(state)
+
+        def wrap_clone_m3(m3: Module3Output) -> Module3Output:
+            clone_counts["m3"] += 1
+            return orig_clone_m3(m3)
+
+        def wrap_m2(_state: h.TensorState, _cfg: Module2Config) -> None:
+            return None
+
+        def wrap_m3(state: h.TensorState, _cfg: Module3Config) -> Module3Output:
+            return self._dummy_m3(state)
+
+        def wrap_m4(state: h.TensorState, _m3: Module3Output, _cfg: Module4Config) -> Module4SignalOutput:
+            return self._dummy_m4_signal(state)
+
+        def fake_risk(close_px_ta, target_qty_ta, initial_cash, cost_cfg, risk_cfg):
+            close_px_ta = np.asarray(close_px_ta, dtype=np.float64)
+            T_local, A_local = close_px_ta.shape
+
+            class _Res:
+                equity_curve = np.full(T_local, float(initial_cash), dtype=np.float64)
+                daily_returns = np.zeros(T_local, dtype=np.float64)
+                filled_qty_ta = np.zeros((T_local, A_local), dtype=np.float64)
+                exec_price_ta = np.asarray(close_px_ta, dtype=np.float64)
+                trade_cost_ta = np.zeros((T_local, A_local), dtype=np.float64)
+                position_qty_ta = np.zeros((T_local, A_local), dtype=np.float64)
+                margin_used_t = np.zeros(T_local, dtype=np.float64)
+                buying_power_t = np.full(T_local, float(initial_cash), dtype=np.float64)
+                daily_loss_t = np.zeros(T_local, dtype=np.float64)
+                trades = 0
+                final_equity = float(initial_cash)
+                max_drawdown = 0.0
+                sharpe = 0.0
+                sortino = 0.0
+
+            return _Res()
+
+        with (
+            mock.patch.object(h, "_clone_state", side_effect=wrap_clone_state),
+            mock.patch.object(h, "_clone_m3", side_effect=wrap_clone_m3),
+            mock.patch.object(h, "run_weightiz_profile_engine", side_effect=wrap_m2),
+            mock.patch.object(h, "run_module3_structural_aggregation", side_effect=wrap_m3),
+            mock.patch.object(h, "run_module4_signal_funnel", side_effect=wrap_m4),
+            mock.patch.object(h, "simulate_portfolio_from_signals", side_effect=fake_risk),
+        ):
+            rows = h._run_group_task(
+                group=group,
+                base_state=base_state,
+                candidates=[candidate],
+                splits=[split],
+                scenarios=[scenario],
+                m2_configs=m2_cfgs,
+                m3_configs=m3_cfgs,
+                m4_configs=m4_cfgs,
+                harness_cfg=harness_cfg,
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(str(rows[0]["status"]), "ok")
+        self.assertEqual(clone_counts["state"], 1)
+        self.assertEqual(clone_counts["m3"], 0)
+
     def test_bounded_active_worker_count_caps_pending_futures(self) -> None:
         self.assertEqual(h._bounded_active_worker_count(pending_count=910, effective_workers=7), 7)
         self.assertEqual(h._bounded_active_worker_count(pending_count=3, effective_workers=7), 3)
