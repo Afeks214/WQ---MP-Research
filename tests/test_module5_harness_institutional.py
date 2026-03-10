@@ -1069,6 +1069,11 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
         self.assertEqual([g.candidate_indices for g in split_groups], [(0,), (1,), (2,), (3,)])
         self.assertEqual([g.group_id for g in split_groups], [f"{grouped[0].group_id}_p{i:03d}" for i in range(4)])
 
+        chunked_groups = h._split_group_tasks_by_candidate(grouped, chunk_size=2)
+        self.assertEqual(len(chunked_groups), 2)
+        self.assertEqual([g.candidate_indices for g in chunked_groups], [(0, 1), (2, 3)])
+        self.assertEqual([g.group_id for g in chunked_groups], [f"{grouped[0].group_id}_p000", f"{grouped[0].group_id}_p001"])
+
     def test_minimal_harness_has_finite_robustness_for_non_pathological_candidate(self) -> None:
         with tempfile.TemporaryDirectory(prefix="m5_finite_robustness_") as td:
             report_dir = Path(td) / "artifacts"

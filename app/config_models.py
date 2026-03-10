@@ -242,6 +242,7 @@ class HarnessConfigModel(BaseModel):
     failure_rate_abort_threshold: float = 0.02
     failure_count_abort_threshold: int = 50
     payload_pickle_threshold_bytes: int = 131_072
+    process_pool_candidate_chunk_size: int = 1
     test_fail_task_ids: list[str] = Field(default_factory=list)
     test_fail_ratio: float = 0.0
     cluster_corr_threshold: float = 0.90

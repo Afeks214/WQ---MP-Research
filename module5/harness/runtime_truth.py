@@ -19,10 +19,14 @@ def build_compute_authority() -> dict[str, str]:
     }
 
 
-def build_execution_topology(execution_mode: str, use_process_pool: bool) -> dict[str, object]:
+def build_execution_topology(
+    execution_mode: str,
+    use_process_pool: bool,
+    process_pool_group_reuse_active: bool = False,
+) -> dict[str, object]:
     return {
         "mode": str(execution_mode),
         "process_pool_candidate_split": bool(use_process_pool),
-        "grouped_post_m2_reuse_active": bool(not use_process_pool),
-        "grouped_post_m3_reuse_active": bool(not use_process_pool),
+        "grouped_post_m2_reuse_active": bool((not use_process_pool) or process_pool_group_reuse_active),
+        "grouped_post_m3_reuse_active": bool((not use_process_pool) or process_pool_group_reuse_active),
     }

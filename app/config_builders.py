@@ -122,6 +122,7 @@ def build_harness_config(cfg: RunConfigModel, project_root: Path) -> Module5Harn
         failure_rate_abort_threshold=h.failure_rate_abort_threshold,
         failure_count_abort_threshold=h.failure_count_abort_threshold,
         payload_pickle_threshold_bytes=h.payload_pickle_threshold_bytes,
+        process_pool_candidate_chunk_size=h.process_pool_candidate_chunk_size,
         test_fail_task_ids=tuple(str(x) for x in h.test_fail_task_ids),
         test_fail_ratio=h.test_fail_ratio,
         cluster_corr_threshold=h.cluster_corr_threshold,

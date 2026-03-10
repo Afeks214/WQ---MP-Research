@@ -293,6 +293,7 @@ class Module5HarnessConfig:
     failure_rate_abort_threshold: float = 0.02
     failure_count_abort_threshold: int = 50
     payload_pickle_threshold_bytes: int = 131_072
+    process_pool_candidate_chunk_size: int = 1
     health_check_interval: int = 50
     progress_interval_seconds: int = 10
     # Test-only deterministic fault hooks.
@@ -1978,9 +1979,12 @@ def run_weightiz_harness(
     if quick_settings.enabled:
         process_pool_requested = False
 
+    process_pool_chunk_size = int(max(1, harness_cfg.process_pool_candidate_chunk_size))
+    process_pool_group_reuse_active = bool(process_pool_requested and process_pool_chunk_size > 1)
+
     group_tasks = _build_group_tasks(candidates, splits, scenarios)
     if process_pool_requested:
-        group_tasks = _split_group_tasks_by_candidate(group_tasks, chunk_size=1)
+        group_tasks = _split_group_tasks_by_candidate(group_tasks, chunk_size=process_pool_chunk_size)
     if not group_tasks:
         raise RuntimeError("No group tasks generated")
 
@@ -2015,7 +2019,11 @@ def run_weightiz_harness(
                 "elapsed_seconds": float(elapsed),
                 "compute_authority": compute_authority,
                 "feature_tensor_role": feature_tensor_role,
-                "execution_topology": _truth_build_execution_topology(execution_mode_now, use_process_pool),
+                "execution_topology": _truth_build_execution_topology(
+                    execution_mode_now,
+                    use_process_pool,
+                    process_pool_group_reuse_active,
+                ),
                 "updated_utc": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -2072,8 +2080,8 @@ def run_weightiz_harness(
                 "avg_strategy_time_sec": float(avg_strategy_time),
                 "diagnostic_feature_tensor_memory_gb": float(shm_mem_gb),
                 "feature_tensor_worker_role": str(feature_tensor_role["role"]),
-                "grouped_post_m2_reuse_active": bool(not use_process_pool),
-                "grouped_post_m3_reuse_active": bool(not use_process_pool),
+                "grouped_post_m2_reuse_active": bool((not use_process_pool) or process_pool_group_reuse_active),
+                "grouped_post_m3_reuse_active": bool((not use_process_pool) or process_pool_group_reuse_active),
                 "elapsed_runtime_sec": float(elapsed),
             },
         )
@@ -2322,7 +2330,11 @@ def run_weightiz_harness(
                     "failures_so_far": int(failure_count),
                     "compute_authority": compute_authority,
                     "feature_tensor_role": feature_tensor_role,
-                    "execution_topology": _truth_build_execution_topology(execution_mode, use_process_pool),
+                    "execution_topology": _truth_build_execution_topology(
+                        execution_mode,
+                        use_process_pool,
+                        process_pool_group_reuse_active,
+                    ),
                     "updated_utc": datetime.now(timezone.utc).isoformat(),
                     "first_exception": {
                         "class": first_exception_class,
@@ -2437,7 +2449,11 @@ def run_weightiz_harness(
         ledger_write_fn=_ledger_write,
         git_hash_fn=_git_hash,
         stable_hash_obj_fn=_stable_hash_obj,
-        execution_topology_fn=_truth_build_execution_topology,
+        execution_topology_fn=lambda execution_mode_now, use_process_pool_now: _truth_build_execution_topology(
+            execution_mode_now,
+            use_process_pool_now,
+            process_pool_group_reuse_active,
+        ),
         dq_accept=DQ_ACCEPT,
         dq_degrade=DQ_DEGRADE,
         dq_reject=DQ_REJECT,
