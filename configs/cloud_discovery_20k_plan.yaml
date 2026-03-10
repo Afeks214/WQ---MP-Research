@@ -1,0 +1,221 @@
+plan_name: cloud_discovery_20k_plan
+source_local_config: configs/local_discovery_short_7core.yaml
+live_axes:
+- module3.block_minutes
+- module4.entry_threshold
+- module4.exit_threshold
+- module4.regime_confidence_min
+- module4.window_selection_mode
+- module4.fixed_window_index
+- module4.anchor_window_index
+- module4.max_abs_weight
+- module4.conviction_scale
+- module4.conviction_clip
+- module4.trend_spread_min
+- module4.trend_poc_drift_min_abs
+- module4.neutral_poc_drift_max_abs
+- module4.shape_skew_min_abs
+- module4.double_dist_sep_x
+- module4.double_dist_valley_frac
+- module4.max_volatility
+- module4.max_spread
+- module4.min_liquidity
+dead_axes:
+- module4.top_k_intraday
+- module4.max_asset_cap_frac
+- module4.max_turnover_frac_per_bar
+- module4.overnight_min_conviction
+- module4.allow_cash_overnight
+- module4.commission_bps
+- module4.spread_tick_mult
+- module4.slippage_bps_low_rvol
+- module4.slippage_bps_mid_rvol
+- module4.slippage_bps_high_rvol
+- module4.stress_slippage_mult
+- module4.hard_kill_on_daily_loss_breach
+- module4.execution_strict_prices
+- module4.strategy_type
+- module4.score_gate
+- module4.score_gate_rule
+- module4.deviation_signal
+- module4.deviation_rule
+- module4.entry_model
+- module4.exit_model
+- module4.origin_level
+- module4.direction
+- module4.delta_th
+- module4.dev_th
+- module4.tp_mult
+- module4.atr_stop_mult
+uncertain_axes:
+- module3.block_minutes
+- module3.include_partial_last_block
+- module3.min_block_valid_ratio
+- module3.ib_pop_frac
+- module4.max_volatility
+- module4.max_spread
+- module4.min_liquidity
+chosen_module3_block_windows:
+- 15
+- 20
+- 30
+- 40
+canonical_internal_module4_windows:
+- 5
+- 15
+- 30
+- 60
+local_short_run:
+  config_path: configs/local_discovery_short_7core.yaml
+  module2_window_count: 1
+  module3_window_count: 4
+  total_m4_configs: 80
+  total_candidates: 320
+  family_entries: &id001
+  - family_name: family_a_activation_frontier
+    research_purpose: Entry/regime activation frontier under adaptive window selection.
+    local_live_axes:
+      entry_threshold:
+      - 0.5
+      - 0.55
+      - 0.6
+      - 0.65
+      - 0.7
+      regime_confidence_min:
+      - 0.5
+      - 0.58
+      - 0.66
+      - 0.74
+    cloud_live_axes:
+      entry_threshold:
+        start: 0.48
+        stop: 0.72
+        step: 0.01
+        count: 25
+      regime_confidence_min:
+        start: 0.4
+        stop: 0.89
+        step: 0.01
+        count: 50
+    local_m4_index_range:
+    - 0
+    - 19
+    local_m4_config_count: 20
+    local_candidate_count: 80
+    cloud_m4_config_count: 1250
+    cloud_candidate_count: 5000
+  - family_name: family_b_hysteresis_hold
+    research_purpose: Entry/exit hysteresis to test hold length versus churn under
+      the same adaptive window policy.
+    local_live_axes:
+      entry_threshold:
+      - 0.5
+      - 0.56
+      - 0.62
+      - 0.68
+      - 0.74
+      exit_threshold:
+      - 0.18
+      - 0.24
+      - 0.3
+      - 0.36
+    cloud_live_axes:
+      entry_threshold:
+        start: 0.5
+        stop: 0.74
+        step: 0.01
+        count: 25
+      exit_threshold:
+        start: 0.1
+        stop: 0.59
+        step: 0.01
+        count: 50
+    local_m4_index_range:
+    - 20
+    - 39
+    local_m4_config_count: 20
+    local_candidate_count: 80
+    cloud_m4_config_count: 1250
+    cloud_candidate_count: 5000
+  - family_name: family_c_regime_taxonomy
+    research_purpose: Regime taxonomy sensitivity across trend-versus-shape classification
+      thresholds.
+    local_live_axes:
+      trend_spread_min:
+      - 0.03
+      - 0.05
+      - 0.07
+      - 0.09
+      - 0.11
+      shape_skew_min_abs:
+      - 0.2
+      - 0.35
+      - 0.5
+      - 0.65
+    cloud_live_axes:
+      trend_spread_min:
+        start: 0.02
+        stop: 0.26
+        step: 0.01
+        count: 25
+      shape_skew_min_abs:
+        start: 0.1
+        stop: 0.59
+        step: 0.01
+        count: 50
+    local_m4_index_range:
+    - 40
+    - 59
+    local_m4_config_count: 20
+    local_candidate_count: 80
+    cloud_m4_config_count: 1250
+    cloud_candidate_count: 5000
+  - family_name: family_d_window_specialists
+    research_purpose: Single-window specialists that force the canonical 5/15/30/60
+      structural windows and vary concentration caps.
+    local_live_axes:
+      fixed_window_index:
+      - 0
+      - 1
+      - 2
+      - 3
+      max_abs_weight:
+      - 0.2
+      - 0.35
+      - 0.5
+      - 0.65
+      - 0.8
+    cloud_live_axes:
+      fixed_window_index:
+        values:
+        - 0
+        - 1
+        - 2
+        - 3
+        count: 4
+      max_abs_weight:
+        start: 0.2
+        stop: 0.8
+        step: 0.05
+        count: 13
+      entry_threshold:
+        start: 0.5
+        stop: 0.74
+        step: 0.01
+        count: 25
+    local_m4_index_range:
+    - 60
+    - 79
+    local_m4_config_count: 20
+    local_candidate_count: 80
+    cloud_m4_config_count: 1300
+    cloud_candidate_count: 5200
+  candidate_count_per_block_window: 80
+later_cloud_run_20k:
+  plan_path: configs/cloud_discovery_20k_plan.yaml
+  module2_window_count: 1
+  module3_window_count: 4
+  total_m4_configs: 5050
+  total_candidates: 20200
+  candidate_count_per_block_window: 5050
+  family_entries: *id001

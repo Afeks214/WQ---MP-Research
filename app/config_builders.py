@@ -90,6 +90,7 @@ def build_harness_config(cfg: RunConfigModel, project_root: Path) -> Module5Harn
 
     return Module5HarnessConfig(
         seed=h.seed,
+        research_mode=h.research_mode,
         timezone=h.timezone,
         freq=h.freq,
         min_asset_coverage=h.min_asset_coverage,

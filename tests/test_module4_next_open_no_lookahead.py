@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 import unittest
 
 import numpy as np
 
+from module3 import ContextIdx, StructIdx
 from weightiz_module1_core import EngineConfig, NS_PER_MIN, Phase, ProfileStatIdx, ScoreIdx, preallocate_state
-from weightiz_module3_structure import ContextIdx, Module3Output, Struct30mIdx
-from weightiz_module4_strategy_funnel import Module4Config, NonFiniteExecutionPriceError, run_module4_strategy_funnel
+from weightiz_module4_strategy_funnel import Module4Config, run_module4_signal_funnel, run_module4_strategy_funnel
 
 
 def _mk_state(T: int = 4, A: int = 1):
@@ -16,141 +17,64 @@ def _mk_state(T: int = 4, A: int = 1):
     st = preallocate_state(ts_ns=ts_ns, cfg=cfg, symbols=("AAA",))
     st.phase[:] = np.int8(Phase.LIVE)
     st.bar_valid[:] = True
-
-    base = 100.0 + np.arange(T, dtype=np.float64)[:, None] * 0.1
-    st.open_px[:] = base
-    st.high_px[:] = base + 0.2
-    st.low_px[:] = base - 0.2
-    st.close_px[:] = base + 0.05
-    st.volume[:] = 10_000.0
-    st.rvol[:] = 1.2
-    st.atr_floor[:] = 0.5
-
+    st.open_px[:] = 100.0
+    st.open_px[1, 0] = np.nan
     st.scores[:] = 0.0
     st.profile_stats[:] = 0.0
     st.scores[:, :, int(ScoreIdx.SCORE_BO_LONG)] = 0.9
-    st.profile_stats[:, :, int(ProfileStatIdx.GBREAK)] = 1.0
-    st.profile_stats[:, :, int(ProfileStatIdx.GREJECT)] = 0.0
     st.profile_stats[:, :, int(ProfileStatIdx.DCLIP)] = 1.0
     st.profile_stats[:, :, int(ProfileStatIdx.Z_DELTA)] = 1.0
-
-    # Trigger fill-time failure only: keep signal bar finite, next open non-finite.
-    st.open_px[1, 0] = np.nan
     return st
 
 
-def _mk_m3(st) -> Module3Output:
-    T, A = st.cfg.T, st.cfg.A
-    c3 = int(ContextIdx.N_FIELDS)
-    k3 = int(Struct30mIdx.N_FIELDS)
-    ctx = np.zeros((T, A, c3), dtype=np.float64)
-    ctx[:, :, int(ContextIdx.CTX_X_VAH)] = 1.0
-    ctx[:, :, int(ContextIdx.CTX_X_VAL)] = -1.0
-    ctx[:, :, int(ContextIdx.CTX_VALID_RATIO)] = 1.0
-    ctx[:, :, int(ContextIdx.CTX_TREND_GATE_SPREAD_MEAN)] = 0.3
-    ctx[:, :, int(ContextIdx.CTX_POC_DRIFT_X)] = 0.5
-    ctx[:, :, int(ContextIdx.CTX_POC_VS_PREV_VA)] = 1.2
-
-    blocks = np.zeros((T, A, k3), dtype=np.float64)
-    blocks[:, :, int(Struct30mIdx.SKEW_ANCHOR)] = -0.5
-    src = np.tile(np.arange(T, dtype=np.int64)[:, None], (1, A))
-    valid = np.ones((T, A), dtype=bool)
-    return Module3Output(
-        block_id_t=np.arange(T, dtype=np.int64),
-        block_seq_t=np.zeros(T, dtype=np.int16),
-        block_end_flag_t=np.ones(T, dtype=bool),
-        block_start_t_index_t=np.arange(T, dtype=np.int64),
-        block_end_t_index_t=np.arange(T, dtype=np.int64),
-        block_features_tak=blocks,
-        block_valid_ta=valid.copy(),
-        context_tac=ctx,
-        context_valid_ta=valid.copy(),
-        context_source_t_index_ta=src,
+def _mk_m3(T: int, A: int) -> object:
+    structure = np.zeros((A, T, int(StructIdx.N_FIELDS), 1), dtype=np.float64)
+    context = np.zeros((A, T, int(ContextIdx.N_FIELDS), 1), dtype=np.float64)
+    structure[:, :, int(StructIdx.VALID_RATIO), 0] = 1.0
+    structure[:, :, int(StructIdx.TREND_GATE_SPREAD_MEAN), 0] = 0.3
+    structure[:, :, int(StructIdx.POC_DRIFT_X), 0] = 0.5
+    context[:, :, int(ContextIdx.CTX_VALID_RATIO), 0] = 1.0
+    context[:, :, int(ContextIdx.CTX_TREND_GATE_SPREAD_MEAN), 0] = 0.3
+    context[:, :, int(ContextIdx.CTX_POC_DRIFT_X), 0] = 0.5
+    context[:, :, int(ContextIdx.CTX_REGIME_CODE), 0] = 1.0
+    return SimpleNamespace(
+        structure_tensor=structure,
+        context_tensor=context,
+        profile_fingerprint_tensor=np.zeros((A, T, 1, 1), dtype=np.float64),
+        profile_regime_tensor=np.zeros((A, T, 1, 1), dtype=np.float64),
+        context_valid_ta=np.ones((T, A), dtype=bool),
+        context_source_index_atw=np.broadcast_to(np.arange(T, dtype=np.int64)[None, :, None], (A, T, 1)).copy(),
         ib_defined_ta=np.ones((T, A), dtype=bool),
     )
 
 
 class TestModule4NextOpenNoLookahead(unittest.TestCase):
-    def test_exception_happens_at_fill_time_not_signal_time(self) -> None:
+    def test_execution_entry_is_forbidden_even_with_fill_time_pathology(self) -> None:
         st = _mk_state()
-        m3 = _mk_m3(st)
-        with self.assertRaises(NonFiniteExecutionPriceError) as cm:
+        with self.assertRaisesRegex(RuntimeError, "MODULE4_EXECUTION_FORBIDDEN_IN_CANONICAL_PATH"):
             run_module4_strategy_funnel(
                 st,
-                m3,
+                _mk_m3(st.cfg.T, st.cfg.A),
                 Module4Config(entry_threshold=0.55, fail_on_non_finite_input=False),
                 run_context={"candidate_id": "c0", "split_id": "wf_000", "scenario_id": "baseline"},
             )
 
-        exc = cm.exception
-        dump = exc.exec_px_dump
-        self.assertEqual(exc.reason_code, "NONFINITE_EXEC_PX")
-        self.assertEqual(str(dump.get("px_source_name")), "next_open")
-        self.assertEqual(int(dump.get("t_signal")), 0)
-        self.assertEqual(int(dump.get("t_fill")), 1)
-        self.assertTrue(np.isfinite(float(dump.get("open_px_signal"))))
-        self.assertTrue(np.isnan(float(dump.get("open_px_fill"))))
-        self.assertGreater(abs(float(dump.get("target_qty"))), 0.0)
-        self.assertTrue(bool(dump.get("quarantine_applied")))
-
-    def test_last_bar_of_session_cancels_pending_without_raise(self) -> None:
-        T, A = 2, 1
-        ts_ns = np.array(
-            [
-                np.datetime64("2024-11-29T18:00:00", "ns").astype(np.int64),  # Short-session close bar (UTC)
-                np.datetime64("2024-12-02T14:31:00", "ns").astype(np.int64),  # Next session open bar (UTC)
-            ],
-            dtype=np.int64,
-        )
-        cfg = EngineConfig(T=T, A=A, B=240, tick_size=np.full(A, 0.01, dtype=np.float64))
-        st = preallocate_state(ts_ns=ts_ns, cfg=cfg, symbols=("AAA",))
-        st.phase[:] = np.int8(Phase.LIVE)
-        st.bar_valid[:] = True
-        st.open_px[:] = np.array([[100.0], [101.0]], dtype=np.float64)
-        st.high_px[:] = st.open_px + 0.2
-        st.low_px[:] = st.open_px - 0.2
-        st.close_px[:] = st.open_px + 0.1
-        st.volume[:] = 10_000.0
-        st.rvol[:] = 1.2
-        st.atr_floor[:] = 0.5
-        st.scores[:] = 0.0
-        st.profile_stats[:] = 0.0
-        st.scores[:, :, int(ScoreIdx.SCORE_BO_LONG)] = 0.9
-        st.profile_stats[:, :, int(ProfileStatIdx.GBREAK)] = 1.0
-        st.profile_stats[:, :, int(ProfileStatIdx.DCLIP)] = 1.0
-        st.profile_stats[:, :, int(ProfileStatIdx.Z_DELTA)] = 1.0
-        m3 = _mk_m3(st)
-
-        out = run_module4_strategy_funnel(
-            st,
-            m3,
-            Module4Config(entry_threshold=0.55, fail_on_non_finite_input=False),
-            run_context={"candidate_id": "c0", "split_id": "wf_000", "scenario_id": "baseline"},
-        )
-
-        # Entry intent may fire, but pending next-open execution is structurally blocked across sessions.
-        self.assertTrue(bool(out.intent_long_ta[0, 0]))
-        self.assertAlmostEqual(float(out.target_qty_ta[0, 0]), 0.0, places=12)
-        self.assertAlmostEqual(float(out.filled_qty_ta[0, 0]), 0.0, places=12)
-
-    def test_invalid_fill_bar_raises_next_open_unavailable(self) -> None:
+    def test_execution_entry_is_forbidden_even_when_fill_bar_is_invalid(self) -> None:
         st = _mk_state()
         st.bar_valid[1, 0] = False
-        m3 = _mk_m3(st)
-        with self.assertRaises(NonFiniteExecutionPriceError) as cm:
+        with self.assertRaisesRegex(RuntimeError, "MODULE4_EXECUTION_FORBIDDEN_IN_CANONICAL_PATH"):
             run_module4_strategy_funnel(
                 st,
-                m3,
+                _mk_m3(st.cfg.T, st.cfg.A),
                 Module4Config(entry_threshold=0.55, fail_on_non_finite_input=False),
                 run_context={"candidate_id": "c0", "split_id": "wf_000", "scenario_id": "baseline"},
             )
-        exc = cm.exception
-        self.assertEqual(exc.reason_code, "NEXT_OPEN_UNAVAILABLE")
-        dump = exc.exec_px_dump
-        self.assertEqual(str(dump.get("px_source_name")), "next_open")
-        self.assertEqual(int(dump.get("t_signal")), 0)
-        self.assertEqual(int(dump.get("t_fill")), 1)
-        self.assertFalse(bool(dump.get("bar_valid_fill")))
+
+    def test_signal_funnel_ignores_next_open_execution_pathologies(self) -> None:
+        st = _mk_state()
+        out = run_module4_signal_funnel(st, _mk_m3(st.cfg.T, st.cfg.A), Module4Config(entry_threshold=0.55))
+        self.assertEqual(out.regime_primary_ta.shape, (st.cfg.T, st.cfg.A))
+        self.assertEqual(out.target_qty_ta.shape, (st.cfg.T, st.cfg.A))
 
 
 if __name__ == "__main__":

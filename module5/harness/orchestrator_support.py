@@ -302,6 +302,7 @@ def finalize_run_outputs(
 
     run_status = {
         "run_id": run_id,
+        "research_mode": str(getattr(harness_cfg, "research_mode", "standard")),
         "aborted": bool(aborted),
         "aborted_early": bool(aborted_early),
         "abort_reason": str(abort_reason),
@@ -339,6 +340,7 @@ def finalize_run_outputs(
 
     manifest = {
         "run_id": run_id,
+        "research_mode": str(getattr(harness_cfg, "research_mode", "standard")),
         "run_started_utc": run_started_utc.isoformat(),
         "run_finished_utc": datetime.now(timezone.utc).isoformat(),
         "git_hash": git_hash_fn(),

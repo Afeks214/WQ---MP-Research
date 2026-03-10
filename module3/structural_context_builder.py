@@ -45,6 +45,13 @@ def _base_context_from_structure(structure_tensor: np.ndarray) -> np.ndarray:
     return out
 
 
+def _required_context_finite_mask(base_context: np.ndarray) -> np.ndarray:
+    req = np.asarray(base_context, dtype=np.float64)[
+        :, :, : int(ContextIdx.CTX_POC_VS_PREV_VA) + 1, :
+    ]
+    return np.all(np.isfinite(req), axis=2)
+
+
 def build_context_tensor(
     structure_tensor: np.ndarray,
     profile_regime_tensor: np.ndarray,
@@ -67,6 +74,7 @@ def build_context_tensor(
     ctx = np.full(base.shape, np.nan, dtype=np.float64)
     valid = np.zeros((A, T, W), dtype=bool)
     src_idx = np.full((A, T, W), -1, dtype=np.int64)
+    base_row_ok = _required_context_finite_mask(base)
 
     starts, ends = _session_spans(session_id_t)
     mode_s = str(mode)
@@ -81,7 +89,7 @@ def build_context_tensor(
 
                 for t in range(int(s0), int(s1)):
                     row = base[a, t, :, w]
-                    row_ok = bool(np.all(np.isfinite(row)))
+                    row_ok = bool(base_row_ok[a, t, w])
 
                     if mode_s == "ffill_last_complete":
                         if row_ok:
@@ -127,7 +135,7 @@ def build_context_tensor(
                         )
 
     if mode_s != "regime_context":
-        ctx[:, :, int(ContextIdx.CTX_REGIME_CODE), :] = np.nan
-        ctx[:, :, int(ContextIdx.CTX_REGIME_PERSISTENCE), :] = np.nan
+        ctx[:, :, int(ContextIdx.CTX_REGIME_CODE), :] = 0.0
+        ctx[:, :, int(ContextIdx.CTX_REGIME_PERSISTENCE), :] = 0.0
 
     return ctx, valid, src_idx

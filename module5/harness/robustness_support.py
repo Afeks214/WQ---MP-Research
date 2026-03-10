@@ -202,6 +202,8 @@ def compute_stats_verdict(
     spa_score = clip01_fn(1.0 - spa_p) if np.isfinite(spa_p) else 0.5
     survivors = set(int(i) for i in np.asarray(mcs.get("survivors", np.array([], dtype=np.int64))).tolist())
     rep_pos_by_col = {int(col): int(i) for i, col in enumerate(cluster_reps.tolist())}
+    research_mode = str(getattr(harness_cfg, "research_mode", "standard")).strip().lower()
+    discovery_mode = research_mode == "discovery"
 
     leaderboard: list[dict[str, Any]] = []
     for j, cid in enumerate(candidate_ids):
@@ -238,6 +240,10 @@ def compute_stats_verdict(
                 "execution_robustness": float(exec_j),
                 "horizon_robustness": float(horizon_robustness),
                 "robustness_score": float(score),
+                "research_mode": research_mode,
+                "standard_reject": reject,
+                "standard_pass": pass_flag,
+                "discovery_included": bool(discovery_mode),
                 "fragile": fragile,
                 "reject": reject,
                 "pass": pass_flag,
@@ -279,8 +285,14 @@ def compute_stats_verdict(
         },
         "leaderboard": leaderboard,
         "gate_defaults": {
+            "research_mode": research_mode,
             "robustness_reject_threshold": float(harness_cfg.robustness_reject_threshold),
             "execution_fragile_threshold": float(harness_cfg.execution_fragile_threshold),
             "mcs_membership_required": True,
+            "discovery_inclusion_policy": (
+                "all_baseline_complete_candidates"
+                if discovery_mode
+                else "policy_ranked_only"
+            ),
         },
     }

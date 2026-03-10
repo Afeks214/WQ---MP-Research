@@ -167,6 +167,7 @@ class Module4ConfigModel(BaseModel):
     stress_slippage_mult: float = 1.0
     hard_kill_on_daily_loss_breach: bool = True
     enable_degraded_bridge_mode: bool = True
+    execution_strict_prices: bool = True
 
     strategy_type: str = "legacy"
     score_gate: str = ""
@@ -193,6 +194,7 @@ class HarnessConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     seed: int = 97
+    research_mode: Literal["standard", "discovery"] = "standard"
     timezone: str = "America/New_York"
     freq: str = "1min"
     min_asset_coverage: float = 0.80

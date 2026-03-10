@@ -3,6 +3,54 @@ from __future__ import annotations
 from typing import Any, Callable
 
 import numpy as np
+from module3.schema import ContextIdx, StructIdx
+
+
+def _assert_or_flag_window_finite(
+    *,
+    features: dict[str, np.ndarray],
+    valid_mask_atw: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    mask = np.asarray(valid_mask_atw, dtype=bool)
+    if mask.ndim != 3:
+        raise RuntimeError(f"valid_mask_atw must be [A,T,W], got shape={mask.shape}")
+
+    updated = mask.copy()
+    invalid_count = 0
+    details: dict[str, Any] = {}
+
+    for name, arr in features.items():
+        x = np.asarray(arr, dtype=np.float64)
+        if x.ndim != 4:
+            raise RuntimeError(f"{name} must be [A,T,F,W], got shape={x.shape}")
+        if x.shape[0] != mask.shape[0] or x.shape[1] != mask.shape[1] or x.shape[3] != mask.shape[2]:
+            raise RuntimeError(
+                f"{name} shape mismatch vs valid_mask_atw: arr={x.shape}, mask={mask.shape}"
+            )
+        row_finite = np.all(np.isfinite(x), axis=2)
+        bad = mask & (~row_finite)
+        if np.any(bad):
+            details[name] = np.argwhere(bad)[:8].tolist()
+            invalid_count += int(np.sum(bad))
+            updated &= row_finite
+
+    return updated, {"invalid_count": invalid_count, "details": details}
+
+
+def _context_tensor_for_invariant(context_tensor: np.ndarray) -> np.ndarray:
+    x = np.asarray(context_tensor, dtype=np.float64).copy()
+    # Regime-context channels are optional outside regime_context mode; treat them as neutral when absent.
+    x[:, :, int(ContextIdx.CTX_REGIME_CODE), :] = 0.0
+    x[:, :, int(ContextIdx.CTX_REGIME_PERSISTENCE), :] = 0.0
+    return x
+
+
+def _structure_valid_mask_for_invariant(structure_tensor: np.ndarray) -> np.ndarray:
+    x = np.asarray(structure_tensor, dtype=np.float64)
+    if x.ndim != 4:
+        raise RuntimeError(f"structure_tensor must be [A,T,F,W], got shape={x.shape}")
+    # VALID_RATIO is zero-filled during warmup and cannot own the required-finite domain.
+    return np.isfinite(x[:, :, int(StructIdx.DCLIP_MEAN), :])
 
 
 def apply_post_m2_invariants(
@@ -93,30 +141,40 @@ def apply_pre_m4_invariants(
     state.bar_valid[:, :] = updated_bar
     set_placeholders_from_bar_valid_fn(state)
 
-    valid_at = np.asarray(state.bar_valid, dtype=bool).T
-    updated_m3_at, m3_flags = assert_or_flag_finite_fn(
+    structure_valid_atw = _structure_valid_mask_for_invariant(m3.structure_tensor)
+    context_valid_atw = (
+        np.asarray(m3.context_valid_atw, dtype=bool)
+        if getattr(m3, "context_valid_atw", None) is not None
+        else np.all(np.isfinite(np.asarray(m3.context_tensor, dtype=np.float64)), axis=2)
+    )
+
+    updated_structure_atw, structure_flags = _assert_or_flag_window_finite(
         features={
             "structure_tensor": np.asarray(m3.structure_tensor, dtype=np.float64),
-            "context_tensor": np.asarray(m3.context_tensor, dtype=np.float64),
             "profile_fingerprint_tensor": np.asarray(m3.profile_fingerprint_tensor, dtype=np.float64),
             "profile_regime_tensor": np.asarray(m3.profile_regime_tensor, dtype=np.float64),
         },
-        valid_mask=valid_at,
-        context="pre_m4_m3_window",
+        valid_mask_atw=structure_valid_atw,
     )
-    if int(m3_flags.get("invalid_count", 0)) > 0:
+    updated_context_atw, context_flags = _assert_or_flag_window_finite(
+        features={"context_tensor": _context_tensor_for_invariant(m3.context_tensor)},
+        valid_mask_atw=context_valid_atw,
+    )
+
+    if int(structure_flags.get("invalid_count", 0)) > 0 or int(context_flags.get("invalid_count", 0)) > 0:
         reasons.append("INVARIANT_PRE_M4_M3_WINDOW_NONFINITE")
-    state.bar_valid[:, :] = np.asarray(state.bar_valid, dtype=bool) & updated_m3_at.T
-    set_placeholders_from_bar_valid_fn(state)
-    valid_at = np.asarray(state.bar_valid, dtype=bool).T
-    m3.structure_tensor[:, :, :, :] = np.where(valid_at[:, :, None, None], m3.structure_tensor, 0.0)
-    m3.context_tensor[:, :, :, :] = np.where(valid_at[:, :, None, None], m3.context_tensor, 0.0)
-    m3.profile_fingerprint_tensor[:, :, :, :] = np.where(valid_at[:, :, None, None], m3.profile_fingerprint_tensor, 0.0)
-    m3.profile_regime_tensor[:, :, :, :] = np.where(valid_at[:, :, None, None], m3.profile_regime_tensor, 0.0)
+    m3.structure_tensor[:, :, :, :] = np.where(updated_structure_atw[:, :, None, :], m3.structure_tensor, 0.0)
+    m3.profile_fingerprint_tensor[:, :, :, :] = np.where(
+        updated_structure_atw[:, :, None, :], m3.profile_fingerprint_tensor, 0.0
+    )
+    m3.profile_regime_tensor[:, :, :, :] = np.where(
+        updated_structure_atw[:, :, None, :], m3.profile_regime_tensor, 0.0
+    )
+    m3.context_tensor[:, :, :, :] = np.where(updated_context_atw[:, :, None, :], m3.context_tensor, 0.0)
     if m3.context_valid_atw is not None:
-        m3.context_valid_atw[:, :, :] = np.where(valid_at[:, :, None], m3.context_valid_atw, False)
+        m3.context_valid_atw[:, :, :] = updated_context_atw
     if m3.context_source_index_atw is not None:
-        m3.context_source_index_atw[:, :, :] = np.where(valid_at[:, :, None], m3.context_source_index_atw, -1)
+        m3.context_source_index_atw[:, :, :] = np.where(updated_context_atw, m3.context_source_index_atw, -1)
 
     updated_ctx, ctx_flags = assert_or_flag_finite_fn(
         features={"context_tac": np.asarray(m3.context_tac, dtype=np.float64)},

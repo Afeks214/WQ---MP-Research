@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from module3.structural_context_builder import build_context_tensor
 from weightiz_module1_core import EngineConfig, Phase, ProfileStatIdx, ScoreIdx, preallocate_state
 import weightiz_module3_structure as module3
 from weightiz_module3_structure import (
@@ -86,6 +87,38 @@ def _set_vp_peak(state, t: int, a: int, bins, values):
 
 
 class TestModule3Structure(unittest.TestCase):
+    def test_window_context_validity_ignores_optional_regime_channels_in_non_regime_modes(self):
+        A = 1
+        T = 3
+        W = 1
+        structure = np.full((A, T, int(module3.StructIdx.N_FIELDS), W), np.nan, dtype=np.float64)
+        for s_idx in [
+            module3.StructIdx.X_POC,
+            module3.StructIdx.X_VAH,
+            module3.StructIdx.X_VAL,
+            module3.StructIdx.VA_WIDTH_X,
+            module3.StructIdx.DCLIP_MEAN,
+            module3.StructIdx.AFFINITY_MEAN,
+            module3.StructIdx.ZDELTA_MEAN,
+            module3.StructIdx.DELTA_EFF_MEAN,
+            module3.StructIdx.TREND_GATE_SPREAD_MEAN,
+            module3.StructIdx.POC_DRIFT_X,
+            module3.StructIdx.VALID_RATIO,
+            module3.StructIdx.IB_HIGH_X,
+            module3.StructIdx.IB_LOW_X,
+            module3.StructIdx.POC_VS_PREV_VA,
+        ]:
+            structure[:, :, int(s_idx), :] = 1.0
+        regime = np.zeros((A, T, 1, W), dtype=np.float64)
+        session_id = np.zeros(T, dtype=np.int64)
+
+        ctx, valid, src = build_context_tensor(structure, regime, session_id, mode="ffill_last_complete")
+
+        self.assertTrue(np.all(valid))
+        np.testing.assert_array_equal(src[:, :, 0], np.array([[0, 1, 2]], dtype=np.int64))
+        self.assertTrue(np.all(ctx[:, :, int(ContextIdx.CTX_REGIME_CODE), :] == 0.0))
+        self.assertTrue(np.all(ctx[:, :, int(ContextIdx.CTX_REGIME_PERSISTENCE), :] == 0.0))
+
     def test_block_start_end_integrity_same_block_id(self):
         state = _make_state(T=20, A=1)
         state.vp[:, :, 120] = 1.0

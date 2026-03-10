@@ -192,6 +192,233 @@ def _configure_deterministic_runtime(seed: int) -> None:
     random.seed(int(seed))
 
 
+def _distribution_summary(values: Any) -> dict[str, Any]:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    finite = arr[np.isfinite(arr)]
+    if finite.size <= 0:
+        return {
+            "count": int(arr.size),
+            "finite_count": 0,
+            "available": False,
+            "note": "no finite values",
+        }
+    return {
+        "count": int(arr.size),
+        "finite_count": int(finite.size),
+        "available": True,
+        "min": float(np.min(finite)),
+        "p05": float(np.percentile(finite, 5)),
+        "median": float(np.median(finite)),
+        "mean": float(np.mean(finite)),
+        "p95": float(np.percentile(finite, 95)),
+        "max": float(np.max(finite)),
+    }
+
+
+def _load_plan_doc(path: Path) -> Optional[dict[str, Any]]:
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    return raw if isinstance(raw, dict) else None
+
+
+def _extract_family_entries(plan_doc: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not isinstance(plan_doc, dict):
+        return []
+    for key in ("adaptive_local_run", "local_short_run", "later_cloud_run_20k"):
+        section = plan_doc.get(key)
+        if isinstance(section, dict):
+            entries = section.get("family_entries")
+            if isinstance(entries, list):
+                return [dict(x) for x in entries if isinstance(x, dict)]
+    return []
+
+
+def _family_name_from_m4_idx(m4_idx: Any, family_entries: list[dict[str, Any]]) -> str:
+    try:
+        idx = int(m4_idx)
+    except Exception:
+        return "unknown"
+    for entry in family_entries:
+        rng = entry.get("local_m4_index_range")
+        if not isinstance(rng, list) or len(rng) != 2:
+            continue
+        lo = int(rng[0])
+        hi = int(rng[1])
+        if lo <= idx <= hi:
+            return str(entry.get("family_name", "unknown"))
+    return "unknown"
+
+
+def _build_research_distribution_report(
+    *,
+    run_dir: Path,
+    research_mode: str,
+    plan_doc: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "run_dir": str(run_dir),
+        "research_mode": str(research_mode),
+        "notes": [],
+    }
+    family_entries = _extract_family_entries(plan_doc)
+    leaderboard_path = run_dir / "robustness_leaderboard.csv"
+    if pd is None:
+        report["notes"].append("pandas_unavailable")
+        return report
+    if not leaderboard_path.exists():
+        report["notes"].append("missing_robustness_leaderboard.csv")
+        return report
+
+    leaderboard = pd.read_csv(leaderboard_path)
+    if leaderboard.shape[0] <= 0:
+        report["notes"].append("empty_robustness_leaderboard.csv")
+        return report
+
+    standard_reject_col = "standard_reject" if "standard_reject" in leaderboard.columns else "reject"
+    standard_pass_col = "standard_pass" if "standard_pass" in leaderboard.columns else "pass"
+    if "discovery_included" not in leaderboard.columns:
+        leaderboard["discovery_included"] = bool(str(research_mode).strip().lower() == "discovery")
+
+    leaderboard["family_name"] = leaderboard["m4_idx"].map(lambda x: _family_name_from_m4_idx(x, family_entries))
+    leaderboard["block_window"] = leaderboard["block_minutes"].astype(int) if "block_minutes" in leaderboard.columns else -1
+
+    daily_path = run_dir / "daily_returns.parquet"
+    sharpe_map: dict[str, float] = {}
+    effective_return_signatures = 0
+    signature_group_sizes: list[int] = []
+    if daily_path.exists():
+        daily = pd.read_parquet(daily_path)
+        candidate_cols = [c for c in daily.columns if c not in {"session_id", "benchmark"}]
+        signature_groups: dict[bytes, list[str]] = {}
+        for col in candidate_cols:
+            vec = np.asarray(daily[col], dtype=np.float64)
+            finite = np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
+            sd = float(np.std(finite, ddof=1)) if finite.size >= 2 else 0.0
+            sharpe_map[str(col)] = float(np.mean(finite) / sd * np.sqrt(252.0)) if finite.size >= 2 and sd > 0.0 else 0.0
+            sig = np.round(np.nan_to_num(vec, nan=9.999e99), 12).tobytes()
+            signature_groups.setdefault(sig, []).append(str(col))
+        effective_return_signatures = int(len(signature_groups))
+        signature_group_sizes = sorted((len(v) for v in signature_groups.values()), reverse=True)
+    else:
+        report["notes"].append("missing_daily_returns.parquet")
+
+    leaderboard["sharpe_daily"] = leaderboard["candidate_id"].map(lambda x: float(sharpe_map.get(str(x), 0.0)))
+
+    trade_path = run_dir / "trade_log.parquet"
+    trade_counts: dict[str, int] = {}
+    if trade_path.exists():
+        trade_df = pd.read_parquet(trade_path)
+        if "candidate_id" in trade_df.columns and trade_df.shape[0] > 0:
+            trade_counts = {str(k): int(v) for k, v in trade_df["candidate_id"].value_counts().to_dict().items()}
+    else:
+        report["notes"].append("missing_trade_log.parquet")
+    leaderboard["executed_trade_count"] = leaderboard["candidate_id"].map(lambda x: int(trade_counts.get(str(x), 0)))
+
+    standard_reject_counts = {str(k): int(v) for k, v in leaderboard[standard_reject_col].value_counts(dropna=False).to_dict().items()}
+    standard_pass_counts = {str(k): int(v) for k, v in leaderboard[standard_pass_col].value_counts(dropna=False).to_dict().items()}
+    discovery_included_count = int(np.sum(np.asarray(leaderboard["discovery_included"], dtype=bool)))
+    cluster_counts = {str(k): int(v) for k, v in leaderboard["cluster_id"].value_counts(dropna=False).to_dict().items()} if "cluster_id" in leaderboard.columns else {}
+
+    positive_expectancy_mask = np.asarray(leaderboard.get("cum_return", pd.Series(np.zeros(len(leaderboard)))), dtype=np.float64) > 0.0
+    positive_sharpe_mask = np.asarray(leaderboard["sharpe_daily"], dtype=np.float64) > 0.0
+    traded_mask = np.asarray(leaderboard["executed_trade_count"], dtype=np.int64) > 0
+
+    def _group_summary(group_cols: list[str]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        gb = leaderboard.groupby(group_cols, dropna=False, sort=True)
+        for key, frame in gb:
+            key_tuple = key if isinstance(key, tuple) else (key,)
+            row = {group_cols[i]: (int(key_tuple[i]) if group_cols[i] == "block_window" else str(key_tuple[i])) for i in range(len(group_cols))}
+            row.update(
+                {
+                    "candidate_count": int(len(frame)),
+                    "discovery_included_count": int(np.sum(np.asarray(frame["discovery_included"], dtype=bool))),
+                    "standard_reject_count": int(np.sum(np.asarray(frame[standard_reject_col], dtype=bool))),
+                    "standard_pass_count": int(np.sum(np.asarray(frame[standard_pass_col], dtype=bool))),
+                    "executed_trade_count": int(np.sum(np.asarray(frame["executed_trade_count"], dtype=np.int64) > 0)),
+                    "positive_expectancy_count": int(np.sum(np.asarray(frame["cum_return"], dtype=np.float64) > 0.0)),
+                    "positive_sharpe_count": int(np.sum(np.asarray(frame["sharpe_daily"], dtype=np.float64) > 0.0)),
+                    "mean_robustness_score": float(np.mean(np.asarray(frame["robustness_score"], dtype=np.float64))),
+                    "mean_execution_robustness": float(np.mean(np.asarray(frame["execution_robustness"], dtype=np.float64))),
+                    "mean_cum_return": float(np.mean(np.asarray(frame["cum_return"], dtype=np.float64))),
+                    "mean_sharpe_daily": float(np.mean(np.asarray(frame["sharpe_daily"], dtype=np.float64))),
+                    "cluster_ids": sorted(int(x) for x in set(np.asarray(frame["cluster_id"], dtype=np.int64).tolist())) if "cluster_id" in frame.columns else [],
+                }
+            )
+            out.append(row)
+        return out
+
+    family_summary = _group_summary(["family_name"])
+    window_summary = _group_summary(["block_window"])
+    family_window_summary = _group_summary(["family_name", "block_window"])
+    top_regions = sorted(
+        family_window_summary,
+        key=lambda x: (
+            -float(x["positive_expectancy_count"]),
+            -float(x["mean_robustness_score"]),
+            -float(x["mean_sharpe_daily"]),
+            str(x["family_name"]),
+            int(x["block_window"]),
+        ),
+    )[:8]
+
+    top_n = max(1, int(np.ceil(0.05 * float(len(leaderboard)))))
+    top_df = leaderboard.sort_values(
+        ["robustness_score", "cum_return", "sharpe_daily", "candidate_id"],
+        ascending=[False, False, False, True],
+        kind="mergesort",
+    ).head(top_n)
+
+    report.update(
+        {
+            "plan_available": bool(plan_doc is not None),
+            "family_entries_count": int(len(family_entries)),
+            "candidate_count": int(len(leaderboard)),
+            "standard_reject_counts": standard_reject_counts,
+            "standard_pass_counts": standard_pass_counts,
+            "discovery_included_candidates": int(discovery_included_count),
+            "effective_return_signature_count": int(effective_return_signatures),
+            "distinct_robustness_score_count": int(leaderboard["robustness_score"].nunique(dropna=False)),
+            "distinct_execution_robustness_count": int(leaderboard["execution_robustness"].nunique(dropna=False)),
+            "family_representation_counts": {str(k): int(v) for k, v in leaderboard["family_name"].value_counts(dropna=False).to_dict().items()},
+            "window_representation_counts": {str(k): int(v) for k, v in leaderboard["block_window"].value_counts(dropna=False).sort_index().to_dict().items()},
+            "count_with_executed_trades": int(np.sum(traded_mask)),
+            "count_with_positive_expectancy": int(np.sum(positive_expectancy_mask)),
+            "count_with_positive_sharpe": int(np.sum(positive_sharpe_mask)),
+            "sharpe_distribution": _distribution_summary(leaderboard["sharpe_daily"]),
+            "return_distribution": _distribution_summary(leaderboard["cum_return"]),
+            "drawdown_distribution": _distribution_summary(leaderboard["max_drawdown"]),
+            "cluster_analysis": {
+                "cluster_count": int(leaderboard["cluster_id"].nunique(dropna=False)) if "cluster_id" in leaderboard.columns else 0,
+                "cluster_counts": cluster_counts,
+                "signature_group_sizes_top20": signature_group_sizes[:20],
+            },
+            "top_5_percent_candidate_metrics": top_df[
+                [
+                    "candidate_id",
+                    "family_name",
+                    "block_window",
+                    "robustness_score",
+                    "execution_robustness",
+                    "cum_return",
+                    "max_drawdown",
+                    "sharpe_daily",
+                    standard_reject_col,
+                    standard_pass_col,
+                    "discovery_included",
+                    "cluster_id",
+                ]
+            ].to_dict(orient="records"),
+            "family_level_summary": family_summary,
+            "window_level_summary": window_summary,
+            "top_family_window_regions": top_regions,
+        }
+    )
+    return report
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     logger = get_logger("run_research")
@@ -286,6 +513,19 @@ def main() -> None:
 
     leaderboard = out.stats_verdict.get("leaderboard", [])
     pass_count = int(sum(1 for row in leaderboard if bool(row.get("pass", False))))
+    research_report_path = run_dir / "research_distribution_report.json"
+    research_report: Optional[dict[str, Any]] = None
+    if str(getattr(harness_cfg, "research_mode", "standard")).strip().lower() == "discovery":
+        plan_path = config_path.with_name(f"{config_path.stem}_plan.yaml")
+        research_report = _build_research_distribution_report(
+            run_dir=run_dir,
+            research_mode=str(harness_cfg.research_mode),
+            plan_doc=_load_plan_doc(plan_path),
+        )
+        research_report["config_path"] = str(config_path)
+        research_report["plan_path"] = str(plan_path) if plan_path.exists() else None
+        with research_report_path.open("w", encoding="utf-8") as f:
+            json.dump(research_report, f, ensure_ascii=False, indent=2)
 
     report_root = Path(harness_cfg.report_dir).resolve()
     artifacts_root = report_root.parent if report_root.name == "module5_harness" else report_root
@@ -317,7 +557,12 @@ def main() -> None:
         "run_index": str((artifacts_root / "run_index.jsonl").resolve()),
         "latest_run": str((artifacts_root / ".latest_run").resolve()),
         "runtime_warning_count": int(runtime_warning_count),
+        "research_mode": str(getattr(harness_cfg, "research_mode", "standard")),
     }
+    if research_report is not None:
+        summary["research_distribution_report"] = str(research_report_path)
+        summary["discovery_included_candidates"] = int(research_report.get("discovery_included_candidates", 0))
+        summary["standard_reject_counts"] = research_report.get("standard_reject_counts", {})
 
     with (run_dir / "run_summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)

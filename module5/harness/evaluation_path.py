@@ -375,6 +375,29 @@ def collect_micro_diagnostics_payload(
     winner_flag = (
         m4_out.overnight_winner_t[t_idx].astype(np.int64) == a_idx.astype(np.int64)
     ).astype(np.int8)
+    context_valid_ta = m3.context_valid_ta[t_idx, a_idx].astype(np.int8)
+    context_source_t_index_ta = m3.context_source_t_index_ta[t_idx, a_idx].astype(np.int64)
+
+    context_valid_any_window = None
+    context_valid_all_windows = None
+    context_source_index_first_valid_window = None
+    context_source_index_last_valid_window = None
+    if getattr(m3, "context_valid_atw", None) is not None:
+        context_valid_rows = np.asarray(m3.context_valid_atw[a_idx, t_idx, :], dtype=bool)
+        context_valid_any_window = np.any(context_valid_rows, axis=1).astype(np.int8)
+        context_valid_all_windows = np.all(context_valid_rows, axis=1).astype(np.int8)
+        if getattr(m3, "context_source_index_atw", None) is not None:
+            context_source_rows = np.asarray(m3.context_source_index_atw[a_idx, t_idx, :], dtype=np.int64)
+            first_valid = np.full(t_idx.shape[0], -1, dtype=np.int64)
+            last_valid = np.full(t_idx.shape[0], -1, dtype=np.int64)
+            for row_idx in range(t_idx.shape[0]):
+                valid_windows = np.flatnonzero(context_valid_rows[row_idx])
+                if valid_windows.size == 0:
+                    continue
+                first_valid[row_idx] = context_source_rows[row_idx, int(valid_windows[0])]
+                last_valid[row_idx] = context_source_rows[row_idx, int(valid_windows[-1])]
+            context_source_index_first_valid_window = first_valid
+            context_source_index_last_valid_window = last_valid
 
     return {
         "ts_ns": state.ts_ns[t_idx].astype(np.int64),
@@ -405,6 +428,12 @@ def collect_micro_diagnostics_payload(
         "ctx_poc_vs_prev_va": m3.context_tac[t_idx, a_idx, int(ContextIdx.CTX_POC_VS_PREV_VA)].astype(np.float64),
         "ctx_ib_high_x": m3.context_tac[t_idx, a_idx, int(ContextIdx.CTX_IB_HIGH_X)].astype(np.float64),
         "ctx_ib_low_x": m3.context_tac[t_idx, a_idx, int(ContextIdx.CTX_IB_LOW_X)].astype(np.float64),
+        "context_valid_ta": context_valid_ta,
+        "context_source_t_index_ta": context_source_t_index_ta,
+        "context_valid_any_window": context_valid_any_window,
+        "context_valid_all_windows": context_valid_all_windows,
+        "context_source_index_first_valid_window": context_source_index_first_valid_window,
+        "context_source_index_last_valid_window": context_source_index_last_valid_window,
         "regime_primary": m4_out.regime_primary_ta[t_idx, a_idx].astype(np.int8),
         "regime_confidence": m4_out.regime_confidence_ta[t_idx, a_idx].astype(np.float64),
         "intent_long": m4_out.intent_long_ta[t_idx, a_idx].astype(np.int8),

@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import numpy as np
+import run_research
 
 try:
     import pandas as pd
@@ -179,6 +180,32 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
 
         st = preallocate_state(ts_ns=ts_ns, cfg=cfg, symbols=("S1", "S2"), clock_override=clk)
         validate_state_hard(st)
+
+    def test_pre_m4_structure_invariant_ignores_valid_ratio_warmup_rows(self) -> None:
+        ts_ns = self._utc_minute_ns("2024-01-03T14:30:00", periods=3)
+        cfg = self._cfg(T=ts_ns.shape[0], A=1)
+        st = preallocate_state(ts_ns=ts_ns, cfg=cfg, symbols=("S1",))
+        st.open_px[:, 0] = np.array([100.0, 101.0, 102.0], dtype=np.float64)
+        st.high_px[:, 0] = np.array([101.0, 102.0, 103.0], dtype=np.float64)
+        st.low_px[:, 0] = np.array([99.0, 100.0, 101.0], dtype=np.float64)
+        st.close_px[:, 0] = np.array([100.5, 101.5, 102.5], dtype=np.float64)
+        st.volume[:, 0] = np.array([1000.0, 1001.0, 1002.0], dtype=np.float64)
+        st.profile_stats[:, 0, :] = 0.0
+        st.scores[:, 0, :] = 0.0
+        st.bar_valid[:, 0] = True
+        h._set_placeholders_from_bar_valid(st)
+
+        m3 = self._dummy_m3(st)
+        m3.context_valid_atw = np.ones((1, 3, 1), dtype=bool)
+        m3.context_source_index_atw = np.zeros((1, 3, 1), dtype=np.int64)
+        m3.structure_tensor[:, :, :, :] = 0.0
+        m3.structure_tensor[0, 0, int(Struct30mIdx.VALID_RATIO), 0] = 0.0
+        m3.structure_tensor[0, 0, int(Struct30mIdx.DCLIP_MEAN), 0] = np.nan
+
+        reasons = h._apply_pre_m4_invariants(st, m3)
+
+        self.assertNotIn("INVARIANT_PRE_M4_M3_WINDOW_NONFINITE", reasons)
+        self.assertTrue(np.all(m3.structure_tensor[0, 0, :, 0] == 0.0))
 
     def test_split_purge_embargo_no_leakage(self) -> None:
         T = 500
@@ -756,6 +783,85 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
             self.assertTrue(bool(run_status.get("execution_topology", {}).get("process_pool_candidate_split", False)))
             self.assertFalse(bool(run_status.get("execution_topology", {}).get("grouped_post_m2_reuse_active", True)))
             self.assertFalse(bool(run_status.get("execution_topology", {}).get("grouped_post_m3_reuse_active", True)))
+
+    def test_bounded_active_worker_count_caps_pending_futures(self) -> None:
+        self.assertEqual(h._bounded_active_worker_count(pending_count=910, effective_workers=7), 7)
+        self.assertEqual(h._bounded_active_worker_count(pending_count=3, effective_workers=7), 3)
+        self.assertEqual(h._bounded_active_worker_count(pending_count=0, effective_workers=7), 0)
+        self.assertEqual(h._bounded_active_worker_count(pending_count=-4, effective_workers=7), 0)
+        self.assertEqual(h._bounded_active_worker_count(pending_count=5, effective_workers=0), 1)
+
+    def test_research_distribution_report_counts_discovery_included_candidates(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="m5_research_report_") as td:
+            run_dir = Path(td) / "run"
+            run_dir.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "candidate_id": "cand_a",
+                        "m4_idx": 0,
+                        "block_minutes": 15,
+                        "cluster_id": 0,
+                        "robustness_score": 0.42,
+                        "execution_robustness": 0.15,
+                        "cum_return": 0.01,
+                        "max_drawdown": 0.02,
+                        "standard_reject": True,
+                        "standard_pass": False,
+                        "discovery_included": True,
+                    },
+                    {
+                        "candidate_id": "cand_b",
+                        "m4_idx": 24,
+                        "block_minutes": 20,
+                        "cluster_id": 1,
+                        "robustness_score": 0.35,
+                        "execution_robustness": 0.05,
+                        "cum_return": -0.01,
+                        "max_drawdown": 0.03,
+                        "standard_reject": True,
+                        "standard_pass": False,
+                        "discovery_included": True,
+                    },
+                ]
+            ).to_csv(run_dir / "robustness_leaderboard.csv", index=False)
+            pd.DataFrame(
+                {
+                    "session_id": [1, 2, 3],
+                    "benchmark": [0.0, 0.0, 0.0],
+                    "cand_a": [0.01, -0.01, 0.02],
+                    "cand_b": [0.02, -0.02, 0.01],
+                }
+            ).to_parquet(run_dir / "daily_returns.parquet", index=False)
+            pd.DataFrame(
+                {
+                    "candidate_id": ["cand_a", "cand_a", "cand_b"],
+                    "filled_qty": [1.0, -1.0, 1.0],
+                }
+            ).to_parquet(run_dir / "trade_log.parquet", index=False)
+
+            plan_doc = {
+                "adaptive_local_run": {
+                    "family_entries": [
+                        {"family_name": "family_a_activation_frontier", "local_m4_index_range": [0, 23]},
+                        {"family_name": "family_b_hysteresis_persistence", "local_m4_index_range": [24, 47]},
+                    ]
+                }
+            }
+
+            report = run_research._build_research_distribution_report(
+                run_dir=run_dir,
+                research_mode="discovery",
+                plan_doc=plan_doc,
+            )
+
+            self.assertEqual(int(report["discovery_included_candidates"]), 2)
+            self.assertEqual(int(report["effective_return_signature_count"]), 2)
+            self.assertEqual(int(report["count_with_executed_trades"]), 2)
+            self.assertEqual(int(report["count_with_positive_expectancy"]), 1)
+            self.assertIn("family_a_activation_frontier", report["family_representation_counts"])
+            self.assertIn("family_b_hysteresis_persistence", report["family_representation_counts"])
 
     def test_aggregate_candidate_baseline_matrix_keeps_zero_return_days(self) -> None:
         bench_sessions = np.asarray([101, 102, 103, 104, 105], dtype=np.int64)

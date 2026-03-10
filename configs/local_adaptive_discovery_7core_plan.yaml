@@ -1,0 +1,192 @@
+plan_name: local_adaptive_discovery_7core_plan
+source_config: configs/local_adaptive_discovery_7core.yaml
+research_mode: discovery
+live_axes:
+- module3.block_minutes
+- module4.entry_threshold
+- module4.exit_threshold
+- module4.regime_confidence_min
+- module4.window_selection_mode
+- module4.fixed_window_index
+- module4.anchor_window_index
+- module4.max_abs_weight
+- module4.conviction_scale
+- module4.conviction_clip
+- module4.trend_spread_min
+- module4.trend_poc_drift_min_abs
+- module4.neutral_poc_drift_max_abs
+- module4.shape_skew_min_abs
+- module4.double_dist_sep_x
+- module4.double_dist_valley_frac
+- module4.max_volatility
+- module4.max_spread
+- module4.min_liquidity
+dead_axes:
+- module4.top_k_intraday
+- module4.max_asset_cap_frac
+- module4.max_turnover_frac_per_bar
+- module4.overnight_min_conviction
+- module4.allow_cash_overnight
+- module4.commission_bps
+- module4.spread_tick_mult
+- module4.slippage_bps_low_rvol
+- module4.slippage_bps_mid_rvol
+- module4.slippage_bps_high_rvol
+- module4.stress_slippage_mult
+- module4.hard_kill_on_daily_loss_breach
+- module4.execution_strict_prices
+- module4.strategy_type
+- module4.score_gate
+- module4.score_gate_rule
+- module4.deviation_signal
+- module4.deviation_rule
+- module4.entry_model
+- module4.exit_model
+- module4.origin_level
+- module4.direction
+- module4.delta_th
+- module4.dev_th
+- module4.tp_mult
+- module4.atr_stop_mult
+uncertain_axes:
+- module3.block_minutes
+- module3.include_partial_last_block
+- module3.min_block_valid_ratio
+- module3.ib_pop_frac
+- module4.max_volatility
+- module4.max_spread
+- module4.min_liquidity
+module3_block_windows:
+- 15
+- 20
+- 30
+- 40
+canonical_internal_module4_windows:
+- 5
+- 15
+- 30
+- 60
+adaptive_local_run:
+  config_path: configs/local_adaptive_discovery_7core.yaml
+  module2_window_count: 1
+  module3_window_count: 4
+  total_m4_configs: 96
+  total_candidates: 384
+  candidate_count_per_block_window: 96
+  family_entries:
+  - family_name: family_a_activation_frontier
+    research_purpose: Expand the entry/regime activation frontier under adaptive multi-window
+      selection.
+    local_live_axes:
+      entry_threshold:
+      - 0.48
+      - 0.54
+      - 0.6
+      - 0.66
+      - 0.72
+      - 0.78
+      regime_confidence_min:
+      - 0.4
+      - 0.52
+      - 0.64
+      - 0.76
+    local_m4_index_range:
+    - 0
+    - 23
+    local_m4_config_count: 24
+    local_candidate_count: 96
+  - family_name: family_b_hysteresis_persistence
+    research_purpose: Test hold-vs-churn persistence with entry/exit hysteresis and
+      conviction scaling.
+    local_live_axes:
+      entry_threshold:
+      - 0.5
+      - 0.58
+      - 0.66
+      - 0.74
+      exit_threshold:
+      - 0.1
+      - 0.2
+      - 0.3
+      conviction_scale:
+      - 0.85
+      - 1.15
+    local_m4_index_range:
+    - 24
+    - 47
+    local_m4_config_count: 24
+    local_candidate_count: 96
+  - family_name: family_c_regime_classification
+    research_purpose: Probe regime taxonomy sensitivity by moving trend and shape
+      thresholds with confidence filtering.
+    local_live_axes:
+      trend_spread_min:
+      - 0.03
+      - 0.05
+      - 0.07
+      - 0.09
+      shape_skew_min_abs:
+      - 0.2
+      - 0.35
+      - 0.5
+      regime_confidence_min:
+      - 0.5
+      - 0.68
+    local_m4_index_range:
+    - 48
+    - 71
+    local_m4_config_count: 24
+    local_candidate_count: 96
+  - family_name: family_d_window_scale_specialists
+    research_purpose: Force single-window specialists and vary allocation concentration
+      and conviction clipping.
+    local_live_axes:
+      fixed_window_index:
+      - 0
+      - 1
+      - 2
+      - 3
+      max_abs_weight:
+      - 0.25
+      - 0.5
+      - 0.75
+      conviction_clip:
+      - 0.75
+      - 1.25
+    local_m4_index_range:
+    - 72
+    - 95
+    local_m4_config_count: 24
+    local_candidate_count: 96
+discovery_mode_policy:
+  hard_fatal:
+  - non-finite active-domain outputs
+  - shape or contract mismatches
+  - impossible state failures
+  - worker contract failures
+  - risk-engine contract failures
+  - canonical execution authority violations
+  soft_flag:
+  - localized invariant reason codes with completed evaluation
+  - fragile execution flags
+  - candidate-level execution warnings that preserve runtime trust
+  analysis_only:
+  - threshold rejection policy
+  - pass/fail policy thresholds for acceptance
+  - execution robustness gating as a research filter
+report_artifact:
+  path: research_distribution_report.json
+  required_fields:
+  - sharpe_distribution
+  - return_distribution
+  - drawdown_distribution
+  - cluster_analysis
+  - top_5_percent_candidate_metrics
+  - family_level_summary
+  - window_level_summary
+  - standard_reject_counts
+  - standard_pass_counts
+  - discovery_included_candidates
+  - effective_return_signature_count
+  - distinct_robustness_score_count
+  - distinct_execution_robustness_count

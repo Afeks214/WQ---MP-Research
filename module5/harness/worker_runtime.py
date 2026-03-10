@@ -5,6 +5,17 @@ from typing import Any, Callable
 
 import numpy as np
 
+_REQUIRED_WORKER_CONTEXT_KEYS = (
+    "base_state",
+    "candidates",
+    "splits",
+    "scenarios",
+    "m2_configs",
+    "m3_configs",
+    "m4_configs",
+    "harness_cfg",
+)
+
 
 def safe_execute_task(
     group: Any,
@@ -85,6 +96,10 @@ def run_group_task_from_context(
 ) -> list[dict[str, Any]]:
     if worker_context is None:
         raise RuntimeError("Worker context not initialized")
+    missing = [key for key in _REQUIRED_WORKER_CONTEXT_KEYS if key not in worker_context]
+    if missing:
+        missing_keys = ", ".join(missing)
+        raise RuntimeError(f"Worker context missing required keys: {missing_keys}")
     return run_group_task_fn(
         group=group,
         base_state=worker_context["base_state"],
