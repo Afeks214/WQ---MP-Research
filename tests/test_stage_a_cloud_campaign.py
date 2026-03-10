@@ -33,12 +33,15 @@ def test_stage_a_cloud_builder_hits_locked_campaign_shape() -> None:
     assert validated.harness.parallel_backend == STAGE_A_PROCESS_BACKEND
     assert validated.harness.parallel_workers == STAGE_A_PROCESS_WORKERS
     assert validated.harness.robustness_reject_threshold == STAGE_A_RESEARCH_THRESHOLD
+    assert len(validated.module2_configs) == 1
     assert tuple(validated.module3_configs[0].structural_windows) == STAGE_A_WINDOW_SET
     assert len(validated.candidates.specs) == STAGE_A_TOTAL_CANDIDATES
     assert int(plan["total_candidates"]) == STAGE_A_TOTAL_CANDIDATES
+    assert int(plan["module2_config_count"]) == 1
     assert float(plan["live_gate_threshold"]) == STAGE_A_LIVE_ENTRY_THRESHOLD
     assert str(plan["live_gate_threshold_ownership"]) == "module4.entry_threshold"
     assert {float(cfg.entry_threshold) for cfg in validated.module4_configs} == {STAGE_A_LIVE_ENTRY_THRESHOLD}
+    assert {int(spec.m2_idx) for spec in validated.candidates.specs} == {0}
 
     family_counts: dict[str, int] = {}
     for spec in validated.candidates.specs:

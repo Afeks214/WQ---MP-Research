@@ -25,9 +25,9 @@ structural_window_set:
 - 90
 - 240
 total_candidates: 5000
-module2_config_count: 362
+module2_config_count: 1
 module3_config_count: 121
-module4_config_count: 778
+module4_config_count: 3509
 family_entries:
 - family_id: F1
   family_name: acceptance_rejection_geometry
@@ -42,9 +42,9 @@ family_entries:
   - 90
   - 240
   live_axes:
-  - module2.reject_center
-  - module2.d_clip
-  - module2.va_threshold
+  - module4.exit_threshold
+  - module4.trend_spread_min
+  - module4.trend_poc_drift_min_abs
   hypothesis: Acceptance / rejection geometry around POC, VAH, VAL and value width.
   live_role: window_probe
 - family_id: F2
@@ -60,9 +60,9 @@ family_entries:
   - 90
   - 240
   live_axes:
-  - module2.delta_gate_threshold
-  - module2.trend_delta_confirm_z
-  - module2.mu2_clv_shift
+  - module4.exit_threshold
+  - module4.regime_confidence_min
+  - module4.conviction_scale
   hypothesis: Deviation only matters when aggression confirms or denies the move.
   live_role: window_probe
 - family_id: F3
@@ -78,9 +78,9 @@ family_entries:
   - 90
   - 240
   live_axes:
-  - module2.rvol_trend_cutoff
-  - module2.body_trend_cutoff
-  - module2.volume_cap_mad_mult
+  - module4.exit_threshold
+  - module4.regime_confidence_min
+  - module4.conviction_scale
   hypothesis: The same geometry means something different under low and high participation.
   live_role: window_probe
 - family_id: F4
@@ -134,7 +134,7 @@ family_entries:
   - module4.shape_skew_min_abs
   - module4.double_dist_sep_x
   - module4.double_dist_valley_frac
-  - module2.normal_concentration_threshold
+  - module4.regime_confidence_min
   restricted_window_subset_justification: Shape hypotheses are restricted to 30/60/90/240
     minute structure because the shortest windows do not carry enough stable shape
     information.

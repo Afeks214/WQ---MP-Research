@@ -267,14 +267,15 @@ def _candidate_spec(candidate_id: str, m2_idx: int, m3_idx: int, m4_idx: int, ta
     }
 
 
-def _build_f1(reg: ConfigRegistry, m3_idx: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _build_f1(reg: ConfigRegistry, m2_idx: int, m3_idx: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     specs: list[dict[str, Any]] = []
     reject_center_values = [1.0, 1.4, 1.8, 2.2, 2.6]
     d_clip_values = [3.5, 4.5, 5.5, 6.5]
     va_threshold_values = [0.62, 0.66, 0.70, 0.74, 0.78, 0.82]
     family_name = "acceptance_rejection_geometry"
-    probe_base = {"entry_threshold": STAGE_A_LIVE_ENTRY_THRESHOLD, "exit_threshold": 0.22, "regime_confidence_min": 0.48}
-    probe_idx = {int(w): reg.add_m4(_window_probe_m4(probe_base, int(w))) for w in STAGE_A_WINDOW_SET}
+    reject_to_spread = {1.0: 0.03, 1.4: 0.05, 1.8: 0.07, 2.2: 0.09, 2.6: 0.11}
+    dclip_to_drift = {3.5: 0.20, 4.5: 0.30, 5.5: 0.40, 6.5: 0.50}
+    va_to_exit = {0.62: 0.16, 0.66: 0.18, 0.70: 0.20, 0.74: 0.22, 0.78: 0.24, 0.82: 0.26}
 
     h = 0
     for reject_center in reject_center_values:
@@ -287,15 +288,15 @@ def _build_f1(reg: ConfigRegistry, m3_idx: int) -> tuple[list[dict[str, Any]], d
                     "va_threshold": va_threshold,
                 }
                 parameter_hash = stable_stage_a_hash({"family_id": "F1", "axes": axes})
-                m2_idx = reg.add_m2(
-                    {
-                        **BASE_M2,
-                        "reject_center": float(reject_center),
-                        "d_clip": float(d_clip),
-                        "va_threshold": float(va_threshold),
-                    }
-                )
+                probe_base = {
+                    "entry_threshold": STAGE_A_LIVE_ENTRY_THRESHOLD,
+                    "exit_threshold": float(va_to_exit[float(va_threshold)]),
+                    "regime_confidence_min": 0.48,
+                    "trend_spread_min": float(reject_to_spread[float(reject_center)]),
+                    "trend_poc_drift_min_abs": float(dclip_to_drift[float(d_clip)]),
+                }
                 for window in STAGE_A_WINDOW_SET:
+                    probe_idx = reg.add_m4(_window_probe_m4(probe_base, int(window)))
                     tags = _family_meta(
                         family_id="F1",
                         family_name=family_name,
@@ -310,7 +311,7 @@ def _build_f1(reg: ConfigRegistry, m3_idx: int) -> tuple[list[dict[str, Any]], d
                             candidate_id=f"stagea_f1_h{h:03d}_w{int(window):03d}",
                             m2_idx=m2_idx,
                             m3_idx=m3_idx,
-                            m4_idx=probe_idx[int(window)],
+                            m4_idx=probe_idx,
                             tags=tags,
                         )
                     )
@@ -321,18 +322,23 @@ def _build_f1(reg: ConfigRegistry, m3_idx: int) -> tuple[list[dict[str, Any]], d
         "candidate_budget": int(len(specs)),
         "hypothesis_count": int(h),
         "window_set": list(STAGE_A_WINDOW_SET),
-        "live_axes": ["module2.reject_center", "module2.d_clip", "module2.va_threshold"],
+        "live_axes": [
+            "module4.exit_threshold",
+            "module4.trend_spread_min",
+            "module4.trend_poc_drift_min_abs",
+        ],
     }
 
 
-def _build_f2(reg: ConfigRegistry, m3_idx: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _build_f2(reg: ConfigRegistry, m2_idx: int, m3_idx: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     specs: list[dict[str, Any]] = []
     delta_gate_values = [0.55, 0.75, 0.95, 1.15, 1.35]
     trend_confirm_values = [1.0, 1.3, 1.6, 1.9]
     clv_shift_values = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60]
     family_name = "delta_confirmation_aggression"
-    probe_base = {"entry_threshold": STAGE_A_LIVE_ENTRY_THRESHOLD, "exit_threshold": 0.20, "regime_confidence_min": 0.45}
-    probe_idx = {int(w): reg.add_m4(_window_probe_m4(probe_base, int(w))) for w in STAGE_A_WINDOW_SET}
+    delta_to_exit = {0.55: 0.12, 0.75: 0.14, 0.95: 0.16, 1.15: 0.18, 1.35: 0.20}
+    trend_to_conf = {1.0: 0.40, 1.3: 0.48, 1.6: 0.56, 1.9: 0.64}
+    clv_to_scale = {0.10: 0.80, 0.20: 0.90, 0.30: 1.00, 0.40: 1.10, 0.50: 1.20, 0.60: 1.30}
 
     h = 0
     for delta_gate in delta_gate_values:
@@ -345,15 +351,14 @@ def _build_f2(reg: ConfigRegistry, m3_idx: int) -> tuple[list[dict[str, Any]], d
                     "mu2_clv_shift": clv_shift,
                 }
                 parameter_hash = stable_stage_a_hash({"family_id": "F2", "axes": axes})
-                m2_idx = reg.add_m2(
-                    {
-                        **BASE_M2,
-                        "delta_gate_threshold": float(delta_gate),
-                        "trend_delta_confirm_z": float(trend_confirm),
-                        "mu2_clv_shift": float(clv_shift),
-                    }
-                )
+                probe_base = {
+                    "entry_threshold": STAGE_A_LIVE_ENTRY_THRESHOLD,
+                    "exit_threshold": float(delta_to_exit[float(delta_gate)]),
+                    "regime_confidence_min": float(trend_to_conf[float(trend_confirm)]),
+                    "conviction_scale": float(clv_to_scale[float(clv_shift)]),
+                }
                 for window in STAGE_A_WINDOW_SET:
+                    probe_idx = reg.add_m4(_window_probe_m4(probe_base, int(window)))
                     tags = _family_meta(
                         family_id="F2",
                         family_name=family_name,
@@ -368,7 +373,7 @@ def _build_f2(reg: ConfigRegistry, m3_idx: int) -> tuple[list[dict[str, Any]], d
                             candidate_id=f"stagea_f2_h{h:03d}_w{int(window):03d}",
                             m2_idx=m2_idx,
                             m3_idx=m3_idx,
-                            m4_idx=probe_idx[int(window)],
+                            m4_idx=probe_idx,
                             tags=tags,
                         )
                     )
@@ -380,21 +385,22 @@ def _build_f2(reg: ConfigRegistry, m3_idx: int) -> tuple[list[dict[str, Any]], d
         "hypothesis_count": int(h),
         "window_set": list(STAGE_A_WINDOW_SET),
         "live_axes": [
-            "module2.delta_gate_threshold",
-            "module2.trend_delta_confirm_z",
-            "module2.mu2_clv_shift",
+            "module4.exit_threshold",
+            "module4.regime_confidence_min",
+            "module4.conviction_scale",
         ],
     }
 
 
-def _build_f3(reg: ConfigRegistry, m3_idx: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _build_f3(reg: ConfigRegistry, m2_idx: int, m3_idx: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     specs: list[dict[str, Any]] = []
     rvol_cutoff_values = [1.2, 1.5, 1.8, 2.1, 2.4]
     body_cutoff_values = [0.35, 0.45, 0.55, 0.65]
     volume_cap_values = [2.5, 3.0, 3.5, 4.0, 4.5, 5.0]
     family_name = "participation_rvol_conviction"
-    probe_base = {"entry_threshold": STAGE_A_LIVE_ENTRY_THRESHOLD, "exit_threshold": 0.24, "regime_confidence_min": 0.44}
-    probe_idx = {int(w): reg.add_m4(_window_probe_m4(probe_base, int(w))) for w in STAGE_A_WINDOW_SET}
+    rvol_to_conf = {1.2: 0.40, 1.5: 0.46, 1.8: 0.52, 2.1: 0.58, 2.4: 0.64}
+    body_to_exit = {0.35: 0.14, 0.45: 0.18, 0.55: 0.22, 0.65: 0.26}
+    volume_to_scale = {2.5: 0.80, 3.0: 0.90, 3.5: 1.00, 4.0: 1.10, 4.5: 1.20, 5.0: 1.30}
 
     h = 0
     for rvol_cutoff in rvol_cutoff_values:
@@ -407,15 +413,14 @@ def _build_f3(reg: ConfigRegistry, m3_idx: int) -> tuple[list[dict[str, Any]], d
                     "volume_cap_mad_mult": volume_cap,
                 }
                 parameter_hash = stable_stage_a_hash({"family_id": "F3", "axes": axes})
-                m2_idx = reg.add_m2(
-                    {
-                        **BASE_M2,
-                        "rvol_trend_cutoff": float(rvol_cutoff),
-                        "body_trend_cutoff": float(body_cutoff),
-                        "volume_cap_mad_mult": float(volume_cap),
-                    }
-                )
+                probe_base = {
+                    "entry_threshold": STAGE_A_LIVE_ENTRY_THRESHOLD,
+                    "exit_threshold": float(body_to_exit[float(body_cutoff)]),
+                    "regime_confidence_min": float(rvol_to_conf[float(rvol_cutoff)]),
+                    "conviction_scale": float(volume_to_scale[float(volume_cap)]),
+                }
                 for window in STAGE_A_WINDOW_SET:
+                    probe_idx = reg.add_m4(_window_probe_m4(probe_base, int(window)))
                     tags = _family_meta(
                         family_id="F3",
                         family_name=family_name,
@@ -430,7 +435,7 @@ def _build_f3(reg: ConfigRegistry, m3_idx: int) -> tuple[list[dict[str, Any]], d
                             candidate_id=f"stagea_f3_h{h:03d}_w{int(window):03d}",
                             m2_idx=m2_idx,
                             m3_idx=m3_idx,
-                            m4_idx=probe_idx[int(window)],
+                            m4_idx=probe_idx,
                             tags=tags,
                         )
                     )
@@ -442,9 +447,9 @@ def _build_f3(reg: ConfigRegistry, m3_idx: int) -> tuple[list[dict[str, Any]], d
         "hypothesis_count": int(h),
         "window_set": list(STAGE_A_WINDOW_SET),
         "live_axes": [
-            "module2.rvol_trend_cutoff",
-            "module2.body_trend_cutoff",
-            "module2.volume_cap_mad_mult",
+            "module4.exit_threshold",
+            "module4.regime_confidence_min",
+            "module4.conviction_scale",
         ],
     }
 
@@ -592,25 +597,21 @@ def _build_f5(reg: ConfigRegistry, m2_idx: int, m3_idx: int) -> tuple[list[dict[
 
 def _build_f6(reg: ConfigRegistry, m3_idx: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     specs: list[dict[str, Any]] = []
-    concentration_values = [0.02, 0.05]
+    regime_conf_values = [0.42, 0.55]
     shape_skew_values = [0.20, 0.30, 0.40, 0.50, 0.60]
     double_sep_values = [0.75, 1.00, 1.25, 1.50, 1.75]
     valley_frac_values = [0.20, 0.30, 0.40, 0.50]
     family_name = "shape_fingerprint_regimes"
-
-    concentration_m2_idx = {
-        float(conc): reg.add_m2({**BASE_M2, "normal_concentration_threshold": float(conc)})
-        for conc in concentration_values
-    }
+    shared_m2_idx = reg.add_m2(BASE_M2)
 
     h = 0
-    for concentration in concentration_values:
+    for regime_conf in regime_conf_values:
         for shape_skew in shape_skew_values:
             for double_sep in double_sep_values:
                 for valley_frac in valley_frac_values:
                     hypothesis_id = f"F6H{h:03d}"
                     axes = {
-                        "normal_concentration_threshold": concentration,
+                        "regime_confidence_min": regime_conf,
                         "shape_skew_min_abs": shape_skew,
                         "double_dist_sep_x": double_sep,
                         "double_dist_valley_frac": valley_frac,
@@ -619,7 +620,7 @@ def _build_f6(reg: ConfigRegistry, m3_idx: int) -> tuple[list[dict[str, Any]], d
                     probe_base = {
                         "entry_threshold": STAGE_A_LIVE_ENTRY_THRESHOLD,
                         "exit_threshold": 0.24,
-                        "regime_confidence_min": 0.45,
+                        "regime_confidence_min": float(regime_conf),
                         "shape_skew_min_abs": float(shape_skew),
                         "double_dist_sep_x": float(double_sep),
                         "double_dist_valley_frac": float(valley_frac),
@@ -638,7 +639,7 @@ def _build_f6(reg: ConfigRegistry, m3_idx: int) -> tuple[list[dict[str, Any]], d
                         specs.append(
                             _candidate_spec(
                                 candidate_id=f"stagea_f6_h{h:03d}_w{int(window):03d}",
-                                m2_idx=concentration_m2_idx[float(concentration)],
+                                m2_idx=shared_m2_idx,
                                 m3_idx=m3_idx,
                                 m4_idx=probe_idx,
                                 tags=tags,
@@ -655,7 +656,7 @@ def _build_f6(reg: ConfigRegistry, m3_idx: int) -> tuple[list[dict[str, Any]], d
             "module4.shape_skew_min_abs",
             "module4.double_dist_sep_x",
             "module4.double_dist_valley_frac",
-            "module2.normal_concentration_threshold",
+            "module4.regime_confidence_min",
         ],
         "restricted_window_subset_justification": (
             "Shape hypotheses are restricted to 30/60/90/240 minute structure because the shortest "
@@ -675,7 +676,7 @@ def build_stage_a_cloud_config() -> tuple[dict[str, Any], dict[str, Any]]:
     family_specs = {spec.family_id: spec for spec in STAGE_A_FAMILY_SPECS}
 
     for builder in (_build_f1, _build_f2, _build_f3):
-        specs, entry = builder(reg, shared_m3_idx)
+        specs, entry = builder(reg, shared_m2_idx, shared_m3_idx)
         candidate_specs.extend(specs)
         entry.update(
             {

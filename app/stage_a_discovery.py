@@ -54,7 +54,11 @@ STAGE_A_FAMILY_SPECS: tuple[StageAFamilySpec, ...] = (
         candidate_budget=840,
         hypothesis_count=120,
         window_set=STAGE_A_WINDOW_SET,
-        live_axes=("module2.reject_center", "module2.d_clip", "module2.va_threshold"),
+        live_axes=(
+            "module4.exit_threshold",
+            "module4.trend_spread_min",
+            "module4.trend_poc_drift_min_abs",
+        ),
         live_role="window_probe",
     ),
     StageAFamilySpec(
@@ -64,7 +68,11 @@ STAGE_A_FAMILY_SPECS: tuple[StageAFamilySpec, ...] = (
         candidate_budget=840,
         hypothesis_count=120,
         window_set=STAGE_A_WINDOW_SET,
-        live_axes=("module2.delta_gate_threshold", "module2.trend_delta_confirm_z", "module2.mu2_clv_shift"),
+        live_axes=(
+            "module4.exit_threshold",
+            "module4.regime_confidence_min",
+            "module4.conviction_scale",
+        ),
         live_role="window_probe",
     ),
     StageAFamilySpec(
@@ -74,7 +82,11 @@ STAGE_A_FAMILY_SPECS: tuple[StageAFamilySpec, ...] = (
         candidate_budget=840,
         hypothesis_count=120,
         window_set=STAGE_A_WINDOW_SET,
-        live_axes=("module2.rvol_trend_cutoff", "module2.body_trend_cutoff", "module2.volume_cap_mad_mult"),
+        live_axes=(
+            "module4.exit_threshold",
+            "module4.regime_confidence_min",
+            "module4.conviction_scale",
+        ),
         live_role="window_probe",
     ),
     StageAFamilySpec(
@@ -108,7 +120,7 @@ STAGE_A_FAMILY_SPECS: tuple[StageAFamilySpec, ...] = (
             "module4.shape_skew_min_abs",
             "module4.double_dist_sep_x",
             "module4.double_dist_valley_frac",
-            "module2.normal_concentration_threshold",
+            "module4.regime_confidence_min",
         ),
         live_role="window_probe",
         restricted_window_subset_justification=(
