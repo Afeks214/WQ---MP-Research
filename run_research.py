@@ -77,6 +77,7 @@ from app.data_resolution import (
     require_pandas as _data_require_pandas,
     resolve_data_paths as _data_resolve_data_paths,
 )
+from app.stage_a_discovery import parse_stage_a_window_set
 
 
 def _require_pandas() -> Any:
@@ -281,8 +282,37 @@ def _build_research_distribution_report(
     if "discovery_included" not in leaderboard.columns:
         leaderboard["discovery_included"] = bool(str(research_mode).strip().lower() == "discovery")
 
-    leaderboard["family_name"] = leaderboard["m4_idx"].map(lambda x: _family_name_from_m4_idx(x, family_entries))
-    leaderboard["block_window"] = leaderboard["block_minutes"].astype(int) if "block_minutes" in leaderboard.columns else -1
+    if "family_name" not in leaderboard.columns:
+        leaderboard["family_name"] = leaderboard["m4_idx"].map(lambda x: _family_name_from_m4_idx(x, family_entries))
+    if "family_id" not in leaderboard.columns:
+        leaderboard["family_id"] = leaderboard["family_name"].astype(str)
+    if "evaluation_window" in leaderboard.columns:
+        leaderboard["block_window"] = pd.to_numeric(leaderboard["evaluation_window"], errors="coerce").fillna(-1).astype(int)
+    else:
+        leaderboard["block_window"] = leaderboard["block_minutes"].astype(int) if "block_minutes" in leaderboard.columns else -1
+    if "window_set" not in leaderboard.columns:
+        leaderboard["window_set"] = ""
+    if "hypothesis_id" not in leaderboard.columns:
+        leaderboard["hypothesis_id"] = ""
+    if "parameter_hash" not in leaderboard.columns:
+        leaderboard["parameter_hash"] = ""
+    if "cost_adjusted_expectancy" not in leaderboard.columns:
+        if "cum_return" in leaderboard.columns:
+            leaderboard["cost_adjusted_expectancy"] = pd.to_numeric(leaderboard["cum_return"], errors="coerce").fillna(0.0)
+        else:
+            leaderboard["cost_adjusted_expectancy"] = 0.0
+    if "overnight_suitability_score" not in leaderboard.columns:
+        leaderboard["overnight_suitability_score"] = np.nan
+    if "zimtra_compliance_flags" not in leaderboard.columns:
+        leaderboard["zimtra_compliance_flags"] = ""
+    if "cross_window_consistency_score" not in leaderboard.columns:
+        leaderboard["cross_window_consistency_score"] = np.nan
+    if "cross_window_conflict_score" not in leaderboard.columns:
+        leaderboard["cross_window_conflict_score"] = np.nan
+    if "multi_scale_stability_score" not in leaderboard.columns:
+        leaderboard["multi_scale_stability_score"] = np.nan
+    if "evaluation_role" not in leaderboard.columns:
+        leaderboard["evaluation_role"] = ""
 
     daily_path = run_dir / "daily_returns.parquet"
     sharpe_map: dict[str, float] = {}
@@ -321,9 +351,52 @@ def _build_research_distribution_report(
     discovery_included_count = int(np.sum(np.asarray(leaderboard["discovery_included"], dtype=bool)))
     cluster_counts = {str(k): int(v) for k, v in leaderboard["cluster_id"].value_counts(dropna=False).to_dict().items()} if "cluster_id" in leaderboard.columns else {}
 
-    positive_expectancy_mask = np.asarray(leaderboard.get("cum_return", pd.Series(np.zeros(len(leaderboard)))), dtype=np.float64) > 0.0
+    positive_expectancy_mask = np.asarray(leaderboard["cost_adjusted_expectancy"], dtype=np.float64) > 0.0
     positive_sharpe_mask = np.asarray(leaderboard["sharpe_daily"], dtype=np.float64) > 0.0
     traded_mask = np.asarray(leaderboard["executed_trade_count"], dtype=np.int64) > 0
+
+    probe_rows = leaderboard[leaderboard["block_window"] > 0].copy()
+    if probe_rows.shape[0] <= 0:
+        probe_rows = leaderboard.copy()
+
+    def _nanmean(values: Any) -> float:
+        arr = np.asarray(values, dtype=np.float64).reshape(-1)
+        arr = arr[np.isfinite(arr)]
+        if arr.size <= 0:
+            return 0.0
+        return float(np.mean(arr))
+
+    hypothesis_summary: list[dict[str, Any]] = []
+    hypothesis_cols = ["family_id", "family_name", "hypothesis_id", "parameter_hash"]
+    hypothesis_df = probe_rows.copy()
+    hypothesis_df = hypothesis_df[hypothesis_df["hypothesis_id"].astype(str).str.len() > 0]
+    if hypothesis_df.shape[0] > 0:
+        gb_h = hypothesis_df.groupby(hypothesis_cols, dropna=False, sort=True)
+        for key, frame in gb_h:
+            family_id, family_name, hypothesis_id, parameter_hash = [str(x) for x in (key if isinstance(key, tuple) else (key,))]
+            window_set = parse_stage_a_window_set(str(frame["window_set"].iloc[0])) if "window_set" in frame.columns else ()
+            window_count_expected = int(len(window_set))
+            window_count_actual = int(frame["block_window"].nunique(dropna=True))
+            hypothesis_summary.append(
+                {
+                    "family_id": family_id,
+                    "family_name": family_name,
+                    "hypothesis_id": hypothesis_id,
+                    "parameter_hash": parameter_hash,
+                    "window_set": list(window_set),
+                    "window_count_expected": window_count_expected,
+                    "window_count_actual": window_count_actual,
+                    "window_probe_completion": float(window_count_actual / max(window_count_expected, 1)) if window_count_expected > 0 else 0.0,
+                    "cost_adjusted_expectancy": _nanmean(frame["cost_adjusted_expectancy"]),
+                    "cross_window_consistency_score": _nanmean(frame["cross_window_consistency_score"]),
+                    "cross_window_conflict_score": _nanmean(frame["cross_window_conflict_score"]),
+                    "multi_scale_stability_score": _nanmean(frame["multi_scale_stability_score"]),
+                    "overnight_suitability_score": _nanmean(frame["overnight_suitability_score"]),
+                    "standard_reject_count": int(np.sum(np.asarray(frame[standard_reject_col], dtype=bool))),
+                    "standard_pass_count": int(np.sum(np.asarray(frame[standard_pass_col], dtype=bool))),
+                    "positive_expectancy_windows": int(np.sum(np.asarray(frame["cost_adjusted_expectancy"], dtype=np.float64) > 0.0)),
+                }
+            )
 
     def _group_summary(group_cols: list[str]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -338,57 +411,142 @@ def _build_research_distribution_report(
                     "standard_reject_count": int(np.sum(np.asarray(frame[standard_reject_col], dtype=bool))),
                     "standard_pass_count": int(np.sum(np.asarray(frame[standard_pass_col], dtype=bool))),
                     "executed_trade_count": int(np.sum(np.asarray(frame["executed_trade_count"], dtype=np.int64) > 0)),
-                    "positive_expectancy_count": int(np.sum(np.asarray(frame["cum_return"], dtype=np.float64) > 0.0)),
+                    "positive_expectancy_count": int(np.sum(np.asarray(frame["cost_adjusted_expectancy"], dtype=np.float64) > 0.0)),
                     "positive_sharpe_count": int(np.sum(np.asarray(frame["sharpe_daily"], dtype=np.float64) > 0.0)),
                     "mean_robustness_score": float(np.mean(np.asarray(frame["robustness_score"], dtype=np.float64))),
                     "mean_execution_robustness": float(np.mean(np.asarray(frame["execution_robustness"], dtype=np.float64))),
-                    "mean_cum_return": float(np.mean(np.asarray(frame["cum_return"], dtype=np.float64))),
+                    "mean_cost_adjusted_expectancy": float(np.mean(np.asarray(frame["cost_adjusted_expectancy"], dtype=np.float64))),
                     "mean_sharpe_daily": float(np.mean(np.asarray(frame["sharpe_daily"], dtype=np.float64))),
+                    "mean_cross_window_consistency_score": _nanmean(frame["cross_window_consistency_score"]),
+                    "mean_multi_scale_stability_score": _nanmean(frame["multi_scale_stability_score"]),
                     "cluster_ids": sorted(int(x) for x in set(np.asarray(frame["cluster_id"], dtype=np.int64).tolist())) if "cluster_id" in frame.columns else [],
                 }
             )
             out.append(row)
         return out
 
-    family_summary = _group_summary(["family_name"])
-    window_summary = _group_summary(["block_window"])
-    family_window_summary = _group_summary(["family_name", "block_window"])
+    family_summary = _group_summary(["family_id", "family_name"])
+    window_summary = []
+    for key, frame in probe_rows.groupby(["block_window"], dropna=False, sort=True):
+        row = {"block_window": int(key if not isinstance(key, tuple) else key[0])}
+        row.update(
+            {
+                "candidate_count": int(len(frame)),
+                "discovery_included_count": int(np.sum(np.asarray(frame["discovery_included"], dtype=bool))),
+                "standard_reject_count": int(np.sum(np.asarray(frame[standard_reject_col], dtype=bool))),
+                "standard_pass_count": int(np.sum(np.asarray(frame[standard_pass_col], dtype=bool))),
+                "executed_trade_count": int(np.sum(np.asarray(frame["executed_trade_count"], dtype=np.int64) > 0)),
+                "positive_expectancy_count": int(np.sum(np.asarray(frame["cost_adjusted_expectancy"], dtype=np.float64) > 0.0)),
+                "positive_sharpe_count": int(np.sum(np.asarray(frame["sharpe_daily"], dtype=np.float64) > 0.0)),
+                "mean_robustness_score": float(np.mean(np.asarray(frame["robustness_score"], dtype=np.float64))),
+                "mean_execution_robustness": float(np.mean(np.asarray(frame["execution_robustness"], dtype=np.float64))),
+                "mean_cost_adjusted_expectancy": float(np.mean(np.asarray(frame["cost_adjusted_expectancy"], dtype=np.float64))),
+                "mean_sharpe_daily": float(np.mean(np.asarray(frame["sharpe_daily"], dtype=np.float64))),
+                "mean_cross_window_consistency_score": _nanmean(frame["cross_window_consistency_score"]),
+                "mean_multi_scale_stability_score": _nanmean(frame["multi_scale_stability_score"]),
+            }
+        )
+        window_summary.append(row)
+
+    family_window_summary = []
+    for key, frame in probe_rows.groupby(["family_id", "family_name", "block_window"], dropna=False, sort=True):
+        key_tuple = key if isinstance(key, tuple) else (key,)
+        row = {
+            "family_id": str(key_tuple[0]),
+            "family_name": str(key_tuple[1]),
+            "block_window": int(key_tuple[2]),
+        }
+        row.update(
+            {
+                "candidate_count": int(len(frame)),
+                "discovery_included_count": int(np.sum(np.asarray(frame["discovery_included"], dtype=bool))),
+                "standard_reject_count": int(np.sum(np.asarray(frame[standard_reject_col], dtype=bool))),
+                "standard_pass_count": int(np.sum(np.asarray(frame[standard_pass_col], dtype=bool))),
+                "executed_trade_count": int(np.sum(np.asarray(frame["executed_trade_count"], dtype=np.int64) > 0)),
+                "positive_expectancy_count": int(np.sum(np.asarray(frame["cost_adjusted_expectancy"], dtype=np.float64) > 0.0)),
+                "positive_sharpe_count": int(np.sum(np.asarray(frame["sharpe_daily"], dtype=np.float64) > 0.0)),
+                "mean_robustness_score": float(np.mean(np.asarray(frame["robustness_score"], dtype=np.float64))),
+                "mean_execution_robustness": float(np.mean(np.asarray(frame["execution_robustness"], dtype=np.float64))),
+                "mean_cost_adjusted_expectancy": float(np.mean(np.asarray(frame["cost_adjusted_expectancy"], dtype=np.float64))),
+                "mean_sharpe_daily": float(np.mean(np.asarray(frame["sharpe_daily"], dtype=np.float64))),
+                "mean_cross_window_consistency_score": _nanmean(frame["cross_window_consistency_score"]),
+                "mean_multi_scale_stability_score": _nanmean(frame["multi_scale_stability_score"]),
+            }
+        )
+        family_window_summary.append(row)
     top_regions = sorted(
         family_window_summary,
         key=lambda x: (
+            -float(x["mean_cost_adjusted_expectancy"]),
             -float(x["positive_expectancy_count"]),
-            -float(x["mean_robustness_score"]),
+            -float(x["mean_cross_window_consistency_score"]),
             -float(x["mean_sharpe_daily"]),
-            str(x["family_name"]),
+            str(x["family_id"]),
             int(x["block_window"]),
         ),
     )[:8]
 
     top_n = max(1, int(np.ceil(0.05 * float(len(leaderboard)))))
     top_df = leaderboard.sort_values(
-        ["robustness_score", "cum_return", "sharpe_daily", "candidate_id"],
+        ["cost_adjusted_expectancy", "cross_window_consistency_score", "robustness_score", "candidate_id"],
         ascending=[False, False, False, True],
         kind="mergesort",
     ).head(top_n)
+
+    consistency_values = np.asarray(
+        [float(x["cross_window_consistency_score"]) for x in hypothesis_summary if np.isfinite(float(x["cross_window_consistency_score"]))],
+        dtype=np.float64,
+    )
+    conflict_values = np.asarray(
+        [float(x["cross_window_conflict_score"]) for x in hypothesis_summary if np.isfinite(float(x["cross_window_conflict_score"]))],
+        dtype=np.float64,
+    )
+    stability_values = np.asarray(
+        [float(x["multi_scale_stability_score"]) for x in hypothesis_summary if np.isfinite(float(x["multi_scale_stability_score"]))],
+        dtype=np.float64,
+    )
+    cross_window_summary = {
+        "hypothesis_count": int(len(hypothesis_summary)),
+        "mean_cross_window_consistency_score": float(np.mean(consistency_values)) if consistency_values.size > 0 else 0.0,
+        "median_cross_window_consistency_score": float(np.median(consistency_values)) if consistency_values.size > 0 else 0.0,
+        "mean_cross_window_conflict_score": float(np.mean(conflict_values)) if conflict_values.size > 0 else 0.0,
+        "mean_multi_scale_stability_score": float(np.mean(stability_values)) if stability_values.size > 0 else 0.0,
+        "high_consistency_hypothesis_count": int(np.sum(consistency_values >= 0.60)) if consistency_values.size > 0 else 0,
+        "top_hypotheses": sorted(
+            hypothesis_summary,
+            key=lambda x: (
+                -float(x["cost_adjusted_expectancy"]),
+                -float(x["cross_window_consistency_score"]),
+                str(x["hypothesis_id"]),
+            ),
+        )[:12],
+    }
 
     report.update(
         {
             "plan_available": bool(plan_doc is not None),
             "family_entries_count": int(len(family_entries)),
             "candidate_count": int(len(leaderboard)),
+            "cluster_count": int(leaderboard["cluster_id"].nunique(dropna=False)) if "cluster_id" in leaderboard.columns else 0,
             "standard_reject_counts": standard_reject_counts,
             "standard_pass_counts": standard_pass_counts,
             "discovery_included_candidates": int(discovery_included_count),
+            "count_standard_reject": int(np.sum(np.asarray(leaderboard[standard_reject_col], dtype=bool))),
+            "count_standard_pass": int(np.sum(np.asarray(leaderboard[standard_pass_col], dtype=bool))),
+            "count_discovery_included": int(discovery_included_count),
             "effective_return_signature_count": int(effective_return_signatures),
             "distinct_robustness_score_count": int(leaderboard["robustness_score"].nunique(dropna=False)),
             "distinct_execution_robustness_count": int(leaderboard["execution_robustness"].nunique(dropna=False)),
-            "family_representation_counts": {str(k): int(v) for k, v in leaderboard["family_name"].value_counts(dropna=False).to_dict().items()},
-            "window_representation_counts": {str(k): int(v) for k, v in leaderboard["block_window"].value_counts(dropna=False).sort_index().to_dict().items()},
+            "family_representation_counts": {str(k): int(v) for k, v in leaderboard["family_id"].value_counts(dropna=False).to_dict().items()},
+            "window_representation_counts": {str(k): int(v) for k, v in probe_rows["block_window"].value_counts(dropna=False).sort_index().to_dict().items()},
             "count_with_executed_trades": int(np.sum(traded_mask)),
             "count_with_positive_expectancy": int(np.sum(positive_expectancy_mask)),
             "count_with_positive_sharpe": int(np.sum(positive_sharpe_mask)),
+            "positive_expectancy_count": int(np.sum(positive_expectancy_mask)),
+            "positive_sharpe_count": int(np.sum(positive_sharpe_mask)),
             "sharpe_distribution": _distribution_summary(leaderboard["sharpe_daily"]),
-            "return_distribution": _distribution_summary(leaderboard["cum_return"]),
+            "return_distribution": _distribution_summary(leaderboard.get("cum_return", pd.Series(np.zeros(len(leaderboard))))),
+            "cost_adjusted_expectancy_distribution": _distribution_summary(leaderboard["cost_adjusted_expectancy"]),
             "drawdown_distribution": _distribution_summary(leaderboard["max_drawdown"]),
             "cluster_analysis": {
                 "cluster_count": int(leaderboard["cluster_id"].nunique(dropna=False)) if "cluster_id" in leaderboard.columns else 0,
@@ -398,11 +556,19 @@ def _build_research_distribution_report(
             "top_5_percent_candidate_metrics": top_df[
                 [
                     "candidate_id",
+                    "family_id",
                     "family_name",
+                    "hypothesis_id",
                     "block_window",
+                    "cost_adjusted_expectancy",
+                    "cross_window_consistency_score",
+                    "multi_scale_stability_score",
+                    "parameter_hash",
+                    "window_set",
+                    "overnight_suitability_score",
+                    "zimtra_compliance_flags",
                     "robustness_score",
                     "execution_robustness",
-                    "cum_return",
                     "max_drawdown",
                     "sharpe_daily",
                     standard_reject_col,
@@ -413,7 +579,10 @@ def _build_research_distribution_report(
             ].to_dict(orient="records"),
             "family_level_summary": family_summary,
             "window_level_summary": window_summary,
+            "hypothesis_level_summary": hypothesis_summary[:250],
+            "top_expectancy_pockets_by_family_window": top_regions,
             "top_family_window_regions": top_regions,
+            "cross_window_consistency_summary": cross_window_summary,
         }
     )
     return report

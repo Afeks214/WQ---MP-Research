@@ -1,0 +1,150 @@
+plan_name: cloud_stage_a_discovery_5000_plan
+campaign_id: stage_a_cloud_20260310
+config_path: configs/cloud_stage_a_discovery_5000.yaml
+run_name: cloud_stage_a_discovery_5000
+research_mode: discovery
+live_gate_threshold_ownership: module4.entry_threshold
+live_gate_threshold: 0.3
+research_threshold_ownership: harness.robustness_reject_threshold
+research_threshold: 0.4
+data_horizon:
+  months: 18
+  start_utc: '2024-09-10T00:00:00Z'
+  end_utc: '2026-03-10T23:59:59Z'
+execution:
+  backend: process_pool
+  workers: 48
+  deterministic_runtime: true
+  bounded_artifact_writing: true
+structural_window_set:
+- 15
+- 20
+- 30
+- 40
+- 60
+- 90
+- 240
+total_candidates: 5000
+module2_config_count: 362
+module3_config_count: 121
+module4_config_count: 778
+family_entries:
+- family_id: F1
+  family_name: acceptance_rejection_geometry
+  candidate_budget: 840
+  hypothesis_count: 120
+  window_set:
+  - 15
+  - 20
+  - 30
+  - 40
+  - 60
+  - 90
+  - 240
+  live_axes:
+  - module2.reject_center
+  - module2.d_clip
+  - module2.va_threshold
+  hypothesis: Acceptance / rejection geometry around POC, VAH, VAL and value width.
+  live_role: window_probe
+- family_id: F2
+  family_name: delta_confirmation_aggression
+  candidate_budget: 840
+  hypothesis_count: 120
+  window_set:
+  - 15
+  - 20
+  - 30
+  - 40
+  - 60
+  - 90
+  - 240
+  live_axes:
+  - module2.delta_gate_threshold
+  - module2.trend_delta_confirm_z
+  - module2.mu2_clv_shift
+  hypothesis: Deviation only matters when aggression confirms or denies the move.
+  live_role: window_probe
+- family_id: F3
+  family_name: participation_rvol_conviction
+  candidate_budget: 840
+  hypothesis_count: 120
+  window_set:
+  - 15
+  - 20
+  - 30
+  - 40
+  - 60
+  - 90
+  - 240
+  live_axes:
+  - module2.rvol_trend_cutoff
+  - module2.body_trend_cutoff
+  - module2.volume_cap_mad_mult
+  hypothesis: The same geometry means something different under low and high participation.
+  live_role: window_probe
+- family_id: F4
+  family_name: session_state_initial_balance
+  candidate_budget: 840
+  hypothesis_count: 120
+  window_set:
+  - 15
+  - 20
+  - 30
+  - 40
+  - 60
+  - 90
+  - 240
+  live_axes:
+  - module3.ib_pop_frac
+  - module3.min_block_valid_ratio
+  - module3.rolling_context_period
+  hypothesis: Profile behavior changes around warmup, IB definition and late-session
+    timing.
+  live_role: window_probe
+- family_id: F5
+  family_name: multi_scale_alignment
+  candidate_budget: 840
+  hypothesis_count: 105
+  window_set:
+  - 15
+  - 20
+  - 30
+  - 40
+  - 60
+  - 90
+  - 240
+  live_axes:
+  - module4.anchor_window_index
+  - module4.regime_confidence_min
+  - module4.conviction_scale
+  live_role: probe_plus_multi_window_live
+  hypothesis: Alignment or conflict across short, medium and long profile states carries
+    alpha.
+- family_id: F6
+  family_name: shape_fingerprint_regimes
+  candidate_budget: 800
+  hypothesis_count: 200
+  window_set:
+  - 30
+  - 60
+  - 90
+  - 240
+  live_axes:
+  - module4.shape_skew_min_abs
+  - module4.double_dist_sep_x
+  - module4.double_dist_valley_frac
+  - module2.normal_concentration_threshold
+  restricted_window_subset_justification: Shape hypotheses are restricted to 30/60/90/240
+    minute structure because the shortest windows do not carry enough stable shape
+    information.
+  hypothesis: Profile shape acts as a state machine beyond raw price location.
+  live_role: window_probe
+required_artifacts:
+- strategy_results.parquet
+- trade_log.parquet
+- micro_diagnostics.parquet
+- micro_profile_blocks.parquet
+- run_manifest.json
+- run_summary.json
+- research_distribution_report.json

@@ -8,7 +8,109 @@ from typing import Any, Callable
 
 import numpy as np
 
+from app.stage_a_discovery import parse_stage_a_tags, parse_stage_a_window_set, stable_stage_a_hash
 from weightiz_module5_stats import deflated_sharpe_ratio, run_full_stats
+
+
+def _serialize_tags(tags: list[str] | tuple[str, ...]) -> str:
+    vals = sorted(str(x) for x in tags if str(x).strip())
+    return "|".join(vals)
+
+
+def _serialize_flags(flags: list[str] | set[str] | tuple[str, ...]) -> str:
+    vals = sorted(str(x) for x in flags if str(x).strip())
+    return "|".join(vals)
+
+
+def _safe_mean(values: list[float] | np.ndarray) -> float:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size <= 0:
+        return float("nan")
+    return float(np.mean(arr))
+
+
+def _stage_a_metadata(
+    *,
+    tags: list[str] | tuple[str, ...],
+    m2_idx: int,
+    m3_idx: int,
+    m4_idx: int,
+) -> dict[str, Any]:
+    meta = parse_stage_a_tags(tags)
+    window_set = parse_stage_a_window_set(meta.get("window_set"))
+    evaluation_window = meta.get("evaluation_window")
+    out: dict[str, Any] = {
+        "campaign_id": str(meta.get("campaign_id", "")),
+        "family_id": str(meta.get("family_id", "")),
+        "family_name": str(meta.get("family_name", "")),
+        "hypothesis_id": str(meta.get("hypothesis_id", "")),
+        "evaluation_role": str(meta.get("evaluation_role", "")),
+        "window_set": ",".join(str(int(x)) for x in window_set),
+        "window_set_size": int(len(window_set)),
+        "parameter_hash": str(
+            meta.get(
+                "parameter_hash",
+                stable_stage_a_hash(
+                    {
+                        "m2_idx": int(m2_idx),
+                        "m3_idx": int(m3_idx),
+                        "m4_idx": int(m4_idx),
+                        "tags": list(tags),
+                    }
+                ),
+            )
+        ),
+        "tags_serialized": _serialize_tags(tags),
+    }
+    if evaluation_window is not None and str(evaluation_window).strip():
+        out["evaluation_window"] = int(evaluation_window)
+    else:
+        out["evaluation_window"] = None
+    return out
+
+
+def _overnight_suitability_score(rows_all: list[dict[str, Any]]) -> float:
+    collected: list[float] = []
+    for row in rows_all:
+        payload = row.get("micro_payload")
+        if not isinstance(payload, dict):
+            continue
+        scores = np.asarray(payload.get("overnight_score", np.zeros(0, dtype=np.float64)), dtype=np.float64)
+        if scores.size <= 0:
+            continue
+        winner = np.asarray(payload.get("overnight_winner_flag", np.zeros(scores.shape[0], dtype=np.int8)), dtype=np.int8)
+        finite_scores = scores[np.isfinite(scores)]
+        if winner.shape == scores.shape and np.any(winner > 0):
+            chosen = scores[(winner > 0) & np.isfinite(scores)]
+            if chosen.size > 0:
+                collected.extend(float(x) for x in chosen.tolist())
+                continue
+        collected.extend(float(x) for x in finite_scores.tolist())
+    return _safe_mean(collected)
+
+
+def _zimtra_compliance_flags(
+    *,
+    rows_all: list[dict[str, Any]],
+    baseline_fail_reasons: list[str],
+    verdict_row: dict[str, Any],
+) -> str:
+    flags: set[str] = set()
+    codes = [str(x) for row in rows_all for x in row.get("quality_reason_codes", [])]
+    if any(code == "RISK_CONSTRAINT_BREACH" for code in codes):
+        flags.add("risk_constraint_breach")
+    if any(code == "DQ_DEGRADED_INPUT" for code in codes):
+        flags.add("dq_degraded_input")
+    if any(code == "DQ_REJECTED_INPUT" for code in codes):
+        flags.add("dq_rejected_input")
+    if any(code.startswith("INVARIANT_") for code in codes):
+        flags.add("localized_invariant_warning")
+    if bool(verdict_row.get("fragile", False)):
+        flags.add("fragile_execution")
+    if baseline_fail_reasons:
+        flags.add("baseline_failure")
+    return _serialize_flags(flags)
 
 
 def stack_payload_frames(payloads: list[dict[str, np.ndarray]], require_pandas_fn: Callable[[], Any]) -> Any:
@@ -33,15 +135,24 @@ def collect_ledger_rows_from_results(
         if str(r.get("status", "")) != "ok":
             continue
         cid = str(r.get("candidate_id", ""))
+        tags = [str(x) for x in r.get("tags", [])]
         spec = {
             "m2_idx": int(r.get("m2_idx", -1)),
             "m3_idx": int(r.get("m3_idx", -1)),
             "m4_idx": int(r.get("m4_idx", -1)),
-            "tags": list(r.get("tags", [])),
+            "tags": tags,
         }
         spec_blob = json.dumps(spec, sort_keys=True, separators=(",", ":"))
         sh = hashlib.sha256(spec_blob.encode("utf-8")).hexdigest()
         daily_ret = np.asarray(r.get("daily_returns", np.zeros(0, dtype=np.float64)), dtype=np.float64)
+        meta = _stage_a_metadata(
+            tags=tags,
+            m2_idx=int(r.get("m2_idx", -1)),
+            m3_idx=int(r.get("m3_idx", -1)),
+            m4_idx=int(r.get("m4_idx", -1)),
+        )
+        overnight_score = _overnight_suitability_score([r])
+        compliance_flags = _zimtra_compliance_flags(rows_all=[r], baseline_fail_reasons=[], verdict_row={})
         sharpe = float(np.mean(daily_ret) / np.std(daily_ret, ddof=1) * np.sqrt(252.0)) if daily_ret.size >= 2 and float(np.std(daily_ret, ddof=1)) > 0 else 0.0
         down = daily_ret[daily_ret < 0.0]
         sortino = float(np.mean(daily_ret) / np.std(down, ddof=1) * np.sqrt(252.0)) if down.size >= 2 and float(np.std(down, ddof=1)) > 0 else 0.0
@@ -50,12 +161,23 @@ def collect_ledger_rows_from_results(
                 "strategy_id": cid,
                 "strategy_hash": sh,
                 "parameter_values": spec_blob,
+                "parameter_hash": str(meta["parameter_hash"]),
                 "asset_count": int(len(r.get("asset_keys", []))),
                 "total_trades": int(trade_count_from_payload_fn(r.get("trade_payload"))),
+                "cost_adjusted_expectancy": float(np.mean(daily_ret)) if daily_ret.size > 0 else 0.0,
                 "sharpe": float(sharpe),
                 "sortino": float(sortino),
                 "max_drawdown": float(max_drawdown_from_returns_fn(daily_ret)),
                 "final_equity": float(extract_final_equity_fn(r)),
+                "family_id": str(meta["family_id"]),
+                "family_name": str(meta["family_name"]),
+                "hypothesis_id": str(meta["hypothesis_id"]),
+                "evaluation_role": str(meta["evaluation_role"]),
+                "evaluation_window": meta["evaluation_window"],
+                "window_set": str(meta["window_set"]),
+                "overnight_suitability_score": float(overnight_score) if np.isfinite(overnight_score) else None,
+                "zimtra_compliance_flags": compliance_flags,
+                "tags": str(meta["tags_serialized"]),
                 "evaluation_timestamp": str(evaluation_timestamp),
             }
         )
@@ -363,6 +485,24 @@ def build_candidate_artifacts(
         verdict_row = candidate_verdict.get(cid, {})
         verdict_score = float(verdict_row.get("robustness_score", np.nan)) if isinstance(verdict_row, dict) else float("nan")
         has_verdict_score = bool(np.isfinite(verdict_score))
+        stage_a_meta = _stage_a_metadata(
+            tags=list(cand.tags),
+            m2_idx=int(cand.m2_idx),
+            m3_idx=int(cand.m3_idx),
+            m4_idx=int(cand.m4_idx),
+        )
+        overnight_score = _overnight_suitability_score(rows_all)
+        compliance_flags = _zimtra_compliance_flags(
+            rows_all=rows_all,
+            baseline_fail_reasons=baseline_fail_reasons,
+            verdict_row=verdict_row if isinstance(verdict_row, dict) else {},
+        )
+        evaluation_window = (
+            int(stage_a_meta["evaluation_window"])
+            if stage_a_meta.get("evaluation_window") is not None
+            else int(getattr(m3_configs[int(cand.m3_idx)], "block_minutes", -1))
+        )
+        cost_adjusted_expectancy = float(np.mean(ret_series)) if ret_series.size > 0 else 0.0
 
         if failed_candidate:
             robustness_score = float("-inf")
@@ -385,7 +525,7 @@ def build_candidate_artifacts(
             "top_k_intraday": float(m4cfg.top_k_intraday),
             "max_asset_cap_frac": float(m4cfg.max_asset_cap_frac),
             "max_turnover_frac_per_bar": float(m4cfg.max_turnover_frac_per_bar),
-            "block_minutes": float(m3cfg.block_minutes),
+            "block_minutes": float(evaluation_window),
             "min_block_valid_ratio": float(m3cfg.min_block_valid_ratio),
         }
 
@@ -398,6 +538,8 @@ def build_candidate_artifacts(
             "m3_idx": int(cand.m3_idx),
             "m4_idx": int(cand.m4_idx),
             "enabled_assets_mask": np.asarray(cand.enabled_assets_mask, dtype=bool).tolist(),
+            "tags": list(cand.tags),
+            "stage_a_metadata": stage_a_meta,
             "engine_config": asdict(engine_cfg),
             "module2_config": asdict(m2_configs[int(cand.m2_idx)]),
             "module3_config": asdict(m3cfg),
@@ -463,6 +605,12 @@ def build_candidate_artifacts(
                 "dq_reject_count": int(dq_reject_count),
                 "dq_reason_top": str(dq_reason_top),
             },
+            "stage_a_metadata": {
+                **stage_a_meta,
+                "cost_adjusted_expectancy": float(cost_adjusted_expectancy),
+                "overnight_suitability_score": float(overnight_score) if np.isfinite(overnight_score) else None,
+                "zimtra_compliance_flags": compliance_flags,
+            },
         }
         write_json_fn(cdir / "candidate_metrics.json", candidate_metrics)
 
@@ -507,13 +655,94 @@ def build_candidate_artifacts(
                 "dq_degrade_count": int(dq_degrade_count),
                 "dq_reject_count": int(dq_reject_count),
                 "dq_reason_top": str(dq_reason_top),
+                "cost_adjusted_expectancy": float(cost_adjusted_expectancy),
+                "overnight_suitability_score": float(overnight_score) if np.isfinite(overnight_score) else np.nan,
+                "zimtra_compliance_flags": compliance_flags,
                 "in_mcs": bool(verdict_row.get("in_mcs", False)),
                 "pass": bool(verdict_row.get("pass", False)),
                 "wrc_p": float(verdict_row.get("wrc_p", np.nan)) if verdict_row else np.nan,
                 "spa_p": float(verdict_row.get("spa_p", np.nan)) if verdict_row else np.nan,
+                "campaign_id": str(stage_a_meta["campaign_id"]),
+                "family_id": str(stage_a_meta["family_id"]),
+                "family_name": str(stage_a_meta["family_name"]),
+                "hypothesis_id": str(stage_a_meta["hypothesis_id"]),
+                "evaluation_role": str(stage_a_meta["evaluation_role"]),
+                "evaluation_window": stage_a_meta["evaluation_window"],
+                "window_set": str(stage_a_meta["window_set"]),
+                "window_set_size": int(stage_a_meta["window_set_size"]),
+                "parameter_hash": str(stage_a_meta["parameter_hash"]),
+                "tags_serialized": str(stage_a_meta["tags_serialized"]),
                 **feat,
             }
         )
+
+    hypothesis_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in candidate_rows:
+        family_id = str(row.get("family_id", "")).strip()
+        hypothesis_id = str(row.get("hypothesis_id", "")).strip()
+        if not family_id or not hypothesis_id:
+            continue
+        hypothesis_groups.setdefault((family_id, hypothesis_id), []).append(row)
+
+    for group_rows in hypothesis_groups.values():
+        probe_rows = sorted(
+            [row for row in group_rows if str(row.get("evaluation_role", "")) == "window_probe"],
+            key=lambda x: (int(x.get("evaluation_window") or -1), str(x.get("candidate_id", ""))),
+        )
+        live_rows = [
+            row
+            for row in group_rows
+            if str(row.get("evaluation_role", "")) == "multi_window_live"
+        ]
+        expectancies = np.asarray(
+            [float(row.get("cost_adjusted_expectancy", 0.0)) for row in probe_rows],
+            dtype=np.float64,
+        )
+        finite_expectancies = expectancies[np.isfinite(expectancies)]
+        if finite_expectancies.size > 0:
+            pos = float(np.mean(finite_expectancies > 0.0))
+            neg = float(np.mean(finite_expectancies < 0.0))
+            dominant_sign_share = max(pos, neg, 0.0)
+            pair_total = 0
+            pair_conflict = 0
+            for i in range(finite_expectancies.size):
+                for j in range(i + 1, finite_expectancies.size):
+                    si = float(np.sign(finite_expectancies[i]))
+                    sj = float(np.sign(finite_expectancies[j]))
+                    if si == 0.0 or sj == 0.0:
+                        continue
+                    pair_total += 1
+                    if si != sj:
+                        pair_conflict += 1
+            conflict_score = float(pair_conflict / pair_total) if pair_total > 0 else 0.0
+            scale = float(np.mean(np.abs(finite_expectancies)))
+            stability = 1.0 - min(1.0, float(np.std(finite_expectancies)) / max(scale, 1.0e-12))
+            consistency = 0.45 * dominant_sign_share + 0.25 * (1.0 - conflict_score) + 0.30 * stability
+        else:
+            conflict_score = 1.0
+            stability = 0.0
+            consistency = 0.0
+
+        primary_rows = live_rows if live_rows else probe_rows
+        hypothesis_expectancy = _safe_mean([float(row.get("cost_adjusted_expectancy", np.nan)) for row in primary_rows])
+        window_set_size = int(group_rows[0].get("window_set_size", 0)) if group_rows else 0
+        window_probe_completion = float(len(probe_rows) / max(window_set_size, 1)) if window_set_size > 0 else 0.0
+        standard_reject_count = int(sum(bool(row.get("standard_reject", False)) for row in group_rows))
+        standard_pass_count = int(sum(bool(row.get("standard_pass", False)) for row in group_rows))
+        overnight_hypothesis = _safe_mean(
+            [float(row.get("overnight_suitability_score", np.nan)) for row in group_rows]
+        )
+
+        for row in group_rows:
+            row["cross_window_consistency_score"] = float(consistency)
+            row["cross_window_conflict_score"] = float(conflict_score)
+            row["multi_scale_stability_score"] = float(stability)
+            row["hypothesis_cost_adjusted_expectancy"] = float(hypothesis_expectancy) if np.isfinite(hypothesis_expectancy) else np.nan
+            row["hypothesis_window_probe_count"] = int(len(probe_rows))
+            row["hypothesis_window_probe_completion"] = float(window_probe_completion)
+            row["hypothesis_standard_reject_count"] = int(standard_reject_count)
+            row["hypothesis_standard_pass_count"] = int(standard_pass_count)
+            row["hypothesis_overnight_suitability_score"] = float(overnight_hypothesis) if np.isfinite(overnight_hypothesis) else np.nan
 
     group_map: dict[tuple[int, ...], list[dict[str, Any]]] = {}
     for row in candidate_rows:

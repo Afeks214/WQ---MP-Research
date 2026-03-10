@@ -5,6 +5,8 @@ from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.stage_a_discovery import STAGE_A_RESEARCH_THRESHOLD
+
 
 class DataConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -111,6 +113,9 @@ class Module2ConfigModel(BaseModel):
 class Module3ConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    structural_windows: list[int] = Field(default_factory=lambda: [5, 15, 30, 60])
+    selected_window: int = 30
+    validate_outputs: bool = True
     block_minutes: int = 30
     phase_mask: list[int] = Field(default_factory=lambda: [1, 2])
     use_rth_minutes_only: bool = True
@@ -121,11 +126,22 @@ class Module3ConfigModel(BaseModel):
     min_block_valid_ratio: float = 0.7
     ib_pop_frac: float = 0.01
     context_mode: str = "ffill_last_complete"
+    rolling_context_period: int = 5
     fail_on_non_finite_input: bool = True
     fail_on_non_finite_output: bool = True
     fail_on_bad_indices: bool = True
     fail_on_missing_prev_va: bool = False
     eps: float = 1e-12
+
+    @field_validator("structural_windows", mode="before")
+    @classmethod
+    def validate_structural_windows_input(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            raise ValueError("module3.structural_windows must be a list of positive integers")
+        for entry in value:
+            if isinstance(entry, bool) or not isinstance(entry, int):
+                raise ValueError("module3.structural_windows entries must be positive integers")
+        return value
 
 
 class Module4ConfigModel(BaseModel):
@@ -246,7 +262,7 @@ class HarnessConfigModel(BaseModel):
     robustness_weight_regime: float = 0.20
     robustness_weight_execution: float = 0.20
     robustness_weight_horizon: float = 0.15
-    robustness_reject_threshold: float = 0.60
+    robustness_reject_threshold: float = STAGE_A_RESEARCH_THRESHOLD
     execution_fragile_threshold: float = 0.50
 
     @field_validator("horizon_minutes", mode="before")

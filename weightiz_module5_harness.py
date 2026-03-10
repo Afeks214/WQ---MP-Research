@@ -55,6 +55,8 @@ try:
 except Exception:  # pragma: no cover - runtime guard
     pd = None  # type: ignore[assignment]
 
+from app.stage_a_discovery import STAGE_A_RESEARCH_THRESHOLD
+
 _MANIFEST_REQUIRED_KEYS = (
     "git_commit",
     "config_hash",
@@ -313,7 +315,7 @@ class Module5HarnessConfig:
     robustness_weight_regime: float = 0.20
     robustness_weight_execution: float = 0.20
     robustness_weight_horizon: float = 0.15
-    robustness_reject_threshold: float = 0.60
+    robustness_reject_threshold: float = STAGE_A_RESEARCH_THRESHOLD
     execution_fragile_threshold: float = 0.50
 
 
