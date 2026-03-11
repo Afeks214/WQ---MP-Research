@@ -1,0 +1,1 @@
+"""Shared IO package placeholder."""

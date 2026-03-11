@@ -1,0 +1,1 @@
+"""Shared calendar package placeholder."""
