@@ -46,7 +46,7 @@ def _candidate_specs() -> list[dict[str, Any]]:
 
 def make_test_config() -> Module6Config:
     return Module6Config(
-        intake=IntakeConfig(min_availability_ratio=0.75, min_observed_sessions=20, require_bridge_artifacts=True),
+        intake=IntakeConfig(min_availability_ratio=0.75, min_observed_sessions=20, require_bridge_artifacts=True, required_comparison_support=0.70),
         generator=GeneratorConfig(
             random_sparse_quota=16,
             cluster_balanced_quota=8,
@@ -77,6 +77,7 @@ def build_synthetic_module5_run(tmp_path: Path, *, n_sessions: int = 64) -> Path
     candidates_dir = run_dir / "candidates"
     candidates_dir.mkdir(exist_ok=True)
     sessions = np.arange(int(n_sessions), dtype=np.int64)
+    session_dates = pd.bdate_range("2024-01-01", periods=int(n_sessions), tz="UTC")
     benchmark = 0.0004 * np.sin(np.linspace(0.0, 8.0, int(n_sessions)))
     candidate_rows: list[dict[str, Any]] = []
     robustness_rows: list[dict[str, Any]] = []
@@ -108,7 +109,14 @@ def build_synthetic_module5_run(tmp_path: Path, *, n_sessions: int = 64) -> Path
                 AVAIL_STRUCTURALLY_MISSING,
             )
             trade_payload = {
-                "ts_ns": np.asarray([int(s * 10_000 + 100) for s in sessions[observed_mask]], dtype=np.int64),
+                "ts_ns": np.asarray(
+                    [
+                        int((session_dates[int(s)] + pd.Timedelta(hours=20)).value)
+                        for s in sessions[observed_mask]
+                    ],
+                    dtype=np.int64,
+                ),
+                "session_id": sessions[observed_mask].astype(np.int64),
                 "filled_qty": np.asarray([10.0] * int(np.sum(observed_mask)), dtype=np.float64),
                 "exec_price": np.asarray([100.0 + idx] * int(np.sum(observed_mask)), dtype=np.float64),
             }
@@ -124,7 +132,7 @@ def build_synthetic_module5_run(tmp_path: Path, *, n_sessions: int = 64) -> Path
                 if observed:
                     step = np.power(1.0 + float(session_ret), 0.25)
                     for minute in range(4):
-                        ts = int(session_id * 10_000 + minute)
+                        ts = int((session_dates[int(session_id)] + pd.Timedelta(hours=14, minutes=30 + minute)).value)
                         equity *= step
                         ts_ns.append(ts)
                         session_ids.append(int(session_id))
@@ -140,6 +148,9 @@ def build_synthetic_module5_run(tmp_path: Path, *, n_sessions: int = 64) -> Path
                                 "split_id": split_id,
                                 "scenario_id": "baseline",
                                 "symbol": "SYM0",
+                                "filled_qty": 10.0 if minute == 0 else 0.0,
+                                "exec_price": float(100.0 + idx),
+                                "trade_cost": 0.0,
                                 "overnight_winner_flag": int(session_id % 7 == 0),
                             }
                         )
@@ -168,6 +179,9 @@ def build_synthetic_module5_run(tmp_path: Path, *, n_sessions: int = 64) -> Path
                 "m4_idx": idx % 3,
                 "tags": [f"family:{spec['family_id']}"],
                 "quality_reason_codes": [],
+                "dq_invalidated": False,
+                "availability_state_session_ids": sessions[observed_mask].copy(),
+                "availability_state_codes": availability_codes[observed_mask].astype(np.int16),
                 "equity_payload": equity_payload,
                 "trade_payload": trade_payload,
                 "micro_payload": {
@@ -194,6 +208,7 @@ def build_synthetic_module5_run(tmp_path: Path, *, n_sessions: int = 64) -> Path
             trade_df = pd.DataFrame(
                 {
                     "ts_ns": trade_payload["ts_ns"],
+                    "session_id": trade_payload["session_id"],
                     "candidate_id": candidate_id,
                     "split_id": split_id,
                     "scenario_id": "baseline",
@@ -364,6 +379,9 @@ def build_synthetic_module5_run(tmp_path: Path, *, n_sessions: int = 64) -> Path
         run_id="synthetic_run",
         execution_mode="process_pool",
         common_sessions=sessions,
+        canonical_reference_split_id="wf_000",
+        canonical_reference_scenario_id="baseline",
+        canonical_reference_policy="synthetic_test_fixture_v1",
         baseline_candidate_ids=[spec["candidate_id"] for spec in _candidate_specs()],
         candidate_daily_mat=np.column_stack([daily_df[spec["candidate_id"]].to_numpy(dtype=np.float64) for spec in _candidate_specs()]),
         candidates=candidates,

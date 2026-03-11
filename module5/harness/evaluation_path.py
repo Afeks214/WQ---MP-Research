@@ -596,6 +596,7 @@ def trade_log_payload(
     if loc.size == 0:
         return {
             "ts_ns": np.zeros(0, dtype=np.int64),
+            "session_id": np.zeros(0, dtype=np.int64),
             "candidate_id": np.zeros(0, dtype=object),
             "split_id": np.zeros(0, dtype=object),
             "scenario_id": np.zeros(0, dtype=object),
@@ -612,6 +613,7 @@ def trade_log_payload(
 
     return {
         "ts_ns": state.ts_ns[t_idx].astype(np.int64),
+        "session_id": state.session_id[t_idx].astype(np.int64),
         "candidate_id": np.full(t_idx.shape[0], candidate_id, dtype=object),
         "split_id": np.full(t_idx.shape[0], split_id, dtype=object),
         "scenario_id": np.full(t_idx.shape[0], scenario_id, dtype=object),

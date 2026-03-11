@@ -6,8 +6,9 @@ import numpy as np
 import pandas as pd
 
 from module6.config import Module6Config
+from module6.constraints import apply_long_only_weight_caps
 from module6.types import ReducedUniverseSpec
-from module6.utils import normalize_long_only_weights, portfolio_pk, target_weights_hash
+from module6.utils import portfolio_pk, target_weights_hash
 
 
 def generate_cluster_balanced_batch(
@@ -20,6 +21,8 @@ def generate_cluster_balanced_batch(
     rows: list[dict[str, Any]] = []
     weights_rows: list[dict[str, Any]] = []
     rng = np.random.default_rng(int(config.generator.random_seed) + 101)
+    cluster_map = dict(strategy_frame[["strategy_instance_pk", "cluster_id"]].itertuples(index=False, name=None))
+    family_map = dict(strategy_frame[["strategy_instance_pk", "family_id"]].itertuples(index=False, name=None))
     grouped = {
         int(cluster_id): grp.sort_values(
             ["robustness_score", "availability_ratio", "strategy_instance_pk"],
@@ -47,7 +50,24 @@ def generate_cluster_balanced_batch(
             local_raw = local_raw / np.sum(local_raw)
             for pk, lw in zip(chosen["strategy_instance_pk"].astype(str).tolist(), local_raw.tolist()):
                 candidate_weights[pk] = candidate_weights.get(pk, 0.0) + float(cluster_w) * float(lw)
-        normalized, cash_weight = normalize_long_only_weights(candidate_weights, config.generator.minimum_cash_weight)
+        ordered_ids = sorted(candidate_weights.keys())
+        projection = apply_long_only_weight_caps(
+            target_weights=np.asarray([candidate_weights[pk] for pk in ordered_ids], dtype=np.float64),
+            cluster_ids=np.asarray([int(cluster_map.get(pk, -1)) for pk in ordered_ids], dtype=np.int64),
+            family_ids=np.asarray([str(family_map.get(pk, "")) for pk in ordered_ids], dtype=object),
+            per_sleeve_cap=float(config.generator.per_sleeve_cap),
+            per_cluster_cap=float(config.generator.per_cluster_cap),
+            per_family_cap=float(config.generator.per_family_cap),
+            min_cash_weight=float(config.generator.minimum_cash_weight),
+        )
+        if projection.infeasible:
+            continue
+        normalized = {
+            str(pk): float(w)
+            for pk, w in zip(ordered_ids, projection.weights.tolist())
+            if float(w) > 0.0
+        }
+        cash_weight = float(projection.cash_weight)
         weights_hash = target_weights_hash(normalized)
         pk = portfolio_pk(
             reduced_universe_id=reduced_universe.reduced_universe_id,
@@ -92,4 +112,3 @@ def generate_cluster_balanced_batch(
                 }
             )
     return pd.DataFrame(rows), pd.DataFrame(weights_rows)
-

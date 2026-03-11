@@ -16,6 +16,70 @@ class ConstraintProjectionResult:
     flags: tuple[str, ...]
 
 
+def apply_long_only_weight_caps(
+    *,
+    target_weights: np.ndarray,
+    cluster_ids: np.ndarray,
+    family_ids: np.ndarray,
+    per_sleeve_cap: float,
+    per_cluster_cap: float,
+    per_family_cap: float,
+    min_cash_weight: float,
+) -> ConstraintProjectionResult:
+    w = np.maximum(np.asarray(target_weights, dtype=np.float64), 0.0)
+    cluster_ids = np.asarray(cluster_ids, dtype=np.int64)
+    family_ids = np.asarray(family_ids, dtype=object)
+    flags: list[str] = []
+    projected = False
+    for _ in range(16):
+        changed = False
+        clipped = np.minimum(w, float(per_sleeve_cap))
+        if not np.allclose(clipped, w):
+            w = clipped
+            flags.append("per_sleeve_cap_projected")
+            projected = True
+            changed = True
+        for cluster_id in sorted(pd_unique_int(cluster_ids)):
+            mask = cluster_ids == cluster_id
+            total = float(np.sum(w[mask]))
+            if total > float(per_cluster_cap) + 1.0e-12:
+                w[mask] *= float(per_cluster_cap) / total
+                flags.append("per_cluster_cap_projected")
+                projected = True
+                changed = True
+        for family_id in pd_unique_obj(family_ids):
+            mask = family_ids == family_id
+            total = float(np.sum(w[mask]))
+            if total > float(per_family_cap) + 1.0e-12:
+                w[mask] *= float(per_family_cap) / total
+                flags.append("per_family_cap_projected")
+                projected = True
+                changed = True
+        total = float(np.sum(w))
+        max_risk = 1.0 - float(min_cash_weight)
+        if total > max_risk + 1.0e-12:
+            w *= max_risk / total
+            flags.append("cash_floor_projected")
+            projected = True
+            changed = True
+        if not changed:
+            break
+    cash_weight = 1.0 - float(np.sum(w))
+    infeasible = bool(
+        np.any(w < -1.0e-12)
+        or float(np.sum(w)) > 1.0 + 1.0e-12
+        or cash_weight < float(min_cash_weight) - 1.0e-12
+        or np.any(w > float(per_sleeve_cap) + 1.0e-12)
+    )
+    return ConstraintProjectionResult(
+        weights=np.asarray(w, dtype=np.float64),
+        cash_weight=float(cash_weight),
+        projected=bool(projected),
+        infeasible=bool(infeasible),
+        flags=tuple(sorted(set(flags))),
+    )
+
+
 def project_to_feasible_weights(
     *,
     target_weights: np.ndarray,
@@ -26,38 +90,25 @@ def project_to_feasible_weights(
     priority_scores: np.ndarray,
     config: Module6Config,
 ) -> ConstraintProjectionResult:
-    w = np.maximum(np.asarray(target_weights, dtype=np.float64), 0.0)
     gross_mult = np.asarray(gross_mult, dtype=np.float64)
     overnight = np.asarray(overnight_flags, dtype=np.int8)
     cluster_ids = np.asarray(cluster_ids, dtype=np.int64)
     family_ids = np.asarray(family_ids, dtype=object)
     priority = np.asarray(priority_scores, dtype=np.float64)
-    flags: list[str] = []
-    projected = False
+    base = apply_long_only_weight_caps(
+        target_weights=np.asarray(target_weights, dtype=np.float64),
+        cluster_ids=cluster_ids,
+        family_ids=family_ids,
+        per_sleeve_cap=float(config.simulator.max_sleeve_weight),
+        per_cluster_cap=float(config.simulator.max_cluster_weight),
+        per_family_cap=float(config.simulator.max_family_weight),
+        min_cash_weight=float(config.simulator.min_cash_weight),
+    )
+    w = np.asarray(base.weights, dtype=np.float64)
+    flags: list[str] = list(base.flags)
+    projected = bool(base.projected)
     for _ in range(16):
         changed = False
-        clipped = np.minimum(w, float(config.generator.per_sleeve_cap))
-        if not np.allclose(clipped, w):
-            flags.append("per_sleeve_cap_projected")
-            w = clipped
-            projected = True
-            changed = True
-        for cluster_id in sorted(pd_unique_int(cluster_ids)):
-            mask = cluster_ids == cluster_id
-            total = float(np.sum(w[mask]))
-            if total > float(config.generator.per_cluster_cap) + 1.0e-12:
-                w[mask] *= float(config.generator.per_cluster_cap) / total
-                flags.append("per_cluster_cap_projected")
-                projected = True
-                changed = True
-        for family_id in pd_unique_obj(family_ids):
-            mask = family_ids == family_id
-            total = float(np.sum(w[mask]))
-            if total > float(config.generator.per_family_cap) + 1.0e-12:
-                w[mask] *= float(config.generator.per_family_cap) / total
-                flags.append("per_family_cap_projected")
-                projected = True
-                changed = True
         overnight_active = np.where((overnight > 0) & (w > 0.0))[0]
         if overnight_active.size > int(config.simulator.max_overnight_sleeves):
             ranked = sorted(
@@ -76,21 +127,14 @@ def project_to_feasible_weights(
             flags.append("gross_limit_projected")
             projected = True
             changed = True
-        total = float(np.sum(w))
-        max_risk = 1.0 - float(config.generator.minimum_cash_weight)
-        if total > max_risk + 1.0e-12:
-            w *= max_risk / total
-            flags.append("cash_floor_projected")
-            projected = True
-            changed = True
         if not changed:
             break
     cash_weight = 1.0 - float(np.sum(w))
     infeasible = bool(
         np.any(w < -1.0e-12)
         or float(np.sum(w)) > 1.0 + 1.0e-12
-        or cash_weight < float(config.generator.minimum_cash_weight) - 1.0e-12
-        or np.any(w > float(config.generator.per_sleeve_cap) + 1.0e-12)
+        or cash_weight < float(config.simulator.min_cash_weight) - 1.0e-12
+        or np.any(w > float(config.simulator.max_sleeve_weight) + 1.0e-12)
     )
     return ConstraintProjectionResult(
         weights=np.asarray(w, dtype=np.float64),
@@ -109,6 +153,7 @@ def check_path_constraints(
     cash_weight: float,
     config: Module6Config,
     overnight_active_count: int,
+    buying_power_headroom: float,
 ) -> tuple[str, ...]:
     flags: list[str] = []
     if float(equity) < float(config.simulator.account_disable_equity):
@@ -120,8 +165,10 @@ def check_path_constraints(
         flags.append("gross_limit_breach")
     if overnight_active_count > int(config.simulator.max_overnight_sleeves):
         flags.append("overnight_limit_breach")
-    if float(cash_weight) < float(config.generator.minimum_cash_weight) - 1.0e-12:
+    if float(cash_weight) < float(config.simulator.min_cash_weight) - 1.0e-12:
         flags.append("cash_floor_breach")
+    if float(buying_power_headroom) < 0.0:
+        flags.append("buying_power_breach")
     return tuple(sorted(set(flags)))
 
 
@@ -131,4 +178,3 @@ def pd_unique_int(values: np.ndarray) -> list[int]:
 
 def pd_unique_obj(values: np.ndarray) -> list[object]:
     return sorted({x for x in np.asarray(values, dtype=object).tolist()}, key=lambda x: str(x))
-

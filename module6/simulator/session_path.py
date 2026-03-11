@@ -26,11 +26,20 @@ class SessionSimulationArtifacts:
     weight_history: pd.DataFrame
 
 
-def _policy_rebalance_due(policy: str, session_idx: int, drift_weights: np.ndarray, target_weights: np.ndarray, band: float) -> bool:
+def _policy_rebalance_due(
+    policy: str,
+    session_idx: int,
+    session_meta: dict[str, int],
+    drift_weights: np.ndarray,
+    target_weights: np.ndarray,
+    band: float,
+) -> bool:
     if policy == "daily_close":
         return True
     if policy == "weekly_monday_close":
-        return bool(session_idx % 5 == 0)
+        if "is_monday_close" not in session_meta:
+            raise Module6ValidationError("weekly_monday_close requires calendar is_monday_close semantics")
+        return bool(int(session_meta["is_monday_close"]) > 0)
     if policy == "band_10pct":
         return bool(0.5 * np.sum(np.abs(drift_weights - target_weights)) > float(band))
     raise Module6ValidationError(f"unsupported rebalance policy: {policy}")
@@ -42,7 +51,7 @@ def simulate_session_batch(
     portfolio_weights: pd.DataFrame,
     strategy_frame: pd.DataFrame,
     matrices: dict[str, np.ndarray | object],
-    calendar: np.ndarray,
+    calendar: pd.DataFrame | np.ndarray,
     config: Module6Config,
     return_weight_history: bool = False,
 ) -> SessionSimulationArtifacts:
@@ -61,7 +70,16 @@ def simulate_session_batch(
     u = np.asarray(matrices["U"], dtype=np.float64)
     state_codes = np.asarray(matrices["state_codes"], dtype=np.int16)
     gross_peak = np.asarray(matrices["gross_peak"], dtype=np.float64)
+    buying_power_min = np.asarray(matrices["buying_power_min"], dtype=np.float64)
     overnight = np.asarray(matrices["overnight_flag"], dtype=np.int8)
+    if isinstance(calendar, pd.DataFrame):
+        calendar_df = calendar[["session_id", "is_monday_close"]].copy()
+    else:
+        calendar_df = pd.DataFrame({"session_id": np.asarray(calendar, dtype=np.int64)})
+    if "is_monday_close" not in calendar_df.columns:
+        calendar_df["is_monday_close"] = 0
+    calendar_df["session_id"] = calendar_df["session_id"].astype(np.int64)
+    calendar_df["is_monday_close"] = calendar_df["is_monday_close"].fillna(0).astype(np.int8)
     session_rows: list[dict[str, Any]] = []
     summary_rows: list[dict[str, Any]] = []
     weight_rows: list[dict[str, Any]] = []
@@ -91,16 +109,21 @@ def simulate_session_batch(
         total_forced_cash = 0.0
         total_missing = 0.0
         path_returns: list[float] = []
-        for t_idx, session_id in enumerate(np.asarray(calendar, dtype=np.int64).tolist()):
+        for t_idx, cal_row in enumerate(calendar_df.itertuples(index=False)):
+            session_id = int(cal_row.session_id)
+            session_meta = {"is_monday_close": int(cal_row.is_monday_close)}
             base_codes = np.asarray(state_codes[t_idx, cols], dtype=np.int16)
             base_active = np.asarray([int(code) in (AVAIL_OBSERVED_ACTIVE, AVAIL_OBSERVED_FLAT) for code in base_codes], dtype=bool)
+            requested_target = target.copy()
+            held_weights = np.where(base_active, np.asarray(weights, dtype=np.float64), 0.0)
+            held_cash_weight = float(cash_weight + np.sum(np.asarray(weights, dtype=np.float64)[~base_active]))
             effective_returns = np.asarray(r_exec[t_idx, cols], dtype=np.float64)
             effective_returns = np.where(base_active, effective_returns, 0.0)
-            gross_return = float(np.dot(weights, effective_returns))
+            gross_return = float(np.dot(held_weights, effective_returns))
             pre_cost_equity = float(equity * (1.0 + gross_return))
             if pre_cost_equity <= 0.0 or not np.isfinite(pre_cost_equity):
                 raise Module6ValidationError(f"invalid pre-cost equity evolution for portfolio {candidate.portfolio_pk}")
-            drift = np.asarray(weights * (1.0 + effective_returns) / max(1.0 + gross_return, 1.0e-12), dtype=np.float64)
+            drift = np.asarray(held_weights * (1.0 + effective_returns) / max(1.0 + gross_return, 1.0e-12), dtype=np.float64)
             drift = np.where(np.isfinite(drift), drift, 0.0)
             drift = np.maximum(drift, 0.0)
             drift_total = float(np.sum(drift))
@@ -108,7 +131,7 @@ def simulate_session_batch(
                 drift /= drift_total
                 drift_total = float(np.sum(drift))
             drift_cash = max(0.0, 1.0 - drift_total)
-            unavailable_target = np.where(base_active, target, 0.0)
+            unavailable_target = np.where(base_active, requested_target, 0.0)
             projected = project_to_feasible_weights(
                 target_weights=unavailable_target,
                 gross_mult=np.asarray(gross_peak[t_idx, cols], dtype=np.float64),
@@ -121,6 +144,7 @@ def simulate_session_batch(
             rebalance_due = False if disable_flag else _policy_rebalance_due(
                 str(candidate.rebalance_policy),
                 t_idx,
+                session_meta,
                 drift,
                 unavailable_target,
                 config.simulator.rebalance_band_l1,
@@ -143,7 +167,17 @@ def simulate_session_batch(
                 else:
                     projected_weights = projected.weights
                     projected_cash = projected.cash_weight
-                    path_state_codes = np.where(base_active, base_codes, AVAIL_FORCED_ZERO_BY_PORTFOLIO)
+                    path_state_codes = np.asarray(base_codes, dtype=np.int16)
+                    path_state_codes = np.where(
+                        (~base_active) & (requested_target > 1.0e-12),
+                        AVAIL_FORCED_ZERO_BY_PORTFOLIO,
+                        path_state_codes,
+                    )
+                    path_state_codes = np.where(
+                        base_active & ((unavailable_target - projected_weights) > 1.0e-12),
+                        AVAIL_FORCED_CASH_BY_RISK,
+                        path_state_codes,
+                    )
                     turnover = float(0.5 * np.sum(np.abs(drift - projected_weights)))
                     liquidity_penalty = 1.0 + float(np.sum(np.asarray(u[t_idx, cols], dtype=np.float64) * np.maximum(drift, 0.0)))
                     cost_abs = (
@@ -163,6 +197,7 @@ def simulate_session_batch(
                 raise Module6ValidationError(f"non-finite equity for portfolio {candidate.portfolio_pk}")
             overnight_active_count = int(np.sum((np.asarray(overnight[t_idx, cols], dtype=np.int8) > 0) & (projected_weights > 0.0)))
             gross_exposure_mult = float(np.sum(projected_weights * np.asarray(gross_peak[t_idx, cols], dtype=np.float64)))
+            buying_power_headroom = float(projected_cash + np.sum(projected_weights * np.asarray(buying_power_min[t_idx, cols], dtype=np.float64)))
             flags = list(
                 check_path_constraints(
                     equity=equity,
@@ -171,13 +206,20 @@ def simulate_session_batch(
                     cash_weight=projected_cash,
                     config=config,
                     overnight_active_count=overnight_active_count,
+                    buying_power_headroom=buying_power_headroom,
                 )
             )
             if projected.projected:
+                flags.extend(list(projected.flags))
                 flags.append("rebalance_projected")
             if projected.infeasible:
                 flags.append("rebalance_infeasible")
-            if "capital_floor_hit" in flags or "daily_loss_breach" in flags or "gross_limit_breach" in flags:
+            if (
+                "capital_floor_hit" in flags
+                or "daily_loss_breach" in flags
+                or "gross_limit_breach" in flags
+                or "buying_power_breach" in flags
+            ):
                 disable_flag = True
                 breach_count += 1
             weights = np.asarray(projected_weights, dtype=np.float64)
@@ -185,9 +227,11 @@ def simulate_session_batch(
             peak_equity = max(peak_equity, equity)
             drawdown = float(1.0 - equity / max(peak_equity, 1.0e-12))
             session_return = float(equity / max(day_start_equity, 1.0e-12) - 1.0)
+            missing_weight = float(np.sum(requested_target[~base_active]))
+            forced_cash_weight = float(np.sum(np.maximum(unavailable_target - projected_weights, 0.0)))
             total_turnover += float(turnover)
-            total_forced_cash += float(np.mean(np.isin(path_state_codes, [AVAIL_FORCED_CASH_BY_RISK, AVAIL_FORCED_ZERO_BY_PORTFOLIO]).astype(np.float64)))
-            total_missing += float(np.mean(np.isin(path_state_codes, [AVAIL_STRUCTURALLY_MISSING, AVAIL_INVALIDATED_BY_DQ]).astype(np.float64)))
+            total_forced_cash += forced_cash_weight
+            total_missing += missing_weight
             path_returns.append(session_return)
             session_rows.append(
                 {
@@ -201,8 +245,13 @@ def simulate_session_batch(
                     "cost_frac": float(cost_frac),
                     "gross_exposure_mult": float(gross_exposure_mult),
                     "cash_weight": float(cash_weight),
-                    "forced_cash_share": float(np.mean(np.isin(path_state_codes, [AVAIL_FORCED_CASH_BY_RISK, AVAIL_FORCED_ZERO_BY_PORTFOLIO]).astype(np.float64))),
-                    "missing_share": float(np.mean(np.isin(path_state_codes, [AVAIL_STRUCTURALLY_MISSING, AVAIL_INVALIDATED_BY_DQ]).astype(np.float64))),
+                    "session_start_cash_weight": float(held_cash_weight),
+                    "pre_rebalance_cash_weight": float(drift_cash),
+                    "forced_cash_weight": float(forced_cash_weight),
+                    "missing_weight": float(missing_weight),
+                    "forced_cash_share": float(forced_cash_weight),
+                    "missing_share": float(missing_weight),
+                    "buying_power_headroom": float(buying_power_headroom),
                     "breach_count_cum": int(breach_count),
                     "disable_flag": int(disable_flag),
                     "rebalance_due": int(rebalance_due),
@@ -210,15 +259,30 @@ def simulate_session_batch(
                 }
             )
             if return_weight_history:
-                for pk, start_weight, end_weight, state_code in zip(strategy_ids, drift.tolist(), weights.tolist(), path_state_codes.tolist()):
+                for pk, start_weight, requested_weight, available_weight, pre_rebalance_weight, end_weight, state_code in zip(
+                    strategy_ids,
+                    held_weights.tolist(),
+                    requested_target.tolist(),
+                    unavailable_target.tolist(),
+                    drift.tolist(),
+                    weights.tolist(),
+                    path_state_codes.tolist(),
+                ):
                     weight_rows.append(
                         {
                             "portfolio_pk": str(candidate.portfolio_pk),
                             "session_id": int(session_id),
                             "strategy_instance_pk": str(pk),
                             "start_weight": float(start_weight),
+                            "requested_target_weight": float(requested_weight),
+                            "available_target_weight": float(available_weight),
+                            "pre_rebalance_weight": float(pre_rebalance_weight),
                             "end_weight": float(end_weight),
                             "availability_state_code": int(state_code),
+                            "session_start_cash_weight": float(held_cash_weight),
+                            "pre_rebalance_cash_weight": float(drift_cash),
+                            "end_cash_weight": float(projected_cash),
+                            "rebalance_due": int(rebalance_due),
                             "reduced_universe_id": str(candidate.reduced_universe_id),
                         }
                     )
@@ -232,10 +296,10 @@ def simulate_session_batch(
                 "final_equity": float(equity),
                 "annualized_return": float(ann_return),
                 "max_drawdown": float(max_dd),
-                "turnover": float(total_turnover / max(len(calendar), 1)),
-                "forced_cash_burden": float(total_forced_cash / max(len(calendar), 1)),
-                "missingness_burden": float(total_missing / max(len(calendar), 1)),
-                "support_coverage": float(1.0 - total_missing / max(len(calendar), 1)),
+                "turnover": float(total_turnover / max(calendar_df.shape[0], 1)),
+                "forced_cash_burden": float(total_forced_cash / max(calendar_df.shape[0], 1)),
+                "missingness_burden": float(total_missing / max(calendar_df.shape[0], 1)),
+                "support_coverage": float(1.0 - total_missing / max(calendar_df.shape[0], 1)),
                 "breach_count": int(breach_count),
                 "disable_flag": int(disable_flag),
             }
@@ -243,5 +307,5 @@ def simulate_session_batch(
     return SessionSimulationArtifacts(
         session_paths=pd.DataFrame(session_rows).sort_values(["portfolio_pk", "session_id"], kind="mergesort").reset_index(drop=True),
         portfolio_summary=pd.DataFrame(summary_rows).sort_values(["portfolio_pk"], kind="mergesort").reset_index(drop=True),
-        weight_history=pd.DataFrame(weight_rows).sort_values(["portfolio_pk", "session_id", "strategy_instance_pk"], kind="mergesort").reset_index(drop=True) if weight_rows else pd.DataFrame(columns=["portfolio_pk", "session_id", "strategy_instance_pk", "start_weight", "end_weight", "availability_state_code", "reduced_universe_id"]),
+        weight_history=pd.DataFrame(weight_rows).sort_values(["portfolio_pk", "session_id", "strategy_instance_pk"], kind="mergesort").reset_index(drop=True) if weight_rows else pd.DataFrame(columns=["portfolio_pk", "session_id", "strategy_instance_pk", "start_weight", "requested_target_weight", "available_target_weight", "pre_rebalance_weight", "end_weight", "availability_state_code", "session_start_cash_weight", "pre_rebalance_cash_weight", "end_cash_weight", "rebalance_due", "reduced_universe_id"]),
     )

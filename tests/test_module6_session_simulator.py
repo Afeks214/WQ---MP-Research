@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import pandas as pd
+
 from module6.io import load_module5_run
 from module6.ledger import materialize_canonical_ledgers
 from module6.matrices import build_matrix_store
 from module6.reduction import reduce_universe
 from module6.runtime import open_matrix_store
-from module6.simulator.session_path import simulate_session_batch
+from module6.simulator.session_path import _policy_rebalance_due, simulate_session_batch
 from module6.dependence import build_covariance_bundle
 from module6.generators import generate_all_portfolios
 from tests.module6_testkit import build_synthetic_module5_run, make_test_config
@@ -37,7 +39,7 @@ def test_session_simulator_emits_paths_and_costs(tmp_path):
         portfolio_weights=weights,
         strategy_frame=strategy_frame,
         matrices=matrices,
-        calendar=store.calendar,
+        calendar=pd.read_parquet(store.calendar_index_path),
         config=cfg,
         return_weight_history=True,
     )
@@ -45,3 +47,10 @@ def test_session_simulator_emits_paths_and_costs(tmp_path):
     assert "cost_frac" in art.session_paths.columns
     assert art.weight_history.shape[0] > 0
 
+
+def test_weekly_rebalance_uses_calendar_flag_not_session_index():
+    cfg = make_test_config()
+    drift = pd.Series([0.6, 0.4], dtype="float64").to_numpy()
+    target = pd.Series([0.5, 0.5], dtype="float64").to_numpy()
+    assert not _policy_rebalance_due("weekly_monday_close", session_idx=1, session_meta={"is_monday_close": 0}, drift_weights=drift, target_weights=target, band=cfg.simulator.rebalance_band_l1)
+    assert _policy_rebalance_due("weekly_monday_close", session_idx=1, session_meta={"is_monday_close": 1}, drift_weights=drift, target_weights=target, band=cfg.simulator.rebalance_band_l1)

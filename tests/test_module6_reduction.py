@@ -22,3 +22,6 @@ def test_reduction_collapses_duplicates_and_keeps_hedge(tmp_path):
     assert dup["cluster_id"].nunique() == 1
     retained = membership.loc[membership["retained_in_reduced_universe"].astype(bool), ["candidate_id", "strategy_instance_pk"]]
     assert "cand_002" in set(retained["candidate_id"].astype(str))
+    assert len(reduction.reduced_universes) >= 2
+    assert len(reduction.reduced_universes[0].strategy_instance_pks) <= cfg.reduction.reduced_universe_cap
+    assert len(reduction.reduced_universes[1].strategy_instance_pks) <= cfg.reduction.mv_universe_cap

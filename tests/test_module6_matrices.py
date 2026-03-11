@@ -19,8 +19,9 @@ def test_matrix_store_shapes_and_availability_mapping(tmp_path):
     assert opened["R_exec"].shape == opened["A"].shape
     assert opened["R_raw"].shape == opened["A"].shape
     assert opened["state_codes"].shape == opened["A"].shape
+    assert opened["buying_power_min"].shape == opened["A"].shape
+    assert store.calendar_index_path.exists()
     codes = np.asarray(opened["state_codes"])
     a = np.asarray(opened["A"])
     assert np.all(a[(codes == 1) | (codes == 2)])
     assert not np.any(a[(codes == 3) | (codes == 6)])
-

@@ -8,8 +8,9 @@ from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
 
 from module6.config import Module6Config
+from module6.constraints import apply_long_only_weight_caps
 from module6.types import ReducedUniverseSpec
-from module6.utils import normalize_long_only_weights, portfolio_pk, target_weights_hash
+from module6.utils import portfolio_pk, target_weights_hash
 
 
 def _cluster_var(cov: np.ndarray, items: np.ndarray) -> float:
@@ -56,28 +57,48 @@ def generate_hrp_variants(
     if covariance_bundle.common_support.sum() < 2 * len(reduced_universe.strategy_instance_pks):
         return pd.DataFrame(columns=["portfolio_pk"]), pd.DataFrame(columns=["portfolio_pk", "strategy_instance_pk", "target_weight"])
     strategy_ids = list(reduced_universe.strategy_instance_pks)
-    weights = _hrp_weights(
+    base_weights = _hrp_weights(
         np.asarray(covariance_bundle.correlation, dtype=np.float64),
         np.asarray(covariance_bundle.covariance, dtype=np.float64),
     )
+    cluster_map = dict(strategy_frame[["strategy_instance_pk", "cluster_id"]].itertuples(index=False, name=None))
+    family_map = dict(strategy_frame[["strategy_instance_pk", "family_id"]].itertuples(index=False, name=None))
     rows: list[dict[str, Any]] = []
     weight_rows: list[dict[str, Any]] = []
-    lookbacks = (63, 126, 252)
     policies = ("daily_close", "weekly_monday_close", "band_10pct")
+    blend_levels = tuple(float(x) for x in np.linspace(0.0, 0.55, 12).tolist())
+    equal_weights = np.full(len(strategy_ids), 1.0 / max(len(strategy_ids), 1), dtype=np.float64)
     idx = 0
-    for lookback in lookbacks:
+    quota = max(0, int(config.generator.hrp_variant_quota))
+    for blend in blend_levels:
         for policy in policies:
-            normalized, cash_weight = normalize_long_only_weights(
-                {pk: float(w) for pk, w in zip(strategy_ids, weights.tolist())},
-                config.generator.minimum_cash_weight,
+            if idx >= quota:
+                break
+            raw_weights = (1.0 - float(blend)) * np.asarray(base_weights, dtype=np.float64) + float(blend) * equal_weights
+            projection = apply_long_only_weight_caps(
+                target_weights=raw_weights,
+                cluster_ids=np.asarray([int(cluster_map.get(pk, -1)) for pk in strategy_ids], dtype=np.int64),
+                family_ids=np.asarray([str(family_map.get(pk, "")) for pk in strategy_ids], dtype=object),
+                per_sleeve_cap=float(config.generator.per_sleeve_cap),
+                per_cluster_cap=float(config.generator.per_cluster_cap),
+                per_family_cap=float(config.generator.per_family_cap),
+                min_cash_weight=float(config.generator.minimum_cash_weight),
             )
+            if projection.infeasible:
+                continue
+            normalized = {
+                str(pk): float(w)
+                for pk, w in zip(strategy_ids, projection.weights.tolist())
+                if float(w) > 0.0
+            }
+            cash_weight = float(projection.cash_weight)
             weights_hash = target_weights_hash(normalized)
             pk = portfolio_pk(
                 reduced_universe_id=reduced_universe.reduced_universe_id,
                 generator_family="hrp_risk",
                 rebalance_policy=policy,
                 target_weights_hash_value=weights_hash,
-                cash_policy=f"explicit_cash_residual_lb{lookback}",
+                cash_policy=f"explicit_cash_residual_blend_{int(round(blend * 100)):02d}",
                 constraint_policy_version=config.simulator.constraint_policy_version,
                 ranking_policy_version=config.scoring.ranking_policy_version,
                 overnight_policy_version=config.simulator.overnight_policy_version,
@@ -92,7 +113,7 @@ def generate_hrp_variants(
                     "generator_family": "hrp_risk",
                     "rebalance_policy": policy,
                     "target_weights_hash": weights_hash,
-                    "cash_policy": f"explicit_cash_residual_lb{lookback}",
+                    "cash_policy": f"explicit_cash_residual_blend_{int(round(blend * 100)):02d}",
                     "constraint_policy_version": config.simulator.constraint_policy_version,
                     "ranking_policy_version": config.scoring.ranking_policy_version,
                     "overnight_policy_version": config.simulator.overnight_policy_version,
@@ -115,5 +136,6 @@ def generate_hrp_variants(
                         "reduced_universe_id": reduced_universe.reduced_universe_id,
                     }
                 )
+        if idx >= quota:
+            break
     return pd.DataFrame(rows), pd.DataFrame(weight_rows)
-

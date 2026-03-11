@@ -8,6 +8,7 @@ import pandas as pd
 
 from module6.config import Module6Config
 from module6.dependence import build_covariance_bundle
+from module6.execution_overlap import finalist_exact_overlap
 from module6.export import write_module6_outputs
 from module6.frontier import select_diverse_finalists
 from module6.generators import generate_all_portfolios
@@ -36,6 +37,7 @@ def run_module6_portfolio_research(
     matrix_store = build_matrix_store(ledgers=ledgers, run=run, output_dir=out_dir, config=cfg)
     matrices = open_matrix_store(matrix_store)
     matrices["column_index"] = matrix_store.column_index
+    comparison_support_calendar = pd.read_parquet(matrix_store.calendar_index_path)
     reduction = reduce_universe(
         ledgers=ledgers,
         matrices=matrices,
@@ -43,15 +45,16 @@ def run_module6_portfolio_research(
         output_dir=out_dir,
         config=cfg,
     )
+    overlap_proxy_index = reduction.admitted_instances[
+        ["strategy_instance_pk", "candidate_id", "split_id", "scenario_id", "column_idx", "overlap_proxy_idx"]
+    ].drop_duplicates().sort_values(["strategy_instance_pk"], kind="mergesort").reset_index(drop=True)
     all_candidates: list[pd.DataFrame] = []
     all_weights: list[pd.DataFrame] = []
     all_session_paths: list[pd.DataFrame] = []
     all_session_scores: list[pd.DataFrame] = []
-    all_finalist_scores: list[pd.DataFrame] = []
-    all_comparable_scores: list[pd.DataFrame] = []
-    all_minute_paths: list[pd.DataFrame] = []
-    all_component_diag: list[pd.DataFrame] = []
-    all_divergence: list[pd.DataFrame] = []
+    dependence_artifacts: dict[str, Any] = {}
+    shortlist_portfolio_pks: list[str] = []
+    calendar_version = str(run.run_manifest["module6_bridge"]["calendar_version"])
 
     for reduced_universe in reduction.reduced_universes:
         strategy_frame = reduction.admitted_instances.loc[
@@ -68,6 +71,7 @@ def run_module6_portfolio_research(
             column_indices=column_indices,
             config=cfg.dependence,
         )
+        dependence_artifacts[str(reduced_universe.reduced_universe_id)] = covariance_bundle
         candidates_df, weights_df = generate_all_portfolios(
             reduced_universe=reduced_universe,
             strategy_frame=strategy_frame,
@@ -84,7 +88,7 @@ def run_module6_portfolio_research(
             portfolio_weights=weights_df,
             strategy_frame=strategy_frame,
             matrices=matrices,
-            calendar=matrix_store.calendar,
+            calendar=comparison_support_calendar,
             config=cfg,
             return_weight_history=False,
         )
@@ -94,65 +98,81 @@ def run_module6_portfolio_research(
             portfolio_weights=weights_df,
             strategy_frame=strategy_frame,
             config=cfg,
+            execution_overlap_proxy=reduction.overlap_proxy,
         )
-        session_scores["calendar_version"] = str(strategy_frame["calendar_version"].iloc[0])
+        session_scores["calendar_version"] = calendar_version
         session_scores["support_policy_version"] = cfg.simulator.support_policy_version
-        shortlist = session_scores.head(int(cfg.scoring.shortlist_minute_keep)).copy()
-        finalist_candidates = candidates_df.loc[candidates_df["portfolio_pk"].isin(shortlist["portfolio_pk"])].copy()
-        detailed_artifacts = simulate_session_batch(
-            portfolio_candidates=finalist_candidates,
-            portfolio_weights=weights_df,
-            strategy_frame=strategy_frame,
-            matrices=matrices,
-            calendar=matrix_store.calendar,
-            config=cfg,
-            return_weight_history=True,
-        )
-        minute_artifacts = replay_finalists_minute(
-            finalist_candidates=finalist_candidates,
-            strategy_frame=strategy_frame,
-            session_paths=detailed_artifacts.session_paths,
-            session_summary=session_scores,
-            weight_history=detailed_artifacts.weight_history,
-            run=run,
-            config=cfg,
-        )
-        finalist_scores = score_finalists(
-            session_scores=session_scores,
-            minute_summary=minute_artifacts.minute_summary,
-            divergence=minute_artifacts.divergence,
-            portfolio_weights=weights_df.loc[weights_df["portfolio_pk"].isin(finalist_candidates["portfolio_pk"])],
-            strategy_frame=strategy_frame,
-            config=cfg,
-        )
-        comparable_scores = build_cross_universe_comparable_scores(
-            finalist_scores=finalist_scores,
-            config=cfg,
-        )
+        session_scores["comparison_support_recomputed"] = False
+        session_stage_shortlist = session_scores.head(int(cfg.scoring.shortlist_session_keep)).copy()
+        shortlist = session_stage_shortlist.head(int(cfg.scoring.shortlist_minute_keep)).copy()
+        shortlist_portfolio_pks.extend(shortlist["portfolio_pk"].astype(str).tolist())
         all_candidates.append(candidates_df)
         all_weights.append(weights_df)
         all_session_paths.append(session_artifacts.session_paths)
         all_session_scores.append(session_scores)
-        all_finalist_scores.append(finalist_scores)
-        all_comparable_scores.append(comparable_scores)
-        all_minute_paths.append(minute_artifacts.minute_paths)
-        all_component_diag.append(minute_artifacts.component_diagnostics)
-        all_divergence.append(minute_artifacts.divergence)
 
-    if not all_finalist_scores:
-        raise Module6ValidationError("no finalist portfolios were produced by Module 6")
+    if not all_candidates:
+        raise Module6ValidationError("no portfolio candidates were produced by Module 6")
     portfolio_candidates = pd.concat(all_candidates, axis=0, ignore_index=True).drop_duplicates("portfolio_pk", keep="first")
     portfolio_weights = pd.concat(all_weights, axis=0, ignore_index=True)
     session_paths = pd.concat(all_session_paths, axis=0, ignore_index=True)
     session_scores = pd.concat(all_session_scores, axis=0, ignore_index=True)
-    finalist_scores = pd.concat(all_finalist_scores, axis=0, ignore_index=True).drop_duplicates("portfolio_pk", keep="first")
-    comparable_scores = build_cross_universe_comparable_scores(
-        finalist_scores=pd.concat(all_comparable_scores, axis=0, ignore_index=True).drop_duplicates("portfolio_pk", keep="first"),
+    shortlist_unique = sorted(set(shortlist_portfolio_pks))
+    if not shortlist_unique:
+        raise Module6ValidationError("no shortlisted portfolios available for comparison-support recomputation")
+    finalist_candidates = portfolio_candidates.loc[portfolio_candidates["portfolio_pk"].isin(shortlist_unique)].copy()
+    finalist_weights = portfolio_weights.loc[portfolio_weights["portfolio_pk"].isin(shortlist_unique)].copy()
+    finalist_instances = reduction.admitted_instances.loc[
+        reduction.admitted_instances["strategy_instance_pk"].isin(finalist_weights["strategy_instance_pk"].astype(str))
+    ][["strategy_instance_pk", "candidate_id", "split_id", "scenario_id"]].drop_duplicates()
+    exact_overlap = finalist_exact_overlap(run.trade_log, finalist_instances)
+    comparison_session_artifacts = simulate_session_batch(
+        portfolio_candidates=finalist_candidates,
+        portfolio_weights=finalist_weights,
+        strategy_frame=reduction.admitted_instances,
+        matrices=matrices,
+        calendar=comparison_support_calendar,
+        config=cfg,
+        return_weight_history=True,
+    )
+    comparison_session_scores = score_session_paths(
+        session_paths=comparison_session_artifacts.session_paths,
+        session_summary=comparison_session_artifacts.portfolio_summary,
+        portfolio_weights=finalist_weights,
+        strategy_frame=reduction.admitted_instances,
+        config=cfg,
+        execution_overlap_proxy=reduction.overlap_proxy,
+    )
+    comparison_session_scores["calendar_version"] = calendar_version
+    comparison_session_scores["support_policy_version"] = cfg.simulator.support_policy_version
+    comparison_session_scores["comparison_support_recomputed"] = True
+    minute_artifacts = replay_finalists_minute(
+        finalist_candidates=finalist_candidates,
+        strategy_frame=reduction.admitted_instances,
+        session_paths=comparison_session_artifacts.session_paths,
+        session_summary=comparison_session_scores,
+        weight_history=comparison_session_artifacts.weight_history,
+        run=run,
         config=cfg,
     )
-    minute_paths = pd.concat(all_minute_paths, axis=0, ignore_index=True)
-    component_diag = pd.concat(all_component_diag, axis=0, ignore_index=True)
-    divergence = pd.concat(all_divergence, axis=0, ignore_index=True).drop_duplicates("portfolio_pk", keep="first")
+    finalist_scores = score_finalists(
+        session_scores=comparison_session_scores,
+        minute_summary=minute_artifacts.minute_summary,
+        divergence=minute_artifacts.divergence,
+        portfolio_weights=finalist_weights,
+        strategy_frame=reduction.admitted_instances,
+        config=cfg,
+        execution_overlap_proxy=reduction.overlap_proxy,
+    )
+    finalist_scores["comparison_support_recomputed"] = True
+    comparable_scores = build_cross_universe_comparable_scores(
+        finalist_scores=finalist_scores.drop_duplicates("portfolio_pk", keep="first"),
+        config=cfg,
+        comparison_support=comparison_support_calendar,
+    )
+    minute_paths = minute_artifacts.minute_paths
+    component_diag = minute_artifacts.component_diagnostics
+    divergence = minute_artifacts.divergence.drop_duplicates("portfolio_pk", keep="first")
     selected_input = comparable_scores.copy()
     global_frontier, risk_return_frontier, operational_frontier, selected_frontier = select_diverse_finalists(
         scores=selected_input.sort_values(["comparable_truth_score", "portfolio_pk"], ascending=[False, True], kind="mergesort").reset_index(drop=True),
@@ -178,6 +198,8 @@ def run_module6_portfolio_research(
             "n_finalists": int(finalist_scores.shape[0]),
             "n_selected": int(len(selected_pks)),
             "n_alternates": int(len(alternate_pks)),
+            "comparison_support_session_count": int(comparison_support_calendar.shape[0]),
+            "canonical_reference_policy": str(run.run_manifest["module6_bridge"]["canonical_reference_policy"]),
         },
     )
     write_module6_outputs(
@@ -185,12 +207,20 @@ def run_module6_portfolio_research(
         candidates=portfolio_candidates,
         portfolio_weights=portfolio_weights,
         session_paths=session_paths,
+        comparison_support_session_paths=comparison_session_artifacts.session_paths,
         minute_paths=minute_paths,
         minute_component_diagnostics=component_diag,
         session_scores=session_scores,
+        comparison_support_session_scores=comparison_session_scores,
         finalist_scores=finalist_scores,
         comparable_scores=comparable_scores,
         divergence=divergence,
+        weight_history=comparison_session_artifacts.weight_history,
+        comparison_support_calendar=comparison_support_calendar,
+        dependence_artifacts=dependence_artifacts,
+        overlap_proxy=reduction.overlap_proxy,
+        overlap_proxy_index=overlap_proxy_index,
+        exact_overlap=exact_overlap,
         global_frontier=global_frontier,
         risk_return_frontier=risk_return_frontier,
         operational_frontier=operational_frontier,

@@ -8,6 +8,7 @@ import pandas as pd
 from scipy import sparse
 
 from module6.config import DependenceConfig
+from module6.constants import ROLLOUT1_EXECUTION_OVERLAP_WEIGHTS
 from module6.utils import Module6ValidationError, safe_divide
 
 
@@ -75,6 +76,16 @@ def build_execution_overlap_proxy(
     config: DependenceConfig,
     candidate_pairs: list[tuple[int, int]] | None = None,
 ) -> ExecutionOverlapComponents:
+    fixed_weights = {
+        "symbol_support": float(config.overlap_weight_symbol_support),
+        "activity": float(config.overlap_weight_activity),
+        "gross": float(config.overlap_weight_gross),
+        "rebalance": float(config.overlap_weight_rebalance),
+    }
+    if fixed_weights != ROLLOUT1_EXECUTION_OVERLAP_WEIGHTS:
+        raise Module6ValidationError(
+            f"rollout-1 execution overlap weights must remain fixed: {ROLLOUT1_EXECUTION_OVERLAP_WEIGHTS}"
+        )
     required_instance_cols = {"strategy_instance_pk", "candidate_id", "split_id", "scenario_id"}
     if not required_instance_cols.issubset(set(instance_rows.columns)):
         raise Module6ValidationError("instance_rows missing required columns for execution overlap proxy")
@@ -111,7 +122,10 @@ def build_execution_overlap_proxy(
     )
     if not symbol_support_map:
         raise Module6ValidationError("execution overlap proxy requires symbol support map")
-    activity = (np.asarray(turnover_matrix, dtype=np.float64) > 0.0).astype(np.int8)
+    activity = bucketize_activity_signature(
+        np.asarray(turnover_matrix, dtype=np.float64),
+        int(config.activity_signature_buckets),
+    )
     gross = np.asarray(gross_peak_matrix, dtype=np.float64)
     rb = rebalance_signature(np.asarray(turnover_matrix, dtype=np.float64))
     pairs_symbol: list[tuple[int, int, float]] = []
@@ -128,10 +142,11 @@ def build_execution_overlap_proxy(
         if not sym_i or not sym_j:
             raise Module6ValidationError("execution overlap proxy input missing symbol support")
         score_symbol = float(len(sym_i & sym_j) / max(len(sym_i | sym_j), 1))
-        act_i = activity[:, i].astype(bool)
-        act_j = activity[:, j].astype(bool)
-        union = int(np.sum(act_i | act_j))
-        score_activity = float(np.sum(act_i & act_j) / union) if union > 0 else 0.0
+        act_i = activity[:, i]
+        act_j = activity[:, j]
+        active_union = (act_i > 0) | (act_j > 0)
+        union = int(np.sum(active_union))
+        score_activity = float(np.sum((act_i == act_j) & (act_i > 0) & active_union) / union) if union > 0 else 0.0
         gross_i = gross[:, i]
         gross_j = gross[:, j]
         denom = float(np.linalg.norm(gross_i) * np.linalg.norm(gross_j))

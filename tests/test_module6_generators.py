@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 
 from module6.config import GeneratorConfig, Module6Config
 from module6.dependence import build_covariance_bundle
@@ -9,7 +10,7 @@ from module6.types import ReducedUniverseSpec
 
 
 def test_generator_outputs_are_simplex_and_nonnegative():
-    strategy_frame = __import__("pandas").DataFrame(
+    strategy_frame = pd.DataFrame(
         {
             "strategy_instance_pk": ["a", "b", "c", "d"],
             "cluster_id": [0, 1, 2, 3],
@@ -34,4 +35,11 @@ def test_generator_outputs_are_simplex_and_nonnegative():
     grouped = weights.groupby("portfolio_pk")["target_weight"].sum()
     assert (grouped <= 1.0 + 1.0e-12).all()
     assert (weights["target_weight"] >= 0.0).all()
-
+    merged = weights.merge(strategy_frame[["strategy_instance_pk", "cluster_id", "family_id"]], on="strategy_instance_pk", how="left")
+    assert merged.groupby(["portfolio_pk", "cluster_id"])["target_weight"].sum().max() <= cfg.generator.per_cluster_cap + 1.0e-12
+    assert merged.groupby(["portfolio_pk", "family_id"])["target_weight"].sum().max() <= cfg.generator.per_family_cap + 1.0e-12
+    assert merged.groupby("portfolio_pk")["target_weight"].max().max() <= cfg.generator.per_sleeve_cap + 1.0e-12
+    counts = candidates.groupby("generator_family").size().to_dict()
+    assert counts.get("random_sparse", 0) <= cfg.generator.random_sparse_quota
+    assert counts.get("cluster_balanced", 0) <= cfg.generator.cluster_balanced_quota
+    assert counts.get("hrp_risk", 0) <= cfg.generator.hrp_variant_quota

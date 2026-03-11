@@ -139,6 +139,11 @@ from module5.harness.memory_accounting import (
     estimate_result_buffer_bytes as _mem_estimate_result_buffer_bytes,
     resolve_base_sharing_mode as _mem_resolve_base_sharing_mode,
 )
+from module5.harness.module6_bridge import (
+    AVAIL_INVALIDATED_BY_DQ as _MODULE6_AVAIL_INVALIDATED_BY_DQ,
+    AVAIL_OBSERVED_ACTIVE as _MODULE6_AVAIL_OBSERVED_ACTIVE,
+    AVAIL_OBSERVED_FLAT as _MODULE6_AVAIL_OBSERVED_FLAT,
+)
 from module5.harness.runtime_truth import (
     build_compute_authority as _truth_build_compute_authority,
     build_execution_topology as _truth_build_execution_topology,
@@ -1325,6 +1330,89 @@ def _trade_log_payload(
     return _eval_trade_log_payload(state, m4_out, candidate_id, split_id, scenario_id, eps=eps)
 
 
+def _session_notional_by_trade_payload(trade_payload: dict[str, np.ndarray] | None) -> dict[int, float]:
+    if not isinstance(trade_payload, dict):
+        return {}
+    session_id = np.asarray(trade_payload.get("session_id", np.zeros(0, dtype=np.int64)), dtype=np.int64)
+    filled_qty = np.asarray(trade_payload.get("filled_qty", np.zeros(0, dtype=np.float64)), dtype=np.float64)
+    exec_price = np.asarray(trade_payload.get("exec_price", np.zeros(0, dtype=np.float64)), dtype=np.float64)
+    n = min(session_id.size, filled_qty.size, exec_price.size)
+    if n <= 0:
+        return {}
+    out: dict[int, float] = {}
+    for i in range(n):
+        sid = int(session_id[i])
+        out[sid] = out.get(sid, 0.0) + abs(float(filled_qty[i]) * float(exec_price[i]))
+    return out
+
+
+def _session_trade_count_by_payload(trade_payload: dict[str, np.ndarray] | None) -> dict[int, int]:
+    if not isinstance(trade_payload, dict):
+        return {}
+    session_id = np.asarray(trade_payload.get("session_id", np.zeros(0, dtype=np.int64)), dtype=np.int64)
+    filled_qty = np.asarray(trade_payload.get("filled_qty", np.zeros(0, dtype=np.float64)), dtype=np.float64)
+    n = min(session_id.size, filled_qty.size)
+    if n <= 0:
+        return {}
+    out: dict[int, int] = {}
+    for i in range(n):
+        if abs(float(filled_qty[i])) <= 1.0e-12:
+            continue
+        sid = int(session_id[i])
+        out[sid] = out.get(sid, 0) + 1
+    return out
+
+
+def _session_gross_peak_by_equity_payload(equity_payload: dict[str, np.ndarray] | None) -> dict[int, float]:
+    if not isinstance(equity_payload, dict):
+        return {}
+    session_id = np.asarray(equity_payload.get("session_id", np.zeros(0, dtype=np.int64)), dtype=np.int64)
+    equity = np.asarray(equity_payload.get("equity", np.zeros(0, dtype=np.float64)), dtype=np.float64)
+    margin_used = np.asarray(equity_payload.get("margin_used", np.zeros(0, dtype=np.float64)), dtype=np.float64)
+    n = min(session_id.size, equity.size, margin_used.size)
+    if n <= 0:
+        return {}
+    out: dict[int, float] = {}
+    for i in range(n):
+        sid = int(session_id[i])
+        eq = max(abs(float(equity[i])), 1.0e-12)
+        gross_peak = abs(float(margin_used[i])) / eq
+        out[sid] = max(out.get(sid, 0.0), gross_peak)
+    return out
+
+
+def _availability_state_codes_from_worker_truth(
+    *,
+    session_ids_exec: np.ndarray,
+    session_ids_raw: np.ndarray,
+    trade_payload: dict[str, np.ndarray] | None,
+    equity_payload: dict[str, np.ndarray] | None,
+    dq_invalidated: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    observed = np.unique(
+        np.r_[
+            np.asarray(session_ids_exec, dtype=np.int64).reshape(-1),
+            np.asarray(session_ids_raw, dtype=np.int64).reshape(-1),
+        ]
+    ).astype(np.int64)
+    if observed.size <= 0:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int16)
+    if bool(dq_invalidated):
+        return observed, np.full(observed.shape[0], int(_MODULE6_AVAIL_INVALIDATED_BY_DQ), dtype=np.int16)
+    trade_notional = _session_notional_by_trade_payload(trade_payload)
+    trade_count = _session_trade_count_by_payload(trade_payload)
+    gross_peak = _session_gross_peak_by_equity_payload(equity_payload)
+    codes = np.zeros(observed.shape[0], dtype=np.int16)
+    for i, sid in enumerate(observed.tolist()):
+        has_activity = (
+            float(trade_notional.get(int(sid), 0.0)) > 0.0
+            or int(trade_count.get(int(sid), 0)) > 0
+            or float(gross_peak.get(int(sid), 0.0)) > 0.0
+        )
+        codes[i] = np.int16(_MODULE6_AVAIL_OBSERVED_ACTIVE if has_activity else _MODULE6_AVAIL_OBSERVED_FLAT)
+    return observed, codes
+
+
 def _event_window_mask(T: int, event_idx: np.ndarray, pre: int, post: int) -> np.ndarray:
     return _eval_event_window_mask(T, event_idx, pre, post)
 
@@ -1633,6 +1721,16 @@ def _run_group_task(
                     [float(map_raw.get(int(s), 0.0)) for s in sess_ids.tolist()],
                     dtype=np.float64,
                 )
+            equity_payload = _equity_curve_payload(st, c.candidate_id, split.split_id, scenario.scenario_id)
+            trade_payload = _trade_log_payload(st, m4_out, c.candidate_id, split.split_id, scenario.scenario_id)
+            dq_invalidated = bool("DQ_REJECTED_INPUT" in quality_reason_codes)
+            availability_state_session_ids, availability_state_codes = _availability_state_codes_from_worker_truth(
+                session_ids_exec=sess_ids,
+                session_ids_raw=sess_ids_raw,
+                trade_payload=trade_payload,
+                equity_payload=equity_payload,
+                dq_invalidated=dq_invalidated,
+            )
 
             micro_payload = _collect_micro_diagnostics_payload(
                 state=st,
@@ -1690,8 +1788,8 @@ def _run_group_task(
                 "daily_returns": daily_ret_exec,
                 "daily_returns_exec": daily_ret_exec,
                 "daily_returns_raw": daily_ret_raw,
-                "equity_payload": _equity_curve_payload(st, c.candidate_id, split.split_id, scenario.scenario_id),
-                "trade_payload": _trade_log_payload(st, m4_out, c.candidate_id, split.split_id, scenario.scenario_id),
+                "equity_payload": equity_payload,
+                "trade_payload": trade_payload,
                 "asset_pnl_by_symbol": _asset_pnl_by_symbol_from_state(st, split),
                 "micro_payload": micro_payload,
                 "profile_payload": profile_payload,
@@ -1703,6 +1801,9 @@ def _run_group_task(
                 "test_days": int(daily_ret_exec.shape[0]),
                 "task_seed": int(task_seed),
                 "quality_reason_codes": quality_reason_codes,
+                "dq_invalidated": bool(dq_invalidated),
+                "availability_state_session_ids": availability_state_session_ids,
+                "availability_state_codes": availability_state_codes,
                 "asset_keys": [st.symbols[i] for i in np.flatnonzero(c.enabled_assets_mask).tolist()],
                 "exception_signature": "",
                 "risk_engine_metrics": {
@@ -1782,6 +1883,9 @@ def _run_group_task(
                     "test_days": 0,
                     "task_seed": int(task_seed),
                     "quality_reason_codes": quality_reason_codes,
+                    "dq_invalidated": bool("DQ_REJECTED_INPUT" in quality_reason_codes),
+                    "availability_state_session_ids": np.zeros(0, dtype=np.int64),
+                    "availability_state_codes": np.zeros(0, dtype=np.int16),
                     "asset_keys": asset_keys,
                     "state_dump": state_dump,
                     "group_runtime_stats": {

@@ -78,6 +78,7 @@ from app.data_resolution import (
     resolve_data_paths as _data_resolve_data_paths,
 )
 from app.stage_a_discovery import parse_stage_a_window_set
+from module6 import Module6Config, run_module6_portfolio_research
 from module5.harness.artifact_writers import write_json as _artifact_write_json
 
 
@@ -702,6 +703,14 @@ def main() -> None:
         pass_count=pass_count,
         resolved_config_sha256=resolved_sha,
     )
+    try:
+        module6_report = run_module6_portfolio_research(
+            run_dir,
+            output_dir=run_dir / "module6",
+            config=Module6Config(),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"MODULE6_SUPPORTED_FLOW_BLOCKED: {type(exc).__name__}: {exc}") from exc
 
     summary = {
         "run_id": run_id,
@@ -721,6 +730,8 @@ def main() -> None:
         "latest_run": str((artifacts_root / ".latest_run").resolve()),
         "runtime_warning_count": int(runtime_warning_count),
         "research_mode": str(getattr(harness_cfg, "research_mode", "standard")),
+        "module6_output_dir": str(module6_report.output_dir),
+        "module6_selected_count": int(len(module6_report.selected_portfolio_pks)),
     }
     if research_report is not None:
         summary["research_distribution_report"] = str(research_report_path)

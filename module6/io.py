@@ -108,6 +108,7 @@ def load_module5_run(run_dir: str | Path, config: Module6Config) -> LoadedModule
         session_returns=session_returns,
         equity_curves=equity_curves,
         trade_log=trade_log,
+        micro_diagnostics=micro,
     )
     return LoadedModule5Run(
         paths=paths,
@@ -134,6 +135,7 @@ def validate_source_contracts(
     session_returns: pd.DataFrame,
     equity_curves: pd.DataFrame,
     trade_log: pd.DataFrame,
+    micro_diagnostics: pd.DataFrame | None,
 ) -> None:
     if str(run_manifest.get("dataset_hash", "")).strip() == "":
         raise Module6ValidationError("run_manifest missing dataset_hash")
@@ -169,6 +171,9 @@ def validate_source_contracts(
             "selection_stage",
             "calendar_version",
             "portfolio_instance_role",
+            "canonical_reference_split_id",
+            "canonical_reference_scenario_id",
+            "canonical_reference_policy",
         ],
         "strategy_instance_selection.parquet",
     )
@@ -186,6 +191,16 @@ def validate_source_contracts(
             "return_exec",
             "return_raw",
             "availability_state_code",
+            "availability_state_source",
+            "observed_exec",
+            "observed_raw",
+            "session_turnover",
+            "session_trade_count",
+            "gross_mult_mean",
+            "gross_mult_peak",
+            "buying_power_min",
+            "buying_power_min_frac",
+            "daily_loss_max",
         ],
         "strategy_instance_session_returns.parquet",
     )
@@ -196,11 +211,21 @@ def validate_source_contracts(
     )
     require_columns(
         trade_log,
-        ["ts_ns", "candidate_id", "split_id", "scenario_id", "symbol", "filled_qty", "exec_price"],
+        ["ts_ns", "session_id", "candidate_id", "split_id", "scenario_id", "symbol", "filled_qty", "exec_price", "trade_cost"],
         "trade_log.parquet",
+    )
+    if micro_diagnostics is None:
+        raise Module6ValidationError("micro_diagnostics.parquet is required for Module 6 truth replay")
+    require_columns(
+        micro_diagnostics,
+        ["ts_ns", "session_id", "candidate_id", "split_id", "scenario_id", "symbol", "filled_qty", "exec_price", "trade_cost"],
+        "micro_diagnostics.parquet",
     )
     if "module6_bridge" not in run_manifest:
         raise Module6ValidationError("run_manifest missing module6_bridge summary")
     if not bool(run_manifest.get("daily_matrix_shape_raw")):
         raise Module6ValidationError("run_manifest missing daily_matrix_shape_raw")
-
+    bridge = dict(run_manifest.get("module6_bridge", {}))
+    for key in ("canonical_reference_split_id", "canonical_reference_scenario_id", "canonical_reference_policy", "calendar_version"):
+        if str(bridge.get(key, "")).strip() == "":
+            raise Module6ValidationError(f"run_manifest.module6_bridge missing {key}")

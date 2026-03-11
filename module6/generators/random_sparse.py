@@ -6,8 +6,9 @@ import numpy as np
 import pandas as pd
 
 from module6.config import Module6Config
+from module6.constraints import apply_long_only_weight_caps
 from module6.types import ReducedUniverseSpec
-from module6.utils import normalize_long_only_weights, portfolio_pk, target_weights_hash
+from module6.utils import portfolio_pk, target_weights_hash
 
 
 def generate_random_sparse_batch(
@@ -32,26 +33,23 @@ def generate_random_sparse_batch(
         chosen = rng.choice(np.asarray(ids, dtype=object), size=card, replace=False, p=probs)
         raw = rng.dirichlet(np.ones(card, dtype=np.float64))
         candidate_weights = {str(pk): float(w) for pk, w in zip(chosen.tolist(), raw.tolist())}
-        cluster_totals: dict[int, float] = {}
-        family_totals: dict[str, float] = {}
-        for pk, w in candidate_weights.items():
-            cluster_totals[int(cluster_map.get(pk, -1))] = cluster_totals.get(int(cluster_map.get(pk, -1)), 0.0) + float(w)
-            family_totals[str(family_map.get(pk, ""))] = family_totals.get(str(family_map.get(pk, "")), 0.0) + float(w)
-        for pk in list(candidate_weights.keys()):
-            candidate_weights[pk] = min(float(candidate_weights[pk]), float(config.generator.per_sleeve_cap))
-        for cluster_id, total in cluster_totals.items():
-            if total > float(config.generator.per_cluster_cap):
-                scale = float(config.generator.per_cluster_cap) / total
-                for pk in list(candidate_weights.keys()):
-                    if int(cluster_map.get(pk, -1)) == cluster_id:
-                        candidate_weights[pk] *= scale
-        for family_id, total in family_totals.items():
-            if total > float(config.generator.per_family_cap):
-                scale = float(config.generator.per_family_cap) / total
-                for pk in list(candidate_weights.keys()):
-                    if str(family_map.get(pk, "")) == family_id:
-                        candidate_weights[pk] *= scale
-        normalized, cash_weight = normalize_long_only_weights(candidate_weights, config.generator.minimum_cash_weight)
+        projection = apply_long_only_weight_caps(
+            target_weights=np.asarray([candidate_weights[pk] for pk in chosen.tolist()], dtype=np.float64),
+            cluster_ids=np.asarray([int(cluster_map.get(str(pk), -1)) for pk in chosen.tolist()], dtype=np.int64),
+            family_ids=np.asarray([str(family_map.get(str(pk), "")) for pk in chosen.tolist()], dtype=object),
+            per_sleeve_cap=float(config.generator.per_sleeve_cap),
+            per_cluster_cap=float(config.generator.per_cluster_cap),
+            per_family_cap=float(config.generator.per_family_cap),
+            min_cash_weight=float(config.generator.minimum_cash_weight),
+        )
+        if projection.infeasible:
+            continue
+        normalized = {
+            str(pk): float(w)
+            for pk, w in zip(chosen.tolist(), projection.weights.tolist())
+            if float(w) > 0.0
+        }
+        cash_weight = float(projection.cash_weight)
         weights_hash = target_weights_hash(normalized)
         pk = portfolio_pk(
             reduced_universe_id=reduced_universe.reduced_universe_id,
@@ -96,4 +94,3 @@ def generate_random_sparse_batch(
                 }
             )
     return pd.DataFrame(rows), pd.DataFrame(weights_rows)
-

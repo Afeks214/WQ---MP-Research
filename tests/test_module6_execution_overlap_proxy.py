@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from module6.execution_overlap import build_execution_overlap_proxy
 from module6.config import DependenceConfig
+from module6.utils import Module6ValidationError
 
 
 def test_execution_overlap_proxy_component_correctness():
@@ -38,3 +40,33 @@ def test_execution_overlap_proxy_component_correctness():
     assert overlap.composite.shape == (2, 2)
     assert overlap.composite[0, 1] > 0.0
 
+
+def test_execution_overlap_proxy_weights_are_locked():
+    instances = pd.DataFrame(
+        {
+            "strategy_instance_pk": ["a", "b"],
+            "candidate_id": ["ca", "cb"],
+            "split_id": ["wf_000", "wf_000"],
+            "scenario_id": ["baseline", "baseline"],
+        }
+    )
+    trade_log = pd.DataFrame(
+        {
+            "candidate_id": ["ca", "cb"],
+            "split_id": ["wf_000", "wf_000"],
+            "scenario_id": ["baseline", "baseline"],
+            "symbol": ["SYM0", "SYM0"],
+            "ts_ns": [1, 1],
+            "filled_qty": [1.0, 1.0],
+            "exec_price": [100.0, 100.0],
+        }
+    )
+    with pytest.raises(Module6ValidationError):
+        build_execution_overlap_proxy(
+            instance_rows=instances,
+            trade_log=trade_log,
+            turnover_matrix=np.asarray([[1.0, 1.0]], dtype=np.float64),
+            gross_peak_matrix=np.asarray([[1.0, 1.0]], dtype=np.float64),
+            config=DependenceConfig(overlap_weight_activity=0.20),
+            candidate_pairs=[(0, 1)],
+        )

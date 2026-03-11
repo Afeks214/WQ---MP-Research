@@ -14,6 +14,13 @@ AVAIL_FORCED_ZERO_BY_PORTFOLIO = 4
 AVAIL_FORCED_CASH_BY_RISK = 5
 AVAIL_INVALIDATED_BY_DQ = 6
 
+_BASE_AVAIL_ALLOWED = {
+    AVAIL_OBSERVED_ACTIVE,
+    AVAIL_OBSERVED_FLAT,
+    AVAIL_STRUCTURALLY_MISSING,
+    AVAIL_INVALIDATED_BY_DQ,
+}
+
 _SELECTION_STAGE = "module5_bridge_canonical_baseline_v1"
 
 
@@ -44,43 +51,64 @@ def _series_map(
     return out
 
 
+def _state_code_map(
+    session_ids: np.ndarray | list[int] | None,
+    codes: np.ndarray | list[int] | None,
+) -> dict[int, int]:
+    sess = np.asarray(session_ids if session_ids is not None else np.zeros(0, dtype=np.int64), dtype=np.int64)
+    vals = np.asarray(codes if codes is not None else np.zeros(0, dtype=np.int16), dtype=np.int16)
+    if sess.size != vals.size:
+        raise RuntimeError(
+            f"session/state size mismatch in module6 bridge; session_count={int(sess.size)} state_count={int(vals.size)}"
+        )
+    out: dict[int, int] = {}
+    for s, code in zip(sess.tolist(), vals.tolist()):
+        cc = int(code)
+        if cc not in _BASE_AVAIL_ALLOWED:
+            raise RuntimeError(f"invalid base availability_state_code in module6 bridge; session_id={int(s)} code={cc}")
+        out[int(s)] = cc
+    return out
+
+
 def _turnover_by_session(trade_payload: dict[str, np.ndarray] | None, ts_to_session: dict[int, int], initial_cash: float) -> dict[int, float]:
     if not trade_payload:
         return {}
+    session_ids = np.asarray(trade_payload.get("session_id", np.zeros(0, dtype=np.int64)), dtype=np.int64)
     ts = np.asarray(trade_payload.get("ts_ns", np.zeros(0, dtype=np.int64)), dtype=np.int64)
     qty = np.asarray(trade_payload.get("filled_qty", np.zeros(0, dtype=np.float64)), dtype=np.float64)
     px = np.asarray(trade_payload.get("exec_price", np.zeros(0, dtype=np.float64)), dtype=np.float64)
-    if ts.size == 0 or qty.size == 0 or px.size == 0:
+    if qty.size == 0 or px.size == 0:
         return {}
-    n = min(ts.size, qty.size, px.size)
+    n = min(max(session_ids.size, ts.size), qty.size, px.size)
     if n <= 0:
         return {}
     out: dict[int, float] = {}
     for i in range(n):
-        session_id = ts_to_session.get(int(ts[i]))
+        session_id = int(session_ids[i]) if i < session_ids.size else ts_to_session.get(int(ts[i]))
         if session_id is None:
             continue
         notional = float(abs(float(qty[i]) * float(px[i])))
-        out[session_id] = out.get(session_id, 0.0) + notional / max(float(initial_cash), 1.0e-12)
+        out[int(session_id)] = out.get(int(session_id), 0.0) + notional / max(float(initial_cash), 1.0e-12)
     return out
 
 
 def _trade_count_by_session(trade_payload: dict[str, np.ndarray] | None, ts_to_session: dict[int, int]) -> dict[int, int]:
     if not trade_payload:
         return {}
+    session_ids = np.asarray(trade_payload.get("session_id", np.zeros(0, dtype=np.int64)), dtype=np.int64)
     ts = np.asarray(trade_payload.get("ts_ns", np.zeros(0, dtype=np.int64)), dtype=np.int64)
     qty = np.asarray(trade_payload.get("filled_qty", np.zeros(0, dtype=np.float64)), dtype=np.float64)
-    if ts.size == 0 or qty.size == 0:
+    if qty.size == 0:
         return {}
-    n = min(ts.size, qty.size)
+    n = min(max(session_ids.size, ts.size), qty.size)
     out: dict[int, int] = {}
     for i in range(n):
         if abs(float(qty[i])) <= 1.0e-12:
             continue
-        session_id = ts_to_session.get(int(ts[i]))
+        session_id = int(session_ids[i]) if i < session_ids.size else ts_to_session.get(int(ts[i]))
         if session_id is None:
             continue
-        out[session_id] = out.get(session_id, 0) + 1
+        out[int(session_id)] = out.get(int(session_id), 0) + 1
     return out
 
 
@@ -131,55 +159,15 @@ def _overnight_by_session(micro_payload: dict[str, np.ndarray] | None) -> dict[i
     return out
 
 
-def _select_canonical_row(
-    baseline_rows: list[dict[str, Any]],
-    aggregate_ret: np.ndarray,
-    common_sessions: np.ndarray,
-    initial_cash: float,
-) -> dict[str, Any]:
-    if not baseline_rows:
-        raise RuntimeError("cannot select canonical module6 bridge instance without baseline rows")
-    common = np.asarray(common_sessions, dtype=np.int64)
-    target = np.asarray(aggregate_ret, dtype=np.float64)
-    if common.size != target.size:
-        raise RuntimeError(
-            f"common session / aggregate return size mismatch in module6 bridge; sessions={int(common.size)} target={int(target.size)}"
-        )
-    best_key: tuple[float, float, float, str] | None = None
-    best_row: dict[str, Any] | None = None
-    for row in baseline_rows:
-        exec_map = _series_map(row.get("session_ids_exec"), row.get("daily_returns_exec"))
-        vec = np.asarray([float(exec_map.get(int(s), 0.0)) for s in common.tolist()], dtype=np.float64)
-        support = float(np.mean(np.asarray([int(int(s) in exec_map) for s in common.tolist()], dtype=np.float64)))
-        turnover = _turnover_by_session(
-            row.get("trade_payload"),
-            {int(ts): int(sess) for ts, sess in zip(
-                np.asarray(row.get("equity_payload", {}).get("ts_ns", np.zeros(0, dtype=np.int64)), dtype=np.int64).tolist(),
-                np.asarray(row.get("equity_payload", {}).get("session_id", np.zeros(0, dtype=np.int64)), dtype=np.int64).tolist(),
-            )},
-            initial_cash,
-        )
-        total_turnover = float(sum(turnover.values()))
-        key = (
-            float(np.sum(np.abs(vec - target))),
-            -support,
-            total_turnover,
-            str(row.get("split_id", "")),
-        )
-        if best_key is None or key < best_key:
-            best_key = key
-            best_row = row
-    if best_row is None:
-        raise RuntimeError("failed to resolve canonical module6 bridge instance")
-    return best_row
-
-
 def build_module6_bridge_artifacts(
     *,
     report_root: Path,
     run_id: str,
     execution_mode: str,
     common_sessions: np.ndarray,
+    canonical_reference_split_id: str,
+    canonical_reference_scenario_id: str,
+    canonical_reference_policy: str,
     baseline_candidate_ids: list[str],
     candidate_daily_mat: np.ndarray,
     candidates: list[Any],
@@ -192,7 +180,14 @@ def build_module6_bridge_artifacts(
     common = np.asarray(common_sessions, dtype=np.int64).reshape(-1)
     if common.size <= 0:
         raise RuntimeError("module6 bridge requires a non-empty canonical session calendar")
-    baseline_col = {str(cid): j for j, cid in enumerate(baseline_candidate_ids)}
+    if str(canonical_reference_split_id).strip() == "":
+        raise RuntimeError("module6 bridge requires explicit canonical_reference_split_id")
+    if str(canonical_reference_scenario_id).strip() == "":
+        raise RuntimeError("module6 bridge requires explicit canonical_reference_scenario_id")
+    if str(canonical_reference_policy).strip() == "":
+        raise RuntimeError("module6 bridge requires explicit canonical_reference_policy")
+    _ = baseline_candidate_ids
+    _ = candidate_daily_mat
     candidate_meta = {str(row["candidate_id"]): row for row in candidate_rows}
     calendar_version = _calendar_version(common)
     selection_rows: list[dict[str, Any]] = []
@@ -209,39 +204,32 @@ def build_module6_bridge_artifacts(
         )
         if not candidate_results:
             raise RuntimeError(f"module6 bridge requires at least one result row per candidate; candidate_id={candidate_id}")
-        baseline_ok_rows = [
-            r for r in candidate_results
-            if str(r.get("status", "")) == "ok" and str(r.get("scenario_id", "")) == "baseline"
+        canonical_matches = [
+            r
+            for r in candidate_results
+            if str(r.get("split_id", "")) == str(canonical_reference_split_id)
+            and str(r.get("scenario_id", "")) == str(canonical_reference_scenario_id)
         ]
-        baseline_any_rows = [
-            r for r in candidate_results
-            if str(r.get("scenario_id", "")) == "baseline"
-        ]
-        aggregate_ret = (
-            np.asarray(candidate_daily_mat[:, int(baseline_col[candidate_id])], dtype=np.float64)
-            if candidate_id in baseline_col
-            else np.zeros(common.shape[0], dtype=np.float64)
-        )
-        if baseline_ok_rows:
-            canonical_row = _select_canonical_row(
-                baseline_rows=baseline_ok_rows,
-                aggregate_ret=aggregate_ret,
-                common_sessions=common,
-                initial_cash=initial_cash,
+        if len(canonical_matches) != 1:
+            raise RuntimeError(
+                "module6 bridge canonical instance truth missing or ambiguous; "
+                f"candidate_id={candidate_id} split_id={canonical_reference_split_id} "
+                f"scenario_id={canonical_reference_scenario_id} match_count={len(canonical_matches)}"
             )
-        elif baseline_any_rows:
-            canonical_row = sorted(
-                baseline_any_rows,
-                key=lambda x: (str(x.get("status", "")) != "ok", str(x.get("split_id", "")), str(x.get("task_id", ""))),
-            )[0]
-        else:
-            canonical_row = candidate_results[0]
+        canonical_row = canonical_matches[0]
+        if str(canonical_row.get("status", "")) != "ok":
+            raise RuntimeError(
+                "module6 bridge canonical instance must be successful; "
+                f"candidate_id={candidate_id} split_id={canonical_reference_split_id} "
+                f"scenario_id={canonical_reference_scenario_id} status={str(canonical_row.get('status', ''))}"
+            )
 
         for row in candidate_results:
             split_id = str(row.get("split_id", ""))
             scenario_id = str(row.get("scenario_id", ""))
             status = str(row.get("status", ""))
             dq_codes = {str(x) for x in row.get("quality_reason_codes", [])}
+            dq_invalidated = bool(row.get("dq_invalidated", False) or ("DQ_REJECTED_INPUT" in dq_codes))
             role = "excluded"
             if status == "ok":
                 role = "robustness_only"
@@ -250,6 +238,10 @@ def build_module6_bridge_artifacts(
 
             exec_map = _series_map(row.get("session_ids_exec"), row.get("daily_returns_exec"))
             raw_map = _series_map(row.get("session_ids_raw"), row.get("daily_returns_raw"))
+            state_map = _state_code_map(
+                row.get("availability_state_session_ids", row.get("session_ids_exec")),
+                row.get("availability_state_codes"),
+            )
             equity_payload = row.get("equity_payload")
             trade_payload = row.get("trade_payload")
             micro_payload = row.get("micro_payload")
@@ -269,10 +261,6 @@ def build_module6_bridge_artifacts(
             )
             overnight_flag = _overnight_by_session(micro_payload if isinstance(micro_payload, dict) else None)
 
-            candidate_distance = float("nan")
-            if candidate_id in baseline_col:
-                aligned = np.asarray([float(exec_map.get(int(s), 0.0)) for s in common.tolist()], dtype=np.float64)
-                candidate_distance = float(np.sum(np.abs(aligned - aggregate_ret)))
             selection_rows.append(
                 {
                     "strategy_id": strategy_id,
@@ -283,12 +271,14 @@ def build_module6_bridge_artifacts(
                     "selection_stage": _SELECTION_STAGE,
                     "calendar_version": calendar_version,
                     "portfolio_instance_role": role,
+                    "canonical_reference_split_id": str(canonical_reference_split_id),
+                    "canonical_reference_scenario_id": str(canonical_reference_scenario_id),
+                    "canonical_reference_policy": str(canonical_reference_policy),
                     "status": status,
                     "n_sessions_exec": int(len(exec_map)),
                     "n_sessions_raw": int(len(raw_map)),
                     "support_coverage_exec": float(len(exec_map) / max(common.size, 1)),
                     "support_coverage_raw": float(len(raw_map) / max(common.size, 1)),
-                    "candidate_distance_to_baseline_aggregate": candidate_distance,
                     "parameter_hash": str(meta.get("parameter_hash", "")),
                     "family_id": str(meta.get("family_id", "")),
                     "hypothesis_id": str(meta.get("hypothesis_id", "")),
@@ -300,17 +290,17 @@ def build_module6_bridge_artifacts(
                 s = int(session_id)
                 observed_exec = s in exec_map
                 observed_raw = s in raw_map
-                if "DQ_REJECTED_INPUT" in dq_codes:
+                if dq_invalidated:
                     availability_state_code = AVAIL_INVALIDATED_BY_DQ
+                elif s in state_map:
+                    availability_state_code = int(state_map[s])
                 elif not (observed_exec or observed_raw):
                     availability_state_code = AVAIL_STRUCTURALLY_MISSING
                 else:
-                    has_activity = (
-                        float(session_turnover.get(s, 0.0)) > 0.0
-                        or float(gross_peak.get(s, 0.0)) > 0.0
-                        or int(session_trade_count.get(s, 0)) > 0
+                    raise RuntimeError(
+                        "module6 bridge requires explicit availability_state_codes for observed sessions; "
+                        f"candidate_id={candidate_id} split_id={split_id} scenario_id={scenario_id} session_id={s}"
                     )
-                    availability_state_code = AVAIL_OBSERVED_ACTIVE if has_activity else AVAIL_OBSERVED_FLAT
                 session_rows.append(
                     {
                         "strategy_id": strategy_id,
@@ -324,6 +314,7 @@ def build_module6_bridge_artifacts(
                         "return_exec": float(exec_map.get(s, 0.0)),
                         "return_raw": float(raw_map.get(s, 0.0)),
                         "availability_state_code": int(availability_state_code),
+                        "availability_state_source": "upstream_worker_truth_v1",
                         "observed_exec": int(observed_exec),
                         "observed_raw": int(observed_raw),
                         "session_turnover": float(session_turnover.get(s, 0.0)),
@@ -331,6 +322,7 @@ def build_module6_bridge_artifacts(
                         "gross_mult_mean": float(gross_mean.get(s, 0.0)),
                         "gross_mult_peak": float(gross_peak.get(s, 0.0)),
                         "buying_power_min": float(buying_power_min.get(s, 0.0)),
+                        "buying_power_min_frac": float(buying_power_min.get(s, 0.0) / max(initial_cash, 1.0e-12)),
                         "daily_loss_max": float(daily_loss_max.get(s, 0.0)),
                         "overnight_flag": int(overnight_flag.get(s, 0)),
                     }
@@ -375,6 +367,9 @@ def build_module6_bridge_artifacts(
         "session_returns_path": str(session_path),
         "calendar_version": calendar_version,
         "selection_stage": _SELECTION_STAGE,
+        "canonical_reference_split_id": str(canonical_reference_split_id),
+        "canonical_reference_scenario_id": str(canonical_reference_scenario_id),
+        "canonical_reference_policy": str(canonical_reference_policy),
         "n_strategy_instances": int(selection_df.shape[0]),
         "n_session_rows": int(session_df.shape[0]),
         "n_canonical_instances": int((selection_df["portfolio_instance_role"] == "canonical_portfolio").sum()),

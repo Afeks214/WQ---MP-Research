@@ -44,6 +44,7 @@ def generate_all_portfolios(
         ),
         lambda: generate_mv_variants(
             reduced_universe=reduced_universe,
+            strategy_frame=strategy_frame,
             covariance_bundle=covariance_bundle,
             returns_exec=returns_exec,
             column_indices=column_indices,

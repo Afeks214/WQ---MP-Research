@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pandas as pd
+
 from module6.io import load_module5_run
 from module6.ledger import materialize_canonical_ledgers
 from module6.matrices import build_matrix_store
@@ -38,7 +40,7 @@ def test_score_session_paths_adds_first_pass_score(tmp_path):
         portfolio_weights=weights,
         strategy_frame=strategy_frame,
         matrices=matrices,
-        calendar=store.calendar,
+        calendar=pd.read_parquet(store.calendar_index_path),
         config=cfg,
         return_weight_history=False,
     )

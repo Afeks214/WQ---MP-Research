@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from module6.config import Module6Config
+from module6.constants import BASE_AVAIL_ALLOWED_CODES
 from module6.io import LoadedModule5Run
 from module6.utils import Module6ValidationError, assert_no_duplicates, count_flag_tokens, ensure_directory, stable_sha256_parts
 
@@ -152,6 +153,9 @@ def build_strategy_instance_master(run: LoadedModule5Run, config: Module6Config)
         raise Module6ValidationError(
             f"canonical portfolio instance cardinality failure: {canonical_counts[canonical_counts != 1].to_dict()}"
         )
+    for col in ("canonical_reference_split_id", "canonical_reference_scenario_id", "canonical_reference_policy"):
+        if merged[col].isna().any() or (merged[col].astype(str).str.strip() == "").any():
+            raise Module6ValidationError(f"strategy_instance_master missing canonical reference field: {col}")
     return merged
 
 
@@ -192,6 +196,10 @@ def build_strategy_session_ledger(run: LoadedModule5Run, instance_master: pd.Dat
     )
     if merged["availability_state_code"].isna().any():
         raise Module6ValidationError("strategy_session_ledger missing availability_state_code")
+    observed_codes = sorted({int(x) for x in pd.unique(merged["availability_state_code"]).tolist()})
+    invalid_codes = [code for code in observed_codes if int(code) not in set(BASE_AVAIL_ALLOWED_CODES)]
+    if invalid_codes:
+        raise Module6ValidationError(f"strategy_session_ledger contains invalid base availability codes: {invalid_codes}")
     if not np.isfinite(np.asarray(merged["return_exec"], dtype=np.float64)).all():
         raise Module6ValidationError("strategy_session_ledger contains non-finite return_exec")
     if not np.isfinite(np.asarray(merged["return_raw"], dtype=np.float64)).all():

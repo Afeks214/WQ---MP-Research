@@ -11,6 +11,45 @@ import numpy as np
 from module5.harness.module6_bridge import build_module6_bridge_artifacts
 
 
+def _module6_split_order_key(split_id: str) -> tuple[int, str]:
+    txt = str(split_id).strip()
+    if txt.startswith("wf_"):
+        try:
+            return 0, f"{int(txt.split('_', 1)[1]):09d}"
+        except Exception:
+            return 0, txt
+    return 1, txt
+
+
+def _resolve_module6_canonical_reference(
+    *,
+    splits: list[Any],
+    scenarios: list[Any],
+) -> tuple[str, str, str]:
+    enabled_baseline = [
+        s for s in scenarios
+        if bool(getattr(s, "enabled", True)) and str(getattr(s, "scenario_id", "")).strip() == "baseline"
+    ]
+    if len(enabled_baseline) != 1:
+        raise RuntimeError(
+            "module6 canonical reference requires exactly one enabled baseline scenario; "
+            f"enabled_baseline_count={len(enabled_baseline)}"
+        )
+    enabled_splits = [s for s in splits if bool(getattr(s, "enabled", True))]
+    if not enabled_splits:
+        raise RuntimeError("module6 canonical reference requires at least one enabled split")
+    wf_splits = [s for s in enabled_splits if str(getattr(s, "split_id", "")).startswith("wf_")]
+    chosen_split = sorted(
+        wf_splits if wf_splits else enabled_splits,
+        key=lambda x: _module6_split_order_key(str(getattr(x, "split_id", ""))),
+    )[0]
+    return (
+        str(getattr(chosen_split, "split_id", "")),
+        str(getattr(enabled_baseline[0], "scenario_id", "")),
+        "enabled_baseline_first_split_v1",
+    )
+
+
 def build_candidate_results(
     all_results: list[dict[str, Any]],
     candidate_verdict: dict[str, dict[str, Any]],
@@ -235,12 +274,19 @@ def finalize_run_outputs(
         m4_configs=m4_configs,
         harness_cfg=harness_cfg,
     )
+    canonical_reference_split_id, canonical_reference_scenario_id, canonical_reference_policy = _resolve_module6_canonical_reference(
+        splits=splits,
+        scenarios=scenarios,
+    )
 
     module6_bridge_paths, module6_bridge_summary = build_module6_bridge_artifacts(
         report_root=report_root,
         run_id=run_id,
         execution_mode=execution_mode,
         common_sessions=common_sessions,
+        canonical_reference_split_id=canonical_reference_split_id,
+        canonical_reference_scenario_id=canonical_reference_scenario_id,
+        canonical_reference_policy=canonical_reference_policy,
         baseline_candidate_ids=baseline_candidate_ids,
         candidate_daily_mat=daily_mat_exec,
         candidates=candidates,

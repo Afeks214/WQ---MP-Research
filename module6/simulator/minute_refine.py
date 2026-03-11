@@ -44,6 +44,8 @@ def replay_finalists_minute(
         + "|"
         + instance_lookup["scenario_id"].astype(str)
     )
+    if run.micro_diagnostics is None:
+        raise Module6ValidationError("minute replay requires micro_diagnostics truth input")
     eq = run.equity_curves.copy()
     eq["instance_key"] = (
         eq["candidate_id"].astype(str)
@@ -55,6 +57,24 @@ def replay_finalists_minute(
     eq = eq.loc[eq["instance_key"].isin(instance_lookup["instance_key"])].copy()
     if eq.shape[0] <= 0:
         raise Module6ValidationError("minute replay requires equity_curves for finalist instances")
+    trade = run.trade_log.copy()
+    trade["instance_key"] = (
+        trade["candidate_id"].astype(str)
+        + "|"
+        + trade["split_id"].astype(str)
+        + "|"
+        + trade["scenario_id"].astype(str)
+    )
+    trade = trade.loc[trade["instance_key"].isin(instance_lookup["instance_key"])].copy()
+    micro = run.micro_diagnostics.copy()
+    micro["instance_key"] = (
+        micro["candidate_id"].astype(str)
+        + "|"
+        + micro["split_id"].astype(str)
+        + "|"
+        + micro["scenario_id"].astype(str)
+    )
+    micro = micro.loc[micro["instance_key"].isin(instance_lookup["instance_key"])].copy()
 
     minute_rows: list[dict[str, Any]] = []
     component_rows: list[dict[str, Any]] = []
@@ -74,6 +94,7 @@ def replay_finalists_minute(
         breach_count = 0
         disable = False
         portfolio_session_returns: list[float] = []
+        portfolio_session_turnover: list[float] = []
         for session_row in path_df.sort_values("session_id", kind="mergesort").itertuples(index=False):
             session_detail = detail.loc[detail["session_id"] == int(session_row.session_id)].copy()
             if session_detail.shape[0] <= 0:
@@ -88,38 +109,105 @@ def replay_finalists_minute(
             session_eq = eq.loc[eq["session_id"] == int(session_row.session_id)].copy()
             if session_eq.shape[0] <= 0:
                 raise Module6ValidationError(f"missing minute equity session for finalist {candidate.portfolio_pk} session={int(session_row.session_id)}")
-            times = np.asarray(sorted(pd.unique(session_eq["ts_ns"]).tolist()), dtype=np.int64)
+            session_trade = trade.loc[trade["session_id"] == int(session_row.session_id)].copy()
+            session_micro = micro.loc[micro["session_id"] == int(session_row.session_id)].copy()
+            times = np.asarray(
+                sorted(
+                    set(pd.unique(session_eq["ts_ns"]).tolist())
+                    | set(pd.unique(session_trade["ts_ns"]).tolist())
+                    | set(pd.unique(session_micro["ts_ns"]).tolist())
+                ),
+                dtype=np.int64,
+            )
+            if times.size <= 0:
+                raise Module6ValidationError(
+                    f"missing minute truth timestamps for finalist {candidate.portfolio_pk} session={int(session_row.session_id)}"
+                )
             component_caps: dict[str, np.ndarray] = {}
             component_gross: dict[str, np.ndarray] = {}
+            session_start_equity = float(equity)
+            session_start_cash_cap = float(session_row.session_start_cash_weight) * session_start_equity
+            embedded_trade_notional = 0.0
+            embedded_trade_cost_abs = 0.0
+            micro_trade_cost_abs = 0.0
+            micro_trade_notional = 0.0
             for comp in session_detail.itertuples(index=False):
                 loc = session_eq.loc[session_eq["instance_key"] == str(comp.instance_key)].copy()
                 loc = loc.sort_values("ts_ns", kind="mergesort")
+                if float(comp.start_weight) > 1.0e-12 and int(comp.availability_state_code) in (1, 2) and loc.shape[0] <= 0:
+                    raise Module6ValidationError(
+                        f"missing equity truth for active sleeve; portfolio_pk={candidate.portfolio_pk} session_id={int(session_row.session_id)} strategy_instance_pk={comp.strategy_instance_pk}"
+                    )
                 if loc.shape[0] <= 0:
-                    vals = np.full(times.shape[0], float(comp.start_weight) * equity, dtype=np.float64)
+                    vals = np.full(times.shape[0], float(comp.start_weight) * session_start_equity, dtype=np.float64)
                     gross_frac = np.zeros(times.shape[0], dtype=np.float64)
+                    base_eq = float(session_start_equity)
                 else:
-                    loc = loc.set_index("ts_ns").reindex(times, method="ffill").reset_index()
+                    loc = (
+                        loc.drop_duplicates("ts_ns", keep="last")
+                        .set_index("ts_ns")
+                        .reindex(times)
+                        .sort_index()
+                        .ffill()
+                        .bfill()
+                        .reset_index()
+                    )
                     eq_series = np.asarray(loc["equity"], dtype=np.float64)
-                    eq_ret = np.ones(eq_series.shape[0], dtype=np.float64)
-                    if eq_series.shape[0] > 1:
-                        prev = np.maximum(eq_series[:-1], 1.0e-12)
-                        eq_ret[1:] = eq_series[1:] / prev
-                    vals = float(comp.start_weight) * equity * np.cumprod(eq_ret)
+                    base_eq = float(eq_series[0])
+                    if not np.isfinite(base_eq) or base_eq <= 0.0:
+                        raise Module6ValidationError(
+                            f"invalid minute equity base; portfolio_pk={candidate.portfolio_pk} session_id={int(session_row.session_id)} strategy_instance_pk={comp.strategy_instance_pk}"
+                        )
+                    vals = float(comp.start_weight) * session_start_equity * (eq_series / max(base_eq, 1.0e-12))
                     gross_frac = np.asarray(loc["margin_used"], dtype=np.float64) / np.maximum(np.asarray(loc["equity"], dtype=np.float64), 1.0e-12)
                 component_caps[str(comp.strategy_instance_pk)] = vals
                 component_gross[str(comp.strategy_instance_pk)] = vals * gross_frac
+                loc_trade = session_trade.loc[session_trade["instance_key"] == str(comp.instance_key)].copy()
+                component_trade_notional = 0.0
+                component_trade_cost_abs = 0.0
+                if loc_trade.shape[0] > 0:
+                    scale = float(comp.start_weight) * session_start_equity / max(base_eq, 1.0e-12)
+                    trade_notional = np.abs(np.asarray(loc_trade["filled_qty"], dtype=np.float64) * np.asarray(loc_trade["exec_price"], dtype=np.float64))
+                    component_trade_notional = float(np.sum(trade_notional) * scale)
+                    component_trade_cost_abs = float(np.sum(np.asarray(loc_trade["trade_cost"], dtype=np.float64)) * scale)
+                    embedded_trade_notional += component_trade_notional
+                    embedded_trade_cost_abs += component_trade_cost_abs
+                loc_micro = session_micro.loc[session_micro["instance_key"] == str(comp.instance_key)].copy()
+                component_micro_trade_cost_abs = 0.0
+                component_micro_trade_notional = 0.0
+                if loc_trade.shape[0] > 0 and loc_micro.shape[0] <= 0:
+                    raise Module6ValidationError(
+                        f"missing micro truth for traded sleeve; portfolio_pk={candidate.portfolio_pk} session_id={int(session_row.session_id)} strategy_instance_pk={comp.strategy_instance_pk}"
+                    )
+                if loc_micro.shape[0] > 0:
+                    scale = float(comp.start_weight) * session_start_equity / max(base_eq, 1.0e-12)
+                    component_micro_trade_cost_abs = float(np.sum(np.asarray(loc_micro["trade_cost"], dtype=np.float64)) * scale)
+                    component_micro_trade_notional = float(
+                        np.sum(
+                            np.abs(
+                                np.asarray(loc_micro["filled_qty"], dtype=np.float64)
+                                * np.asarray(loc_micro["exec_price"], dtype=np.float64)
+                            )
+                        )
+                        * scale
+                    )
+                    micro_trade_cost_abs += component_micro_trade_cost_abs
+                    micro_trade_notional += component_micro_trade_notional
                 component_rows.append(
                     {
                         "portfolio_pk": str(candidate.portfolio_pk),
                         "session_id": int(session_row.session_id),
                         "strategy_instance_pk": str(comp.strategy_instance_pk),
                         "availability_state_code": int(comp.availability_state_code),
-                        "forced_cash_weight": float(1.0 - comp.end_weight) if int(comp.availability_state_code) in (4, 5) else 0.0,
-                        "unavailable_target_weight": float(comp.start_weight) if int(comp.availability_state_code) in (3, 6) else 0.0,
+                        "forced_cash_weight": float(max(float(comp.available_target_weight) - float(comp.end_weight), 0.0)) if int(comp.availability_state_code) in (4, 5) else 0.0,
+                        "unavailable_target_weight": float(max(float(comp.requested_target_weight) - float(comp.available_target_weight), 0.0)) if int(comp.availability_state_code) in (3, 6) else 0.0,
+                        "embedded_trade_cost_abs": float(component_trade_cost_abs),
+                        "embedded_trade_notional": float(component_trade_notional),
+                        "micro_trade_cost_abs": float(component_micro_trade_cost_abs),
+                        "micro_trade_notional": float(component_micro_trade_notional),
                     }
                 )
-            cash_cap = float(session_row.cash_weight) * equity
-            session_start_equity = float(equity)
+            cash_cap = float(session_start_cash_cap)
             flattened = False
             for k, ts_ns in enumerate(times.tolist()):
                 sleeve_total = float(sum(vals[k] for vals in component_caps.values()))
@@ -166,13 +254,28 @@ def replay_finalists_minute(
                     break
             if not flattened:
                 equity = float(cash_cap + sum(vals[-1] for vals in component_caps.values()))
-            equity *= max(0.0, 1.0 - float(session_row.cost_frac))
+            portfolio_turnover = float(
+                0.5
+                * np.sum(
+                    np.abs(
+                        np.asarray(session_detail["pre_rebalance_weight"], dtype=np.float64)
+                        - np.asarray(session_detail["end_weight"], dtype=np.float64)
+                    )
+                )
+            )
+            embedded_turnover_frac = float(embedded_trade_notional / max(session_start_equity, 1.0e-12))
+            liquidity_penalty = 1.0 + embedded_turnover_frac
+            rebalance_cost_abs = (
+                float(config.simulator.fixed_fee) * float(portfolio_turnover > 0.0)
+                + float(config.simulator.linear_cost_bps) * 1.0e-4 * portfolio_turnover * equity
+                + float(config.simulator.slippage_cost_bps) * 1.0e-4 * portfolio_turnover * equity * liquidity_penalty
+            )
+            equity = max(0.0, float(equity - rebalance_cost_abs))
             portfolio_session_returns.append(float(equity / max(session_start_equity, 1.0e-12) - 1.0))
+            portfolio_session_turnover.append(float(portfolio_turnover))
         minute_score = float(np.mean(portfolio_session_returns) * 252.0 - max((1.0 - equity / max(peak, 1.0e-12)), 0.0))
         max_dd = float(max((row["drawdown"] for row in minute_rows if row["portfolio_pk"] == str(candidate.portfolio_pk)), default=0.0))
-        minute_turnover = float(
-            session_paths.loc[session_paths["portfolio_pk"] == str(candidate.portfolio_pk), "turnover"].mean()
-        )
+        minute_turnover = float(np.mean(portfolio_session_turnover) if portfolio_session_turnover else 0.0)
         summary_rows.append(
             {
                 "portfolio_pk": str(candidate.portfolio_pk),

@@ -17,8 +17,8 @@ def test_project_to_feasible_weights_respects_caps():
         priority_scores=np.asarray([1.0, 0.5], dtype=np.float64),
         config=cfg,
     )
-    assert result.cash_weight >= cfg.generator.minimum_cash_weight - 1.0e-12
-    assert np.all(result.weights <= cfg.generator.per_sleeve_cap + 1.0e-12)
+    assert result.cash_weight >= cfg.simulator.min_cash_weight - 1.0e-12
+    assert np.all(result.weights <= cfg.simulator.max_sleeve_weight + 1.0e-12)
 
 
 def test_check_path_constraints_flags_breach():
@@ -29,7 +29,8 @@ def test_check_path_constraints_flags_breach():
         cash_weight=0.0,
         config=make_test_config(),
         overnight_active_count=10,
+        buying_power_headroom=-0.1,
     )
     assert "capital_floor_hit" in flags
     assert "gross_limit_breach" in flags
-
+    assert "buying_power_breach" in flags

@@ -9,7 +9,7 @@ import pandas as pd
 from scipy import sparse
 from numpy.lib.format import open_memmap
 
-from module6.calendar import build_portfolio_calendar
+from module6.calendar import build_portfolio_calendar_frame
 from module6.config import Module6Config
 from module6.constants import BASE_AVAIL_ACTIVE_CODES
 from module6.utils import Module6ValidationError, ensure_directory
@@ -18,6 +18,7 @@ from module6.utils import Module6ValidationError, ensure_directory
 @dataclass(frozen=True)
 class MatrixStore:
     calendar: np.ndarray
+    calendar_index_path: Path
     column_index: pd.DataFrame
     returns_exec_path: Path
     returns_raw_path: Path
@@ -26,6 +27,7 @@ class MatrixStore:
     state_code_path: Path
     gross_peak_path: Path
     gross_mean_path: Path
+    buying_power_min_path: Path
     overnight_flag_path: Path
     family_incidence_path: Path
     regime_exposure_path: Path
@@ -56,9 +58,11 @@ def build_matrix_store(
     canonical_instances = canonical_instances.sort_values(["strategy_instance_pk"], kind="mergesort").reset_index(drop=True)
     if canonical_instances.shape[0] <= 0:
         raise Module6ValidationError("no admitted canonical portfolio instances available for matrix build")
-    calendar = build_portfolio_calendar(session_ledger)
+    calendar_frame = build_portfolio_calendar_frame(strategy_session_returns=session_ledger, equity_curves=run.equity_curves)
+    calendar = np.asarray(calendar_frame.sessions, dtype=np.int64)
     T = int(calendar.shape[0])
     N = int(canonical_instances.shape[0])
+    calendar_frame.frame.to_parquet(out_dir / "calendar_index.parquet", index=False)
     column_index = canonical_instances[
         ["strategy_instance_pk", "strategy_pk", "candidate_id", "family_id", "hypothesis_id"]
     ].copy()
@@ -74,6 +78,7 @@ def build_matrix_store(
     state_codes = _write_dense_matrix(out_dir / "availability_state_codes.npy", (T, N), np.int16)
     gross_peak = _write_dense_matrix(out_dir / "gross_mult_peak.npy", (T, N), np.float32)
     gross_mean = _write_dense_matrix(out_dir / "gross_mult_mean.npy", (T, N), np.float32)
+    buying_power_min = _write_dense_matrix(out_dir / "buying_power_min.npy", (T, N), np.float32)
     overnight_flag = _write_dense_matrix(out_dir / "overnight_flag.npy", (T, N), np.int8)
 
     session_index = {int(s): i for i, s in enumerate(calendar.tolist())}
@@ -85,6 +90,7 @@ def build_matrix_store(
     state_codes[:, :] = 0
     gross_peak[:, :] = 0.0
     gross_mean[:, :] = 0.0
+    buying_power_min[:, :] = 0.0
     overnight_flag[:, :] = 0
 
     canonical_sessions = session_ledger.loc[
@@ -100,6 +106,7 @@ def build_matrix_store(
         availability[t, n] = bool(int(row.availability_state_code) in BASE_AVAIL_ACTIVE_CODES)
         gross_peak[t, n] = np.float32(float(row.gross_mult_peak))
         gross_mean[t, n] = np.float32(float(row.gross_mult_mean))
+        buying_power_min[t, n] = np.float32(float(getattr(row, "buying_power_min_frac", row.buying_power_min)))
         overnight_flag[t, n] = np.int8(int(row.overnight_flag))
     for name, arr in {
         "returns_exec": np.asarray(returns_exec),
@@ -167,8 +174,9 @@ def build_matrix_store(
         state_code_path=out_dir / "availability_state_codes.npy",
         gross_peak_path=out_dir / "gross_mult_peak.npy",
         gross_mean_path=out_dir / "gross_mult_mean.npy",
+        buying_power_min_path=out_dir / "buying_power_min.npy",
         overnight_flag_path=out_dir / "overnight_flag.npy",
+        calendar_index_path=out_dir / "calendar_index.parquet",
         family_incidence_path=out_dir / "family_incidence.npz",
         regime_exposure_path=out_dir / "regime_exposure.npy",
     )
-
