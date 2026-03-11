@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from weightiz_feature_tensor_cache import compute_tensor_hash
+from weightiz.shared.io.feature_tensor_cache import compute_tensor_hash
 
 
 def test_profile_cache_hash_changes_on_config_change():

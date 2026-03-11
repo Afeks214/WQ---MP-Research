@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-import weightiz_module5_harness as h
+import weightiz.module5.orchestrator as h
 
 
 def test_workers_cannot_write_strategy_ledger(tmp_path, monkeypatch):

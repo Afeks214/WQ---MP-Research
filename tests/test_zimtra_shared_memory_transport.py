@@ -1,6 +1,6 @@
 import numpy as np
 
-from weightiz_profile_engine import attach_shared_buffers, cleanup_shared_buffers, write_shared_buffers
+from weightiz.shared.io.profile_engine import attach_shared_buffers, cleanup_shared_buffers, write_shared_buffers
 
 
 def test_shared_memory_attach_readonly_views() -> None:

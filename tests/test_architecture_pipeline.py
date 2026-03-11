@@ -6,9 +6,9 @@ import pytest
 
 import run_research
 import sweep_runner
-import weightiz_module2_core as m2
-import weightiz_module4_strategy_funnel as m4
-import weightiz_module5_harness as h
+import weightiz.module2.core as m2
+import weightiz.module4.strategy_funnel as m4
+import weightiz.module5.orchestrator as h
 
 
 def test_single_runtime_dispatch_and_sweep_stub() -> None:

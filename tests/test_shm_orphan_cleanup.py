@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import weightiz_shared_feature_store as shm_mod
+import weightiz.shared.io.shared_feature_store as shm_mod
 
 
 class _FakeShm:

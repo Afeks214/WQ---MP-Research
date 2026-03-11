@@ -6,15 +6,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from module2.feature_engine_shared_memory import SharedMemoryFeatureEngine
-from module2.market_profile_engine import (
+from weightiz.module2.feature_engine_shared_memory import SharedMemoryFeatureEngine
+from weightiz.module2.market_profile_engine import (
     GoldenManifest,
     benchmark_memory_layout,
     verify_golden_manifest,
 )
-from module2.tensor_builder import RollingMoments, apply_rolling_update, init_rolling_profile_state
-from weightiz_module1_core import EngineConfig, preallocate_state
-from weightiz_module2_core import Module2Config, run_weightiz_profile_engine
+from weightiz.module2.tensor_builder import RollingMoments, apply_rolling_update, init_rolling_profile_state
+from weightiz.module1.core import EngineConfig, preallocate_state
+from weightiz.module2.core import Module2Config, run_weightiz_profile_engine
 
 
 def _state(T: int = 80, A: int = 2):

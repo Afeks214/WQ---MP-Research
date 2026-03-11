@@ -3,10 +3,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from module6.dependence import build_covariance_bundle
-from module6.psd import enforce_psd
-from module6.config import DependenceConfig
-from module6.utils import Module6ValidationError
+from weightiz.module6.dependence import build_covariance_bundle
+from weightiz.module6.psd import enforce_psd
+from weightiz.module6.config import DependenceConfig
+from weightiz.module6.utils import Module6ValidationError
 
 
 def test_enforce_psd_rejects_large_negative_mass():

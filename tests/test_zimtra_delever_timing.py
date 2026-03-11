@@ -1,6 +1,6 @@
 import numpy as np
 
-from risk_engine import CostConfig, RiskConfig, simulate_portfolio_task
+from weightiz.module4.risk_engine import CostConfig, RiskConfig, simulate_portfolio_task
 
 
 def test_delever_executes_at_1546_after_1545_check() -> None:

@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from weightiz_module1_core import (
+from weightiz.module1.core import (
     FeatureEngineConfig,
     FeatureSpec,
     build_feature_dag,

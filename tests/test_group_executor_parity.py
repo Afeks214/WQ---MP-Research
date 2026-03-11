@@ -10,11 +10,11 @@ import numpy as np
 pd = pytest.importorskip("pandas")
 from pandas.testing import assert_frame_equal
 
-import weightiz_module5_harness as h
-from weightiz_module1_core import EngineConfig
-from weightiz_module2_core import Module2Config
-from weightiz_module3_structure import Module3Config
-from weightiz_module4_strategy_funnel import Module4Config
+import weightiz.module5.orchestrator as h
+from weightiz.module1.core import EngineConfig
+from weightiz.module2.core import Module2Config
+from weightiz.module3.bridge import Module3Config
+from weightiz.module4.strategy_funnel import Module4Config
 
 
 def _cfg(T: int, A: int) -> EngineConfig:

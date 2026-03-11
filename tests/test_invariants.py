@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from weightiz_invariants import assert_or_flag_finite
+from weightiz.shared.validation.invariants import assert_or_flag_finite
 
 
 class TestInvariants(unittest.TestCase):

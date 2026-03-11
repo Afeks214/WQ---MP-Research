@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from weightiz_feature_tensor_cache import (
+from weightiz.shared.io.feature_tensor_cache import (
     build_manifest,
     load_tensor_cache,
     save_tensor_cache,

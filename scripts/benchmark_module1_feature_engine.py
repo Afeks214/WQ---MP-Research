@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from weightiz_module1_core import FeatureEngineConfig, build_feature_tensor, make_compat_feature_specs
+from weightiz.module1.core import FeatureEngineConfig, build_feature_tensor, make_compat_feature_specs
 
 
 def _build_data(T: int, A: int, seed: int) -> dict[str, np.ndarray]:

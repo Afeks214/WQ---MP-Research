@@ -10,7 +10,7 @@ try:
 except Exception:  # pragma: no cover
     pd = None
 
-from weightiz_data.cleaning import canonicalize_alpaca_bars, run_post_clean_qa_or_raise
+from weightiz.shared.io.market_data.cleaning import canonicalize_alpaca_bars, run_post_clean_qa_or_raise
 
 HAS_XCALS = find_spec("exchange_calendars") is not None
 

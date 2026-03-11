@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from weightiz_module1_core import (
+from weightiz.module1.core import (
     EngineConfig,
     NS_PER_MIN,
     _build_session_clock_reference,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 
-import weightiz_module5_harness as h
+import weightiz.module5.orchestrator as h
 
 
 def test_worker_group_task_uses_risk_engine_only() -> None:

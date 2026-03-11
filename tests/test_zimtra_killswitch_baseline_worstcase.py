@@ -1,6 +1,6 @@
 import numpy as np
 
-from risk_engine import CostConfig, RiskConfig, simulate_portfolio_task
+from weightiz.module4.risk_engine import CostConfig, RiskConfig, simulate_portfolio_task
 
 
 def test_killswitch_uses_worstcase_and_flattens_next_open() -> None:

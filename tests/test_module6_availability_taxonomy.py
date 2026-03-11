@@ -4,11 +4,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from module6.constants import AVAIL_FORCED_CASH_BY_RISK, AVAIL_FORCED_ZERO_BY_PORTFOLIO, AVAIL_INVALIDATED_BY_DQ, AVAIL_OBSERVED_ACTIVE, AVAIL_OBSERVED_FLAT, AVAIL_STRUCTURALLY_MISSING
-from module6.io import load_module5_run
-from module6.ledger import materialize_canonical_ledgers
-from module6.utils import Module6ValidationError
-from module6.utils import state_code_to_bool
+from weightiz.module6.constants import AVAIL_FORCED_CASH_BY_RISK, AVAIL_FORCED_ZERO_BY_PORTFOLIO, AVAIL_INVALIDATED_BY_DQ, AVAIL_OBSERVED_ACTIVE, AVAIL_OBSERVED_FLAT, AVAIL_STRUCTURALLY_MISSING
+from weightiz.module6.io import load_module5_run
+from weightiz.module6.ledger import materialize_canonical_ledgers
+from weightiz.module6.utils import Module6ValidationError
+from weightiz.module6.utils import state_code_to_bool
 from tests.module6_testkit import build_synthetic_module5_run, make_test_config
 
 

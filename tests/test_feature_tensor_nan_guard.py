@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from weightiz_module2_core import validate_feature_tensor_contract
+from weightiz.module2.core import validate_feature_tensor_contract
 
 
 def test_feature_tensor_nan_guard_raises():

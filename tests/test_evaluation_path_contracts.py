@@ -7,7 +7,7 @@ import pytest
 
 pd = pytest.importorskip("pandas")
 
-from module5.harness.evaluation_path import (
+from weightiz.module5.harness.evaluation_path import (
     assert_artifact_dependency_contract,
     collect_funnel_payload,
     collect_micro_diagnostics_payload,
@@ -16,16 +16,16 @@ from module5.harness.evaluation_path import (
     materialize_risk_outputs_into_state,
     trade_log_payload,
 )
-from module5.harness.state_overlay import (
+from weightiz.module5.harness.state_overlay import (
     BaseTensorState,
     CandidateScratch,
     CombinedStateView,
     FeatureOverlay,
     MarketOverlay,
 )
-from weightiz_module1_core import EngineConfig, Phase, ProfileStatIdx, ScoreIdx, preallocate_state
-from weightiz_module3_structure import ContextIdx
-from weightiz_module4_strategy_funnel import RegimeIdx
+from weightiz.module1.core import EngineConfig, Phase, ProfileStatIdx, ScoreIdx, preallocate_state
+from weightiz.module3.bridge import ContextIdx
+from weightiz.module4.strategy_funnel import RegimeIdx
 
 
 def _timestamps_two_sessions() -> np.ndarray:

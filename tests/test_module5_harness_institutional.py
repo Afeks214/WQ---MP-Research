@@ -17,12 +17,12 @@ try:
 except Exception:  # pragma: no cover
     pd = None  # type: ignore[assignment]
 
-from weightiz_module1_core import EngineConfig, deterministic_digest_sha256, preallocate_state, validate_state_hard
-from weightiz_module2_core import Module2Config
-from weightiz_module3_structure import ContextIdx, Module3Config, Module3Output, Struct30mIdx
-from weightiz_module4_strategy_funnel import Module4Config, Module4SignalOutput
+from weightiz.module1.core import EngineConfig, deterministic_digest_sha256, preallocate_state, validate_state_hard
+from weightiz.module2.core import Module2Config
+from weightiz.module3.bridge import ContextIdx, Module3Config, Module3Output, Struct30mIdx
+from weightiz.module4.strategy_funnel import Module4Config, Module4SignalOutput
 from run_research import HarnessConfigModel
-import weightiz_module5_harness as h
+import weightiz.module5.orchestrator as h
 
 
 @unittest.skipIf(pd is None, "pandas not available")

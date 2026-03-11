@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from regime_detector import RegimeConfig, build_regime_masks, detect_regimes, regime_sample_counts
+from weightiz.module5.regime_detector import RegimeConfig, build_regime_masks, detect_regimes, regime_sample_counts
 
 
 class TestRegimeDetector(unittest.TestCase):

@@ -1,4 +1,4 @@
-from risk_engine import CostConfig, _trade_costs
+from weightiz.module4.risk_engine import CostConfig, _trade_costs
 
 
 def test_short_entry_locate_fee_applied() -> None:

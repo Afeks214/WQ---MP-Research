@@ -5,8 +5,8 @@ import os
 import numpy as np
 import pytest
 
-from weightiz_module1_core import EngineConfig, preallocate_state
-from weightiz_module2_core import Module2Config, run_weightiz_profile_engine
+from weightiz.module1.core import EngineConfig, preallocate_state
+from weightiz.module2.core import Module2Config, run_weightiz_profile_engine
 
 
 def test_module2_worker_execution_forbidden() -> None:

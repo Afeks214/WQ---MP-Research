@@ -15,8 +15,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from engine.hpc_market_profile_parity import compute_market_profile_features
-from engine.profile_sanity_plots import generate_profile_sanity_plots
+from weightiz.shared.io.hpc_market_profile_parity import compute_market_profile_features
+from weightiz.shared.io.profile_sanity_plots import generate_profile_sanity_plots
 
 
 def _canonical_hash(df: pd.DataFrame) -> str:

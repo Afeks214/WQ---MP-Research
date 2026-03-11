@@ -8,9 +8,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from module6.config import GeneratorConfig, IntakeConfig, Module6Config, ScoringConfig
-from module6.orchestrator import run_module6_portfolio_research
-from module5.harness.module6_bridge import (
+from weightiz.module6.config import GeneratorConfig, IntakeConfig, Module6Config, ScoringConfig
+from weightiz.module6.orchestrator import run_module6_portfolio_research
+from weightiz.module5.harness.module6_bridge import (
     AVAIL_OBSERVED_ACTIVE,
     AVAIL_OBSERVED_FLAT,
     AVAIL_STRUCTURALLY_MISSING,

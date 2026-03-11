@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
 
-from weightiz_module1_core import (
+from weightiz.module1.core import (
     EngineConfig,
     Phase,
     ProfileStatIdx,
@@ -9,7 +9,7 @@ from weightiz_module1_core import (
     deterministic_digest_sha256,
     preallocate_state,
 )
-from weightiz_module2_core import (
+from weightiz.module2.core import (
     Module2Config,
     _rolling_median_mad_causal,
     compute_value_area_greedy,

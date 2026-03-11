@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import numpy as np
 
-from module6.io import load_module5_run
-from module6.ledger import materialize_canonical_ledgers
-from module6.matrices import build_matrix_store
-from module6.runtime import open_matrix_store
+from weightiz.module6.io import load_module5_run
+from weightiz.module6.ledger import materialize_canonical_ledgers
+from weightiz.module6.matrices import build_matrix_store
+from weightiz.module6.runtime import open_matrix_store
 from tests.module6_testkit import build_synthetic_module5_run, make_test_config
 
 

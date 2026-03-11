@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import run_research as rr
-from weightiz_validation_suite import run_preflight_validation_suite
+from weightiz.shared.validation.validation_suite import run_preflight_validation_suite
 
 
 def test_configure_deterministic_runtime_sets_env_and_seed(monkeypatch):

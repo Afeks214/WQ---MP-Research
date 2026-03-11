@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from weightiz_runtime_monitor import RuntimeMonitor
+from weightiz.shared.logging.runtime_monitor import RuntimeMonitor
 
 
 def test_runtime_monitor_emits_health_rows(tmp_path: Path) -> None:

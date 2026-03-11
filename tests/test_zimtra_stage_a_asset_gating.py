@@ -1,6 +1,6 @@
 import numpy as np
 
-from risk_engine import CostConfig, RiskConfig, simulate_portfolio_task
+from weightiz.module4.risk_engine import CostConfig, RiskConfig, simulate_portfolio_task
 
 
 def test_stage_a_active_asset_gating_only_trades_selected_assets() -> None:

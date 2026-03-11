@@ -24,8 +24,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import run_research
-from engine.hpc_market_profile_parity import compute_market_profile_features
-from strategy_engine import generate_strategy_specs
+from weightiz.shared.io.hpc_market_profile_parity import compute_market_profile_features
+from weightiz.module5.strategy_engine import generate_strategy_specs
 
 SYMBOLS = ("EEM", "GLD", "HYG", "IWM", "QQQ", "SPY", "TLT", "XLE", "XLK", "XLU")
 WINDOWS = (30, 45, 60)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from module5.harness.group_executor import GroupExecutionTask, build_group_execution_tasks
+from weightiz.module5.harness.group_executor import GroupExecutionTask, build_group_execution_tasks
 
 
 @dataclass(frozen=True)

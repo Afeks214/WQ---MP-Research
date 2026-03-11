@@ -29,21 +29,21 @@ try:
 except Exception as exc:  # pragma: no cover
     raise RuntimeError("pyyaml is required. Install with: pip install pyyaml") from exc
 
-from weightiz_module1_core import EngineConfig
-from weightiz_module2_core import Module2Config
-from weightiz_module3_structure import Module3Config
-from weightiz_module4_strategy_funnel import Module4Config
-from weightiz_module5_harness import (
+from weightiz.module1.core import EngineConfig
+from weightiz.module2.core import Module2Config
+from weightiz.module3.bridge import Module3Config
+from weightiz.module4.strategy_funnel import Module4Config
+from weightiz.module5.orchestrator import (
     CandidateSpec,
     Module5HarnessConfig,
     StressScenario,
     run_weightiz_harness,
 )
-from weightiz_self_audit import run_full_self_audit
-from weightiz_architecture_guard import run_architecture_consistency_check
-from weightiz_validation_suite import run_preflight_validation_suite
-from weightiz_system_logger import get_logger, log_event
-from app.config_models import (
+from weightiz.shared.validation.self_audit import run_full_self_audit
+from weightiz.shared.validation.architecture_guard import run_architecture_consistency_check
+from weightiz.shared.validation.validation_suite import run_preflight_validation_suite
+from weightiz.shared.logging.system_logger import get_logger, log_event
+from weightiz.shared.config.models import (
     CandidateSpecModel,
     CandidatesModel,
     DataConfigModel,
@@ -56,7 +56,7 @@ from app.config_models import (
     SearchConfigModel,
     StressScenarioModel,
 )
-from app.config_builders import (
+from weightiz.shared.config.builders import (
     build_candidates as _cfg_build_candidates,
     build_engine_config as _cfg_build_engine_config,
     build_harness_config as _cfg_build_harness_config,
@@ -66,20 +66,20 @@ from app.config_builders import (
     build_stress_scenarios as _cfg_build_stress_scenarios,
     resolve_tick_size as _cfg_resolve_tick_size,
 )
-from app.runtime_support import (
+from weightiz.shared.io.runtime_support import (
     append_run_registry as _runtime_append_run_registry,
-    ensure_dashboard_handoff as _runtime_ensure_dashboard_handoff,
+    ensure_run_artifact_link as _runtime_ensure_run_artifact_link,
     resolved_config_sha256 as _runtime_resolved_config_sha256,
 )
-from app.data_resolution import (
+from weightiz.shared.io.data_resolution import (
     find_col as _data_find_col,
     in_memory_date_filter_loader as _data_in_memory_date_filter_loader,
     require_pandas as _data_require_pandas,
     resolve_data_paths as _data_resolve_data_paths,
 )
-from app.stage_a_discovery import parse_stage_a_window_set
-from module6 import Module6Config, run_module6_portfolio_research
-from module5.harness.artifact_writers import write_json as _artifact_write_json
+from weightiz.module5.stage_a_discovery import parse_stage_a_window_set
+from weightiz.module6 import Module6Config, run_module6_portfolio_research
+from weightiz.module5.harness.artifact_writers import write_json as _artifact_write_json
 
 
 def _require_pandas() -> Any:
@@ -154,8 +154,8 @@ def _resolved_config_sha256(cfg: RunConfigModel) -> str:
     return _runtime_resolved_config_sha256(cfg)
 
 
-def _ensure_dashboard_handoff(artifacts_root: Path, run_dir: Path) -> Path:
-    return _runtime_ensure_dashboard_handoff(artifacts_root, run_dir)
+def _ensure_run_artifact_link(artifacts_root: Path, run_dir: Path) -> Path:
+    return _runtime_ensure_run_artifact_link(artifacts_root, run_dir)
 
 
 def _load_config(path: Path) -> RunConfigModel:
@@ -693,7 +693,7 @@ def main() -> None:
 
     report_root = Path(harness_cfg.report_dir).resolve()
     artifacts_root = report_root.parent if report_root.name == "module5_harness" else report_root
-    _ensure_dashboard_handoff(artifacts_root, run_dir)
+    _ensure_run_artifact_link(artifacts_root, run_dir)
     _append_run_registry(
         artifacts_root=artifacts_root,
         run_id=run_id,

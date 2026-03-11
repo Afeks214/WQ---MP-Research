@@ -78,7 +78,7 @@ def test_run_research_fails_closed_when_module6_blocks(tmp_path, monkeypatch):
     monkeypatch.setattr(run_research, "_build_stress_scenarios", lambda cfg: None)
     monkeypatch.setattr(run_research, "_build_candidates", lambda cfg: [])
     monkeypatch.setattr(run_research, "run_weightiz_harness", lambda **kwargs: dummy_out)
-    monkeypatch.setattr(run_research, "_ensure_dashboard_handoff", lambda *args, **kwargs: Path(tmp_path))
+    monkeypatch.setattr(run_research, "_ensure_run_artifact_link", lambda *args, **kwargs: Path(tmp_path))
     monkeypatch.setattr(run_research, "_append_run_registry", lambda **kwargs: None)
     monkeypatch.setattr(run_research, "_artifact_write_json", lambda path, payload: Path(path).write_text(json.dumps(payload), encoding="utf-8"))
     monkeypatch.setattr(run_research, "get_logger", lambda name: logging.getLogger(name))

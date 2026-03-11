@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from strategy_engine import generate_sobol_strategy_specs, strategy_payload
-from weightiz_adaptive_search import adaptive_search
+from weightiz.module5.strategy_engine import generate_sobol_strategy_specs, strategy_payload
+from weightiz.module5.adaptive_search import adaptive_search
 
 
 RANGES = {

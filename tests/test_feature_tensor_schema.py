@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from weightiz_module2_core import build_feature_tensor_multiaxis, validate_feature_tensor_contract
+from weightiz.module2.core import build_feature_tensor_multiaxis, validate_feature_tensor_contract
 
 
 def test_feature_tensor_schema_shape_and_dtype():

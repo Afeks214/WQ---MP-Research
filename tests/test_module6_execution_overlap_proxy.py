@@ -4,9 +4,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from module6.execution_overlap import build_execution_overlap_proxy
-from module6.config import DependenceConfig
-from module6.utils import Module6ValidationError
+from weightiz.module6.execution_overlap import build_execution_overlap_proxy
+from weightiz.module6.config import DependenceConfig
+from weightiz.module6.utils import Module6ValidationError
 
 
 def test_execution_overlap_proxy_component_correctness():

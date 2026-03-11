@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from module4.strategy_intent_engine import generate_strategy_intent
-from weightiz_module1_core import ProfileStatIdx, ScoreIdx
-from weightiz_module4_strategy_funnel import Module4Config
+from weightiz.module4.strategy_intent_engine import generate_strategy_intent
+from weightiz.module1.core import ProfileStatIdx, ScoreIdx
+from weightiz.module4.strategy_funnel import Module4Config
 
 
 def test_intent_generation_is_mutually_exclusive_and_flat_on_mask() -> None:

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from module4.allocation_engine import compute_normalized_signal_allocation
-from weightiz_module4_strategy_funnel import Module4Config
+from weightiz.module4.allocation_engine import compute_normalized_signal_allocation
+from weightiz.module4.strategy_funnel import Module4Config
 
 
 def test_allocation_math_and_ranking_are_locked() -> None:

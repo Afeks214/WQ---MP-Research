@@ -2,7 +2,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from weightiz_module1_core import EngineConfig, build_session_clock_vectorized
+from weightiz.module1.core import EngineConfig, build_session_clock_vectorized
 
 
 class TestTimezoneDST(unittest.TestCase):

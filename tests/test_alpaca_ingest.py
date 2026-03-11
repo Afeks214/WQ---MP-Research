@@ -8,8 +8,8 @@ try:
 except Exception:  # pragma: no cover
     pd = None
 
-from weightiz_data.alpaca_client import AlpacaClient
-from weightiz_data.cleaning import _apply_session_policy, canonicalize_alpaca_bars, deduplicate_canonical_minutes
+from weightiz.shared.io.market_data.alpaca_client import AlpacaClient
+from weightiz.shared.io.market_data.cleaning import _apply_session_policy, canonicalize_alpaca_bars, deduplicate_canonical_minutes
 
 
 HAS_XCALS = find_spec("exchange_calendars") is not None

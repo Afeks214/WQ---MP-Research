@@ -3,10 +3,10 @@ from unittest.mock import patch
 
 import numpy as np
 
-from module3.structural_context_builder import build_context_tensor
-from weightiz_module1_core import EngineConfig, Phase, ProfileStatIdx, ScoreIdx, preallocate_state
-import weightiz_module3_structure as module3
-from weightiz_module3_structure import (
+from weightiz.module3.structural_context_builder import build_context_tensor
+from weightiz.module1.core import EngineConfig, Phase, ProfileStatIdx, ScoreIdx, preallocate_state
+import weightiz.module3.bridge as module3
+from weightiz.module3.bridge import (
     ContextIdx,
     Module3Config,
     Struct30mIdx,

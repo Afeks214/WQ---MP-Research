@@ -1,6 +1,6 @@
 import numpy as np
 
-from risk_engine import CostConfig, RiskConfig, simulate_portfolio_task
+from weightiz.module4.risk_engine import CostConfig, RiskConfig, simulate_portfolio_task
 
 
 def test_realized_pnl_uses_pre_update_average_price() -> None:

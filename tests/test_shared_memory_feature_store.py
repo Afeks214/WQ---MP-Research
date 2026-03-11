@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from weightiz_shared_feature_store import attach_shared_feature_store, close_shared_feature_store, create_shared_feature_store
+from weightiz.shared.io.shared_feature_store import attach_shared_feature_store, close_shared_feature_store, create_shared_feature_store
 
 
 def test_shared_feature_store_attach_readonly():

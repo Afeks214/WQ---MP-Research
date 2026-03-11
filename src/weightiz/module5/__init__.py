@@ -1,1 +1,1 @@
-"""Canonical Weightiz Module 5 package placeholder."""
+"""Module5 internal packages."""

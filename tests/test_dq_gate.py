@@ -9,7 +9,7 @@ try:
 except Exception:  # pragma: no cover
     pd = None  # type: ignore[assignment]
 
-from weightiz_dq import DQ_ACCEPT, DQ_DEGRADE, DQ_REJECT, dq_apply, dq_validate
+from weightiz.shared.validation.dq import DQ_ACCEPT, DQ_DEGRADE, DQ_REJECT, dq_apply, dq_validate
 
 
 @unittest.skipIf(pd is None, "pandas not available")

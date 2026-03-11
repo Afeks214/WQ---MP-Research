@@ -5,13 +5,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-import module4.strategy_funnel_engine as funnel_engine
-from module3 import ContextIdx, StructIdx
-from module4.contracts import build_module4_input_contracts
-from module4.strategy_funnel_engine import Module4DecisionOutput, run_module4_funnel
-from module4.telemetry import DecisionReasonCode
-from weightiz_module1_core import ProfileStatIdx, ScoreIdx
-from weightiz_module4_strategy_funnel import Module4Config, Module4SignalOutput, run_module4_signal_funnel
+import weightiz.module4.strategy_funnel_engine as funnel_engine
+from weightiz.module3 import ContextIdx, StructIdx
+from weightiz.module4.contracts import build_module4_input_contracts
+from weightiz.module4.strategy_funnel_engine import Module4DecisionOutput, run_module4_funnel
+from weightiz.module4.telemetry import DecisionReasonCode
+from weightiz.module1.core import ProfileStatIdx, ScoreIdx
+from weightiz.module4.strategy_funnel import Module4Config, Module4SignalOutput, run_module4_signal_funnel
 
 
 def _sample_contracts(A: int = 2, T: int = 4, W: int = 2, *, with_risk: bool = False):
@@ -171,7 +171,7 @@ def test_non_finite_stage_output_invalidates_cell_when_fail_soft(monkeypatch: py
 
 
 def test_orchestration_order_smoke(monkeypatch: pytest.MonkeyPatch) -> None:
-    import module4.strategy_funnel_engine as eng
+    import weightiz.module4.strategy_funnel_engine as eng
 
     calls: list[str] = []
     contracts = _sample_contracts(A=1, T=1)

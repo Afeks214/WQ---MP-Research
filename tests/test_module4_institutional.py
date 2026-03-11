@@ -5,9 +5,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from module3 import ContextIdx, StructIdx
-from weightiz_module1_core import EngineConfig, Phase, ProfileStatIdx, ScoreIdx, preallocate_state
-from weightiz_module4_strategy_funnel import (
+from weightiz.module3 import ContextIdx, StructIdx
+from weightiz.module1.core import EngineConfig, Phase, ProfileStatIdx, ScoreIdx, preallocate_state
+from weightiz.module4.strategy_funnel import (
     Module4Config,
     _execute_to_target,
     run_module4_signal_funnel,

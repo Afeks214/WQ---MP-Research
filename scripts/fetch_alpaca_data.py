@@ -28,8 +28,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from weightiz_data.alpaca_client import AlpacaAPIError, AlpacaClient
-from weightiz_data.cleaning import (
+from weightiz.shared.io.market_data.alpaca_client import AlpacaAPIError, AlpacaClient
+from weightiz.shared.io.market_data.cleaning import (
     CANONICAL_COLUMNS,
     canonicalize_alpaca_bars,
     merge_canonical_frames,

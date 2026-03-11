@@ -4,7 +4,15 @@ from pathlib import Path
 
 import pytest
 
-from weightiz_self_audit import run_full_self_audit
+from weightiz.shared.validation.self_audit import run_full_self_audit
+
+
+SOURCE_PATHS = {
+    "weightiz_module4_strategy_funnel.py": "src/weightiz/module4/strategy_funnel.py",
+    "weightiz_module5_harness.py": "src/weightiz/module5/orchestrator.py",
+    "risk_engine.py": "src/weightiz/module4/risk_engine.py",
+    "weightiz_shared_feature_store.py": "src/weightiz/shared/io/shared_feature_store.py",
+}
 
 
 def _root() -> Path:
@@ -12,7 +20,7 @@ def _root() -> Path:
 
 
 def _src(path: str) -> str:
-    return (_root() / path).read_text(encoding="utf-8")
+    return (_root() / SOURCE_PATHS.get(path, path)).read_text(encoding="utf-8")
 
 
 def test_self_audit_passes_and_writes_report(tmp_path: Path) -> None:
@@ -72,7 +80,7 @@ def test_self_audit_fails_on_float32_usage() -> None:
 
 
 def test_self_audit_fails_on_multiple_runtime_entrypoints() -> None:
-    bad_sweep = "from weightiz_module5_harness import run_weightiz_harness\nrun_weightiz_harness()\n"
+    bad_sweep = "from weightiz.module5.orchestrator import run_weightiz_harness\nrun_weightiz_harness()\n"
     with pytest.raises(RuntimeError, match="SELF_AUDIT_FAILURE"):
         run_full_self_audit(
             project_root=_root(),

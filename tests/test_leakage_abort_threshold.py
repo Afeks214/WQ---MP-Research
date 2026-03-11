@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from weightiz_module2_core import compute_window_correlation_diagnostics
+from weightiz.module2.core import compute_window_correlation_diagnostics
 
 
 def test_window_leakage_abort_threshold(tmp_path):

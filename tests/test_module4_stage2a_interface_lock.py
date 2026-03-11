@@ -3,12 +3,12 @@ from __future__ import annotations
 import inspect
 from dataclasses import fields
 
-from module3 import ContextIdx, StructIdx
-from module4.allocation_engine import AllocationResult, compute_normalized_signal_allocation
-from module4.conviction_engine import ConvictionResult, compute_conviction
-from module4.regime_classifier import RegimeClassificationResult, classify_regime
-from module4.strategy_intent_engine import StrategyIntentResult, generate_strategy_intent
-from weightiz_module4_strategy_funnel import Module4SignalOutput
+from weightiz.module3 import ContextIdx, StructIdx
+from weightiz.module4.allocation_engine import AllocationResult, compute_normalized_signal_allocation
+from weightiz.module4.conviction_engine import ConvictionResult, compute_conviction
+from weightiz.module4.regime_classifier import RegimeClassificationResult, classify_regime
+from weightiz.module4.strategy_intent_engine import StrategyIntentResult, generate_strategy_intent
+from weightiz.module4.strategy_funnel import Module4SignalOutput
 
 
 def test_struct_and_context_indices_are_locked() -> None:

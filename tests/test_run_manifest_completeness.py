@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from pathlib import Path
+import inspect
+
+import weightiz.module5.orchestrator as h
 
 
 def test_manifest_required_fields_present_in_harness_source():
-    src = Path("weightiz_module5_harness.py").read_text(encoding="utf-8")
+    src = inspect.getsource(h)
     required = [
         "git_commit",
         "config_hash",

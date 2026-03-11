@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-import weightiz_module5_harness as harness
+import weightiz.module5.orchestrator as harness
 from scripts import run_sweep_auto as sweep_auto
 
 

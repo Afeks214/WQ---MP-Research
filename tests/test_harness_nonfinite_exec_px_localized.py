@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import weightiz_module5_harness as h
+import weightiz.module5.orchestrator as h
 
 
 class TestHarnessNonFiniteExecPxLocalized(unittest.TestCase):

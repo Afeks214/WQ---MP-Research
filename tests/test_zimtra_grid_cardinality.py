@@ -1,4 +1,4 @@
-from strategy_engine import EXPECTED_BASE_STRATEGY_COUNT, family_counts, generate_strategy_specs
+from weightiz.module5.strategy_engine import EXPECTED_BASE_STRATEGY_COUNT, family_counts, generate_strategy_specs
 
 
 def test_grid_cardinality_exact_15120() -> None:

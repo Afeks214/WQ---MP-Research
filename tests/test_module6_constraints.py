@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from module6.constraints import check_path_constraints, project_to_feasible_weights
+from weightiz.module6.constraints import check_path_constraints, project_to_feasible_weights
 from tests.module6_testkit import make_test_config
 
 

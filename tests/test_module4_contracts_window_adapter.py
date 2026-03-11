@@ -3,12 +3,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from module4.contracts import (
+from weightiz.module4.contracts import (
     RiskFilterConfig,
     apply_optional_risk_filters,
     build_module4_input_contracts,
 )
-from module4.window_adapter import WindowAdapterConfig, adapt_windows
+from weightiz.module4.window_adapter import WindowAdapterConfig, adapt_windows
 
 
 def _sample_inputs(A: int = 2, T: int = 5, W: int = 3):

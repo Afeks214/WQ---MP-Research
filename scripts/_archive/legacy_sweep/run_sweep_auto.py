@@ -400,7 +400,7 @@ def probe_symbol_dq_metrics(
         repo_str = str(REPO_ROOT)
         if repo_str not in sys.path:
             sys.path.insert(0, repo_str)
-        from weightiz_dq import DQ_ACCEPT, DQ_DEGRADE, DQ_REJECT, dq_validate
+        from weightiz.shared.validation.dq import DQ_ACCEPT, DQ_DEGRADE, DQ_REJECT, dq_validate
     except Exception as exc:
         return SymbolDQProbe(
             symbol=str(symbol),

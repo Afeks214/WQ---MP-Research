@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-from app.stage_a_discovery import (
+from weightiz.module5.stage_a_discovery import (
     STAGE_A_CAMPAIGN_ID,
     STAGE_A_DATA_END_UTC,
     STAGE_A_DATA_START_UTC,

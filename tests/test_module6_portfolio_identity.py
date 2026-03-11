@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from module6.utils import portfolio_pk
+from weightiz.module6.utils import portfolio_pk
 
 
 def test_portfolio_pk_changes_when_policy_changes():

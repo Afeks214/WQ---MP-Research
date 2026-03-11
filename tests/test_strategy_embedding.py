@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from strategy_embedding import (
+from weightiz.module5.strategy_embedding import (
     build_strategy_embeddings,
     cluster_strategies_hierarchical_threshold,
     compute_correlation_distance,

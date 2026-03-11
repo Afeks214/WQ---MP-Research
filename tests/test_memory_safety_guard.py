@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from weightiz_shared_feature_store import enforce_memory_safety, estimate_tensor_bytes
+from weightiz.shared.io.shared_feature_store import enforce_memory_safety, estimate_tensor_bytes
 
 
 def test_memory_safety_guard_raises():

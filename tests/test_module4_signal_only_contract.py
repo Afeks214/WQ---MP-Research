@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import inspect
-from pathlib import Path
 
-import weightiz_module4_strategy_funnel as m4
+import weightiz.module4.strategy_funnel as m4
 
 
 def test_signal_only_api_exists():
-    src = Path("weightiz_module4_strategy_funnel.py").read_text(encoding="utf-8")
+    src = inspect.getsource(m4)
     assert "def run_module4_signal_funnel" in src
     assert "class Module4SignalOutput" in src
 

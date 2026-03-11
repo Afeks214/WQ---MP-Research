@@ -14,7 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import yaml
-from module5.harness.artifact_writers import write_frozen_json
+from weightiz.module5.harness.artifact_writers import write_frozen_json
 
 try:
     import psutil  # type: ignore[import-not-found]

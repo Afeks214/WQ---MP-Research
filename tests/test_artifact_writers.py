@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from module5.harness.artifact_writers import write_frozen_json, write_json
+from weightiz.module5.harness.artifact_writers import write_frozen_json, write_json
 
 
 def test_write_json_replaces_file_without_leaking_tempfiles(tmp_path: Path) -> None:

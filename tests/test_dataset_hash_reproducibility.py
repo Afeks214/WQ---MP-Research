@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from weightiz_feature_tensor_cache import compute_tensor_hash
+from weightiz.shared.io.feature_tensor_cache import compute_tensor_hash
 
 
 def test_dataset_hash_reproducibility_inputs_stable():

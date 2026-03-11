@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from weightiz_shared_feature_store import close_shared_feature_store, create_shared_feature_store
+from weightiz.shared.io.shared_feature_store import close_shared_feature_store, create_shared_feature_store
 
 
 def test_master_close_unlink_cleanup():

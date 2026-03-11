@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
-from weightiz_system_logger import get_logger, init_runtime_logger, log_event, shutdown_runtime_logger
+import weightiz.shared.logging.system_logger as system_logger
+from weightiz.shared.logging.system_logger import get_logger, init_runtime_logger, log_event, shutdown_runtime_logger
 
 
 def test_runtime_logger_queue_writes_files(tmp_path: Path) -> None:
@@ -20,6 +22,6 @@ def test_runtime_logger_queue_writes_files(tmp_path: Path) -> None:
 
 
 def test_logging_module_uses_queue_handler_listener() -> None:
-    src = Path(__file__).resolve().parents[1].joinpath("weightiz_system_logger.py").read_text(encoding="utf-8")
+    src = inspect.getsource(system_logger)
     assert "QueueHandler" in src
     assert "QueueListener" in src

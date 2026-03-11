@@ -3,17 +3,17 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from module6.io import load_module5_run
-from module6.ledger import materialize_canonical_ledgers
-from module6.matrices import build_matrix_store
-from module6.reduction import reduce_universe
-from module6.runtime import open_matrix_store
-from module6.simulator.session_path import simulate_session_batch
-from module6.simulator.minute_refine import replay_finalists_minute
-from module6.dependence import build_covariance_bundle
-from module6.generators import generate_all_portfolios
-from module6.scoring import score_session_paths
-from module6.utils import Module6ValidationError
+from weightiz.module6.io import load_module5_run
+from weightiz.module6.ledger import materialize_canonical_ledgers
+from weightiz.module6.matrices import build_matrix_store
+from weightiz.module6.reduction import reduce_universe
+from weightiz.module6.runtime import open_matrix_store
+from weightiz.module6.simulator.session_path import simulate_session_batch
+from weightiz.module6.simulator.minute_refine import replay_finalists_minute
+from weightiz.module6.dependence import build_covariance_bundle
+from weightiz.module6.generators import generate_all_portfolios
+from weightiz.module6.scoring import score_session_paths
+from weightiz.module6.utils import Module6ValidationError
 from tests.module6_testkit import build_synthetic_module5_run, make_test_config
 
 

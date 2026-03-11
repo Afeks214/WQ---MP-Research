@@ -5,9 +5,9 @@ import unittest
 
 import numpy as np
 
-from module3 import ContextIdx, StructIdx
-from weightiz_module1_core import EngineConfig, Phase, ProfileStatIdx, ScoreIdx, preallocate_state
-from weightiz_module4_strategy_funnel import Module4Config, RegimeIdx, run_module4_signal_funnel
+from weightiz.module3 import ContextIdx, StructIdx
+from weightiz.module1.core import EngineConfig, Phase, ProfileStatIdx, ScoreIdx, preallocate_state
+from weightiz.module4.strategy_funnel import Module4Config, RegimeIdx, run_module4_signal_funnel
 
 
 def _mk_state(T: int = 40, A: int = 3):

@@ -3,10 +3,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from risk_engine import CostConfig, RiskConfig, simulate_portfolio_from_signals
-from weightiz_dtype_guard import assert_float64
-from weightiz_module2_core import build_feature_tensor_multiaxis
-from weightiz_shared_feature_store import attach_shared_feature_store, close_shared_feature_store, create_shared_feature_store
+from weightiz.module4.risk_engine import CostConfig, RiskConfig, simulate_portfolio_from_signals
+from weightiz.shared.validation.dtype_guard import assert_float64
+from weightiz.module2.core import build_feature_tensor_multiaxis
+from weightiz.shared.io.shared_feature_store import attach_shared_feature_store, close_shared_feature_store, create_shared_feature_store
 
 
 def test_assert_float64_failure():

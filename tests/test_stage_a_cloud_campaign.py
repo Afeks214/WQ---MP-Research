@@ -7,8 +7,8 @@ import numpy as np
 import pandas as pd
 
 import run_research
-from app.config_models import HarnessConfigModel, RunConfigModel
-from app.stage_a_discovery import (
+from weightiz.shared.config.models import HarnessConfigModel, RunConfigModel
+from weightiz.module5.stage_a_discovery import (
     STAGE_A_LIVE_ENTRY_THRESHOLD,
     STAGE_A_PROCESS_BACKEND,
     STAGE_A_PROCESS_WORKERS,
@@ -17,7 +17,7 @@ from app.stage_a_discovery import (
     STAGE_A_WINDOW_SET,
 )
 from scripts.build_stage_a_cloud_campaign import build_stage_a_cloud_config
-from weightiz_module5_harness import Module5HarnessConfig
+from weightiz.module5.orchestrator import Module5HarnessConfig
 
 
 def test_stage_a_threshold_is_owned_once_across_loader_and_runtime_defaults() -> None:

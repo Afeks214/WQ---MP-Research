@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from module5.harness.memory_accounting import (
+from weightiz.module5.harness.memory_accounting import (
     build_memory_accounting_estimate,
     chunk_policy_memory_cap,
     resolve_base_sharing_mode,

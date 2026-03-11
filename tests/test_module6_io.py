@@ -3,8 +3,8 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from module6.io import load_module5_run
-from module6.utils import Module6ValidationError
+from weightiz.module6.io import load_module5_run
+from weightiz.module6.utils import Module6ValidationError
 from tests.module6_testkit import build_synthetic_module5_run, make_test_config
 
 

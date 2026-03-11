@@ -10,7 +10,7 @@ except Exception:  # pragma: no cover
     yaml = None  # type: ignore[assignment]
 
 from run_research import _load_config
-from weightiz_module4_strategy_funnel import Module4Config
+from weightiz.module4.strategy_funnel import Module4Config
 
 
 @unittest.skipIf(yaml is None, "pyyaml not available")

@@ -3,8 +3,8 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from module6.scoring import build_cross_universe_comparable_scores
-from module6.utils import Module6ValidationError
+from weightiz.module6.scoring import build_cross_universe_comparable_scores
+from weightiz.module6.utils import Module6ValidationError
 from tests.module6_testkit import make_test_config
 
 

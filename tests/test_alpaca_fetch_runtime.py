@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 import yaml
 
 from scripts.fetch_alpaca_data import run_fetch
-from weightiz_data.alpaca_client import AlpacaAPIError, AlpacaClient
+from weightiz.shared.io.market_data.alpaca_client import AlpacaAPIError, AlpacaClient
 
 
 class _FakeResponse:

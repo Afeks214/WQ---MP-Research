@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
+import inspect
+
+import weightiz.module5.orchestrator as h
 
 
 def test_dataset_hash_key_exists_in_manifest_build():
-    src = Path("weightiz_module5_harness.py").read_text(encoding="utf-8")
+    src = inspect.getsource(h)
     assert '"dataset_hash"' in src
     assert '"feature_tensor"' in src

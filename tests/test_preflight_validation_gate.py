@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from weightiz_validation_suite import run_preflight_validation_suite
+from weightiz.shared.validation.validation_suite import run_preflight_validation_suite
 
 
 def test_preflight_rejects_parallel_runtime():

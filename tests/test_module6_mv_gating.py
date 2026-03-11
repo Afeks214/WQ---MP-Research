@@ -3,10 +3,10 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from module6.config import GeneratorConfig, Module6Config
-from module6.dependence import build_covariance_bundle
-from module6.generators.mv_shrinkage import generate_mv_variants
-from module6.types import ReducedUniverseSpec
+from weightiz.module6.config import GeneratorConfig, Module6Config
+from weightiz.module6.dependence import build_covariance_bundle
+from weightiz.module6.generators.mv_shrinkage import generate_mv_variants
+from weightiz.module6.types import ReducedUniverseSpec
 
 
 def test_mv_generator_disabled_by_default():

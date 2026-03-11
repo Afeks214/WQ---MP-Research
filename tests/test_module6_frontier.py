@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from module6.frontier import select_diverse_finalists
+from weightiz.module6.frontier import select_diverse_finalists
 from tests.module6_testkit import make_test_config
 
 

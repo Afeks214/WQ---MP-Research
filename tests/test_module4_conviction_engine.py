@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import numpy as np
 
-from module3 import ContextIdx
-from module4.conviction_engine import compute_conviction
-from weightiz_module1_core import ScoreIdx
-from weightiz_module4_strategy_funnel import Module4Config
+from weightiz.module3 import ContextIdx
+from weightiz.module4.conviction_engine import compute_conviction
+from weightiz.module1.core import ScoreIdx
+from weightiz.module4.strategy_funnel import Module4Config
 
 
 def test_conviction_is_zero_for_flat_and_clipped_for_directional_intent() -> None:

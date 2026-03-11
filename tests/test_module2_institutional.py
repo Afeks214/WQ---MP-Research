@@ -2,8 +2,8 @@ import unittest
 
 import numpy as np
 
-from weightiz_module1_core import EngineConfig, Phase, ProfileStatIdx, preallocate_state
-from weightiz_module2_core import (
+from weightiz.module1.core import EngineConfig, Phase, ProfileStatIdx, preallocate_state
+from weightiz.module2.core import (
     Module2Config,
     _build_poc_rank,
     _rolling_median_mad_causal,

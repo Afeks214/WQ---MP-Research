@@ -3,10 +3,10 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from module6.config import GeneratorConfig, Module6Config
-from module6.dependence import build_covariance_bundle
-from module6.generators import generate_all_portfolios
-from module6.types import ReducedUniverseSpec
+from weightiz.module6.config import GeneratorConfig, Module6Config
+from weightiz.module6.dependence import build_covariance_bundle
+from weightiz.module6.generators import generate_all_portfolios
+from weightiz.module6.types import ReducedUniverseSpec
 
 
 def test_generator_outputs_are_simplex_and_nonnegative():

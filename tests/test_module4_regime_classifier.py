@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from module3 import ContextIdx, StructIdx
-from module4.regime_classifier import (
+from weightiz.module3 import ContextIdx, StructIdx
+from weightiz.module4.regime_classifier import (
     REGIME_B_SHAPE,
     REGIME_DOUBLE_DISTRIBUTION,
     REGIME_NONE,
@@ -11,7 +11,7 @@ from module4.regime_classifier import (
     REGIME_TREND,
     classify_regime,
 )
-from weightiz_module4_strategy_funnel import Module4Config
+from weightiz.module4.strategy_funnel import Module4Config
 
 
 def _base_inputs(A: int = 2, T: int = 4):

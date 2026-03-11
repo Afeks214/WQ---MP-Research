@@ -7,8 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
-import weightiz_module5_harness as h
-from weightiz_module1_core import EngineConfig, NS_PER_MIN, preallocate_state
+import weightiz.module5.orchestrator as h
+from weightiz.module1.core import EngineConfig, NS_PER_MIN, preallocate_state
 
 
 class TestOptionARiskBreachStateDump(unittest.TestCase):

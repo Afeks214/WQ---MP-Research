@@ -4,9 +4,9 @@ import unittest
 
 import numpy as np
 
-from weightiz_module1_core import EngineConfig, NS_PER_MIN, Phase, ProfileStatIdx, ScoreIdx, preallocate_state
-from weightiz_module3_structure import ContextIdx, Module3Output, Struct30mIdx
-from weightiz_module4_strategy_funnel import Module4Config, run_module4_strategy_funnel
+from weightiz.module1.core import EngineConfig, NS_PER_MIN, Phase, ProfileStatIdx, ScoreIdx, preallocate_state
+from weightiz.module3.bridge import ContextIdx, Module3Output, Struct30mIdx
+from weightiz.module4.strategy_funnel import Module4Config, run_module4_strategy_funnel
 
 
 class TestNoNanEquityOnInvalidBars(unittest.TestCase):

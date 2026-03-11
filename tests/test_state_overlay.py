@@ -3,14 +3,14 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from module5.harness.state_overlay import (
+from weightiz.module5.harness.state_overlay import (
     BaseTensorState,
     CandidateScratch,
     CombinedStateView,
     FeatureOverlay,
     MarketOverlay,
 )
-from weightiz_module1_core import EngineConfig, preallocate_state
+from weightiz.module1.core import EngineConfig, preallocate_state
 
 
 def _cfg(*, T: int, A: int):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-import weightiz_module5_harness as h
+import weightiz.module5.orchestrator as h
 
 
 class TestHarnessFaultIsolation(unittest.TestCase):

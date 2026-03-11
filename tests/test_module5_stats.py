@@ -3,7 +3,7 @@ import math
 import numpy as np
 import pytest
 
-from weightiz_module5_stats import (
+from weightiz.module5.stats import (
     deflated_sharpe_ratio,
     effective_num_trials_from_corr,
     expected_max_z,
