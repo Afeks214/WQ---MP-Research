@@ -20,6 +20,20 @@ def _enabled_assets_hash(enabled_assets_mask: list[bool] | tuple[bool, ...]) -> 
     return hashlib.sha256(payload).hexdigest()
 
 
+def _metric_scalar(payload: Any, key: str, default: float) -> float:
+    if not isinstance(payload, dict):
+        return float(default)
+    raw = payload.get(key, default)
+    if isinstance(raw, (list, tuple)):
+        arr = np.asarray(raw, dtype=np.float64).reshape(-1)
+        finite = arr[np.isfinite(arr)]
+        return float(finite[0]) if finite.size > 0 else float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
 def build_strategy_instance_master(run: LoadedModule5Run, config: Module6Config) -> pd.DataFrame:
     run_id = str(run.run_manifest["run_id"])
     dataset_hash = str(run.run_manifest["dataset_hash"])
@@ -66,8 +80,8 @@ def build_strategy_instance_master(run: LoadedModule5Run, config: Module6Config)
                 "dq_median_metrics": float(dq_summary.get("dq_median", 1.0)),
                 "dq_degrade_count_metrics": int(dq_summary.get("dq_degrade_count", 0)),
                 "dq_reject_count_metrics": int(dq_summary.get("dq_reject_count", 0)),
-                "stats_dsr": float(dict(stats.get("dsr", {})).get("dsr", 0.0)) if isinstance(stats.get("dsr", {}), dict) else float("nan"),
-                "stats_pbo": float(dict(stats.get("pbo", {})).get("pbo", 1.0)) if isinstance(stats.get("pbo", {}), dict) else float("nan"),
+                "stats_dsr": _metric_scalar(stats.get("dsr", {}), "dsr", float("nan")),
+                "stats_pbo": _metric_scalar(stats.get("pbo", {}), "pbo", float("nan")),
                 "engine_config_json": json.dumps(cfg.get("engine_config", {}), sort_keys=True),
             }
         )

@@ -11,7 +11,7 @@ import numpy as np
 
 
 _SOURCE_FILES = {
-    "run_research.py": "run_research.py",
+    "run_research.py": "src/weightiz/cli/run_research.py",
     "sweep_runner.py": "sweep_runner.py",
     "weightiz_module2_core.py": "src/weightiz/module2/core.py",
     "weightiz_module3_structure.py": "src/weightiz/module3/bridge.py",

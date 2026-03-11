@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 _PATHS = {
-    "run_research.py": "run_research.py",
+    "run_research.py": "src/weightiz/cli/run_research.py",
     "sweep_runner.py": "sweep_runner.py",
     "weightiz_module5_harness.py": "src/weightiz/module5/orchestrator.py",
     "weightiz_module4_strategy_funnel.py": "src/weightiz/module4/strategy_funnel.py",

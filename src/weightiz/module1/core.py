@@ -33,6 +33,8 @@ import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from zoneinfo import ZoneInfo
 
+from weightiz.shared.config.paths import resolve_repo_path
+
 
 # -----------------------------------------------------------------------------
 # Time constants
@@ -1087,7 +1089,7 @@ def load_feature_registry(path: str | os.PathLike[str]) -> list[FeatureSpec]:
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("pyyaml is required to load feature registry") from exc
 
-    p = Path(path).expanduser().resolve()
+    p = resolve_repo_path(path)
     if not p.exists():
         raise RuntimeError(f"Feature registry file not found: {p}")
     raw = yaml.safe_load(p.read_text(encoding="utf-8"))
@@ -1575,9 +1577,7 @@ def _allocate_tensor(A: int, T: int, F: int, W: int, cfg: FeatureEngineConfig) -
     if backend != "memmap":
         raise RuntimeError(f"Unsupported tensor backend: {cfg.tensor_backend}")
 
-    p = Path(cfg.memmap_path).expanduser()
-    if not p.is_absolute():
-        p = (Path.cwd() / p).resolve()
+    p = resolve_repo_path(cfg.memmap_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     if p.exists():
         p.unlink(missing_ok=True)
@@ -1628,11 +1628,9 @@ def build_feature_tensor(
     registry_hash = feature_registry_hash(ordered_specs)
     dataset_hash = _dataset_hash_from_data(sanitized_ta, ordered_specs, ts_ns=sanitized_ta.get("ts_ns"))
     key = _cache_key(dataset_hash, registry_hash)
-    cache_dir = Path(cfg.cache_dir).expanduser().resolve()
+    cache_dir = resolve_repo_path(cfg.cache_dir)
     cache_path = cache_dir / f"feature_tensor_{key}.npz"
-    memmap_path = Path(cfg.memmap_path).expanduser()
-    if not memmap_path.is_absolute():
-        memmap_path = (Path.cwd() / memmap_path).resolve()
+    memmap_path = resolve_repo_path(cfg.memmap_path)
 
     if bool(cfg.use_cache) and cache_path.exists():
         with np.load(cache_path, allow_pickle=False) as d:

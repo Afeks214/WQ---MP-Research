@@ -1,0 +1,116 @@
+{
+  "candidate_id": "cand_0000_m20_m30_m40",
+  "base_metrics": {
+    "n_days": 8,
+    "n_trades": 0,
+    "win_rate": 0.0,
+    "avg_trade": 0.0,
+    "profit_factor": 0.0,
+    "max_drawdown": 0.0,
+    "cagr_ish": 0.0,
+    "avg_turnover": 0.0,
+    "asset_pnl_concentration": 0.0,
+    "avg_margin_used_frac": 0.0,
+    "peak_margin_used_frac": 0.0
+  },
+  "per_stress": {
+    "baseline": {
+      "n_tasks": 1,
+      "cum_return_median": 0.0,
+      "cum_return_mean": 0.0,
+      "max_drawdown_median": 0.0,
+      "turnover_median": 0.0,
+      "delta_vs_baseline": {
+        "pnl": 0.0,
+        "dd": 0.0,
+        "turnover": 0.0
+      }
+    }
+  },
+  "per_fold": {
+    "wf": {
+      "summary": {
+        "count": 1,
+        "sharpe_daily_mean": 0.0,
+        "sharpe_daily_median": 0.0,
+        "sharpe_daily_worst": 0.0,
+        "cum_return_mean": 0.0,
+        "cum_return_median": 0.0,
+        "max_drawdown_median": 0.0,
+        "turnover_median": 0.0
+      },
+      "folds": [
+        {
+          "split_id": "wf_000",
+          "mode": "wf",
+          "scenario_id": "baseline",
+          "cum_return": 0.0,
+          "sharpe_daily": 0.0,
+          "max_drawdown": 0.0,
+          "turnover": 0.0,
+          "test_days": 4
+        }
+      ]
+    },
+    "cpcv": {
+      "summary": {
+        "count": 0,
+        "sharpe_daily_mean": 0.0,
+        "sharpe_daily_median": 0.0,
+        "sharpe_daily_worst": 0.0,
+        "cum_return_mean": 0.0,
+        "cum_return_median": 0.0,
+        "max_drawdown_median": 0.0,
+        "turnover_median": 0.0
+      },
+      "folds": []
+    }
+  },
+  "robustness": {
+    "score": 0.6771388890386781,
+    "formula": "0.20*dsr+0.15*(1-pbo)+0.10*(1-spa_p)+0.20*regime+0.20*execution+0.15*horizon",
+    "dsr_source": "cluster_representative_exec",
+    "inputs": {
+      "dsr_median": 0.5000000005248086,
+      "pbo": 1.0,
+      "dd_severe": 0.0,
+      "fold_sharpe_std": 0.0,
+      "asset_pnl_concentration": 0.0,
+      "verdict_robustness_score": 0.6771388890386781
+    },
+    "caps": {
+      "dd_cap": 0.35,
+      "std_cap": 1.0,
+      "conc_cap": 0.75
+    }
+  },
+  "failed": false,
+  "failure_reasons": [],
+  "alignment": {
+    "aligned_to_global_benchmark_sessions": true,
+    "global_session_count": 8,
+    "observed_baseline_session_count": 4
+  },
+  "dq_summary": {
+    "dq_min": 1.0,
+    "dq_median": 1.0,
+    "dq_degrade_count": 0,
+    "dq_reject_count": 0,
+    "dq_reason_top": ""
+  },
+  "stage_a_metadata": {
+    "campaign_id": "",
+    "family_id": "",
+    "family_name": "",
+    "hypothesis_id": "",
+    "evaluation_role": "",
+    "window_set": "",
+    "window_set_size": 0,
+    "parameter_hash": "8a08aa8ca6a7a119e71b2a9682a023d9259bf5f1bd2b0cdec6e4f9427bb343ea",
+    "tags_serialized": "",
+    "evaluation_window": null,
+    "cost_adjusted_expectancy": 0.0,
+    "overnight_suitability_score": 0.0,
+    "zimtra_compliance_flags": ""
+  }
+}

@@ -102,6 +102,15 @@ def build_execution_overlap_proxy(
     pk_to_instance_key = {str(pk): str(key) for pk, key in zip(strategy_instance_pks, instance_keys)}
     if candidate_pairs is None:
         candidate_pairs = [(i, j) for i in range(n_count) for j in range(i + 1, n_count)]
+    if n_count <= 1 or len(candidate_pairs) == 0:
+        empty = sparse.csr_matrix((n_count, n_count), dtype=np.float64)
+        return ExecutionOverlapComponents(
+            symbol_support=empty,
+            activity_concurrence=empty,
+            gross_exposure_concurrence=empty,
+            rebalance_collision=empty,
+            composite=empty,
+        )
 
     required_cols = {"candidate_id", "split_id", "scenario_id", "symbol"}
     if not required_cols.issubset(set(trade_log.columns)):

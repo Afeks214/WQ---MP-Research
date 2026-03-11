@@ -43,3 +43,38 @@ def test_generator_outputs_are_simplex_and_nonnegative():
     assert counts.get("random_sparse", 0) <= cfg.generator.random_sparse_quota
     assert counts.get("cluster_balanced", 0) <= cfg.generator.cluster_balanced_quota
     assert counts.get("hrp_risk", 0) <= cfg.generator.hrp_variant_quota
+
+
+def test_generators_handle_single_strategy_universe():
+    strategy_frame = pd.DataFrame(
+        {
+            "strategy_instance_pk": ["a"],
+            "cluster_id": [0],
+            "family_id": ["f0"],
+            "robustness_score": [0.9],
+            "availability_ratio": [1.0],
+            "avg_turnover_metrics": [0.1],
+        }
+    )
+    returns = np.asarray([[0.01], [0.0], [0.01], [0.0]], dtype=np.float64)
+    bundle = build_covariance_bundle(
+        returns,
+        np.ones_like(returns, dtype=bool),
+        np.ones((4, 1), dtype=np.float64),
+        np.asarray([0], dtype=np.int64),
+        Module6Config().dependence,
+    )
+    cfg = Module6Config(generator=GeneratorConfig(random_sparse_quota=2, cluster_balanced_quota=2, hrp_variant_quota=2, active_cardinality_choices=(1,)))
+    candidates, weights = generate_all_portfolios(
+        reduced_universe=ReducedUniverseSpec("ru", ("a",), ("a",), tuple(), 1),
+        strategy_frame=strategy_frame,
+        covariance_bundle=bundle,
+        returns_exec=returns,
+        column_indices=np.asarray([0], dtype=np.int64),
+        config=cfg,
+        calendar_version="calv1",
+    )
+    assert not candidates.empty
+    assert not weights.empty
+    grouped = weights.groupby("portfolio_pk")["target_weight"].sum()
+    assert (grouped <= 1.0 + 1.0e-12).all()

@@ -1,0 +1,5 @@
+run_dir: "./artifacts/server/compute_small/example_run"
+
+module6:
+  export:
+    output_subdir_name: "module6"

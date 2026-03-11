@@ -59,7 +59,12 @@ def generate_all_portfolios(
     if not frames:
         return pd.DataFrame(), pd.DataFrame()
     candidates = pd.concat(frames, axis=0, ignore_index=True).drop_duplicates("portfolio_pk", keep="first")
-    weights = pd.concat(weight_frames, axis=0, ignore_index=True)
+    weights = (
+        pd.concat(weight_frames, axis=0, ignore_index=True)
+        .loc[lambda df: df["portfolio_pk"].isin(candidates["portfolio_pk"])]
+        .drop_duplicates(["portfolio_pk", "strategy_instance_pk"], keep="first")
+        .reset_index(drop=True)
+    )
     return (
         candidates.sort_values(["generator_family", "portfolio_pk"], kind="mergesort").reset_index(drop=True),
         weights.sort_values(["portfolio_pk", "strategy_instance_pk"], kind="mergesort").reset_index(drop=True),

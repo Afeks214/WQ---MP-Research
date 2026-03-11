@@ -680,9 +680,6 @@ def _init_worker_context(
 ) -> None:
     global _WORKER_CONTEXT, _WORKER_PROCESS
     _WORKER_PROCESS = True
-    repo_root = str(Path(__file__).resolve().parent)
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
     # Keep worker BLAS/Arrow threading deterministic and avoid nested oversubscription.
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")

@@ -1,0 +1,4 @@
+{"timestamp": "2026-03-11T13:53:08.934621+00:00", "level": "INFO", "message": "module5_harness_start", "run_id": "run_20260311_135308", "module": "module5_harness", "worker_id": "", "strategy_id": "", "event_type": "harness_start"}
+{"timestamp": "2026-03-11T13:53:10.776802+00:00", "level": "INFO", "message": "module2_profile_complete", "run_id": "", "module": "module2", "worker_id": "", "strategy_id": "", "event_type": "module2_complete"}
+{"timestamp": "2026-03-11T13:53:12.257969+00:00", "level": "INFO", "message": "module2_profile_complete", "run_id": "", "module": "module2", "worker_id": "", "strategy_id": "", "event_type": "module2_complete"}
+{"timestamp": "2026-03-11T13:53:20.345637+00:00", "level": "INFO", "message": "run_complete", "run_id": "", "module": "weightiz.cli.research", "worker_id": "", "strategy_id": "", "event_type": "run_complete"}

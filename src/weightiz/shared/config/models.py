@@ -458,6 +458,7 @@ class RunConfigModel(BaseModel):
     module4_configs: list[Module4ConfigModel] = Field(default_factory=lambda: [Module4ConfigModel()])
     harness: HarnessConfigModel = Field(default_factory=HarnessConfigModel)
     search: SearchConfigModel = Field(default_factory=SearchConfigModel)
+    module6: dict[str, Any] = Field(default_factory=dict)
     zimtra_sweep: Optional[dict[str, Any]] = None
     stress_scenarios: Optional[list[StressScenarioModel]] = None
     candidates: CandidatesModel = Field(default_factory=CandidatesModel)

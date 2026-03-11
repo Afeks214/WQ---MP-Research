@@ -17,6 +17,13 @@ dependencies = [
   "scipy",
 ]
 
+[project.scripts]
+weightiz-research = "weightiz.cli.run_research:main"
+weightiz-module5 = "weightiz.cli.run_module5:main"
+weightiz-module6 = "weightiz.cli.run_module6:main"
+weightiz-server-job = "weightiz.cli.run_server_job:main"
+weightiz-validate-artifacts = "weightiz.cli.validate_artifacts:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

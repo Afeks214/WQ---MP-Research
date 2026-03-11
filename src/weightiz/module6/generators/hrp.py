@@ -21,6 +21,8 @@ def _cluster_var(cov: np.ndarray, items: np.ndarray) -> float:
 
 
 def _hrp_weights(correlation: np.ndarray, covariance: np.ndarray) -> np.ndarray:
+    if correlation.shape[0] == 1:
+        return np.asarray([1.0], dtype=np.float64)
     dist = np.sqrt(np.maximum(0.0, 0.5 * (1.0 - correlation)))
     np.fill_diagonal(dist, 0.0)
     order = leaves_list(linkage(squareform(dist, checks=False), method="single"))
