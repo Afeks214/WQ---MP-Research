@@ -6,9 +6,9 @@
 - `RED FLAG 2 (hardcoded thresholds)`: generator pool extraction reads source config values dynamically; no hardcoded T/A/B lists.
   - Evidence: `scripts/build_family_sweeps.py` line 68-114 + regex probes (Phase 2).
 - `RED FLAG 3 (canonical hash double-rounding)`: canonical hash now sorts by `(config_id, seed)`, casts numeric to float64, rounds to 8 decimals, serializes CSV bytes, hashes sha256.
-  - Evidence: `run_research.py` line 900-914.
+  - Evidence: `weightiz.cli.run_research` line 900-914.
 - `RED FLAG 4 (silent clamp)`: hard fail with explicit message if `parallel_workers > 14`.
-  - Evidence: `run_research.py` line 1210-1213.
+  - Evidence: `weightiz.cli.run_research` line 1210-1213.
 - `RED FLAG 5 (smoke timeout)`: smoke run used temporary shortened date range + reduced split params + single manual candidate; post-run bounds checks included.
   - Evidence: Phase 5 commands/output.
 - `RED FLAG 6 (stale aggregator merge)`: aggregator now enforces required families, selects deterministic latest candidate for duplicates, and fail-closes on summary/file hash mismatch.
@@ -104,14 +104,14 @@ sweep_family_surfers.yaml
 
 | Requirement | PASS/FAIL | Evidence (path:function:line) | Notes |
 |---|---|---|---|
-| Family trigger `run_name.startswith("sweep_family_")` | PASS | `run_research.py::_family_mode_enabled` line 799-800 | Exact prefix gate present |
-| Strict YAML schema (`extra="forbid"`) | PASS | `run_research.py` models at lines 55,72,98,157,179,230,269,282,293,306 | Root + nested strict schemas |
-| Worker cap fail-closed >14 | PASS | `run_research.py::main` line 1210-1213 | Raises `ValueError("Strict cap exceeded: ...")` |
-| Deterministic jitter from hash, bounded [10,30] | PASS | `run_research.py::_deterministic_jitter_seconds` line 803-806 | `10 + (sha256(...) % 21)` |
-| Results integrity checks pre-parquet | PASS | `run_research.py::_assert_results_integrity` line 877-897 | required cols + unique `(config_id,seed)` + finite numeric |
-| Canonical reproducibility hash | PASS | `run_research.py::_canonical_results_sha256` line 900-914 | deterministic sort + float64 cast + round(8) + stable CSV bytes |
-| Canonical hash excludes operational timestamps | PASS | `run_research.py::_canonical_results_sha256` line 900-914 + `summary.json` timestamps written separately at line 1167-1174 | Hash computed only from `results_df` |
-| Non-family regression guard | PASS | `run_research.py::main` line 1205-1213 and 1228-1235 | family-only branch gates; non-family path bypasses family controls |
+| Family trigger `run_name.startswith("sweep_family_")` | PASS | `weightiz.cli.run_research::_family_mode_enabled` line 799-800 | Exact prefix gate present |
+| Strict YAML schema (`extra="forbid"`) | PASS | `weightiz.cli.run_research` models at lines 55,72,98,157,179,230,269,282,293,306 | Root + nested strict schemas |
+| Worker cap fail-closed >14 | PASS | `weightiz.cli.run_research::main` line 1210-1213 | Raises `ValueError("Strict cap exceeded: ...")` |
+| Deterministic jitter from hash, bounded [10,30] | PASS | `weightiz.cli.run_research::_deterministic_jitter_seconds` line 803-806 | `10 + (sha256(...) % 21)` |
+| Results integrity checks pre-parquet | PASS | `weightiz.cli.run_research::_assert_results_integrity` line 877-897 | required cols + unique `(config_id,seed)` + finite numeric |
+| Canonical reproducibility hash | PASS | `weightiz.cli.run_research::_canonical_results_sha256` line 900-914 | deterministic sort + float64 cast + round(8) + stable CSV bytes |
+| Canonical hash excludes operational timestamps | PASS | `weightiz.cli.run_research::_canonical_results_sha256` line 900-914 + `summary.json` timestamps written separately at line 1167-1174 | Hash computed only from `results_df` |
+| Non-family regression guard | PASS | `weightiz.cli.run_research::main` line 1205-1213 and 1228-1235 | family-only branch gates; non-family path bypasses family controls |
 
 Diff summary target files:
 ```bash
@@ -194,7 +194,7 @@ REMEDIATION: Expand configs/sweep_20x432.yaml with additional profile_window_bar
 |---|---|---|---|---|---|
 | Unknown top-level field | `_load_config` on temp YAML with `__bogus_key__` | Validation crash | `ValidationError` | PASS | `1 validation error for RunConfigModel` |
 | Unknown nested field | `_load_config` on temp YAML with `module4_configs[0].__bogus_nested__` | Validation crash | `ValidationError` | PASS | `1 validation error for RunConfigModel` |
-| Worker cap = 15 | `python run_research.py --config /tmp/sweep_family_workers15_probe.yaml` | Hard fail | ValueError raised | PASS | `Strict cap exceeded: 15 > 14. Fail-closed.` |
+| Worker cap = 15 | `python -m weightiz.cli.run_research --config /tmp/sweep_family_workers15_probe.yaml` | Hard fail | ValueError raised | PASS | `Strict cap exceeded: 15 > 14. Fail-closed.` |
 | Jitter determinism | `_deterministic_jitter_seconds` seeds [1..5] twice | In range, stable, diverse | `[29,10,30,10,23]` twice, 4 distinct | PASS | `IN_RANGE True, STABLE_REPEAT True, DISTINCT_COUNT 4` |
 
 Verbatim outputs:

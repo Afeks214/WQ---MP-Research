@@ -151,10 +151,10 @@ $$
 Robustness score uses code-declared formula string in `candidate_metrics["robustness"]["formula"]` and `ROBUSTNESS_CAPS`.
 
 ## 5) Epsilons / Constants (code anchors)
-- Engine: `run_research.py::EngineConfigModel`
+- Engine: `weightiz.cli.run_research::EngineConfigModel`
   - `eps_pdf=1e-12`, `eps_vol=1e-12`
-- Module 3: `run_research.py::Module3ConfigModel.eps=1e-12`
-- Module 4: `run_research.py::Module4ConfigModel.eps=1e-12`
+- Module 3: `weightiz.cli.run_research::Module3ConfigModel.eps=1e-12`
+- Module 4: `weightiz.cli.run_research::Module4ConfigModel.eps=1e-12`
 - Profit factor denominator floor: `weightiz_module5_harness.py` uses `max(abs(neg_sum), 1e-12)`
 
 ## 6) Sanity Checklist (Guard Rails)
@@ -165,9 +165,9 @@ Robustness score uses code-declared formula string in `candidate_metrics["robust
 | Invalid reset flag values | binary + first-row assertions | `weightiz_module1_core.py` validation blocks |
 | Non-finite Module2 outputs | fail on non-finite output branch | `weightiz_module2_core.py` Stage F checks |
 | Non-finite Module4 outputs | `_assert_finite_masked(...)` at output validation | `weightiz_module4_strategy_funnel.py` |
-| Unknown YAML fields | `extra="forbid"` models | `run_research.py` Pydantic models |
-| Family worker oversubscription | fatal error if workers > 14 | `run_research.py::main` |
-| Family result non-finite fields | strict integrity check before parquet write | `run_research.py::_assert_results_integrity` |
+| Unknown YAML fields | `extra="forbid"` models | `weightiz.cli.run_research` Pydantic models |
+| Family worker oversubscription | fatal error if workers > 14 | `weightiz.cli.run_research::main` |
+| Family result non-finite fields | strict integrity check before parquet write | `weightiz.cli.run_research::_assert_results_integrity` |
 
 ## 7) NOT FOUND IN CODE
 - A closed-form single-equation strategy objective for the full funnel is **NOT FOUND IN CODE** (logic is procedural across Module 2 + Module 4).

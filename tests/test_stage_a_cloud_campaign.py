@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import run_research
+from weightiz.cli import run_research
 from weightiz.shared.config.models import HarnessConfigModel, RunConfigModel
 from weightiz.module5.stage_a_discovery import (
     STAGE_A_LIVE_ENTRY_THRESHOLD,

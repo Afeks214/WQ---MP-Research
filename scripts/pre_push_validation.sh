@@ -19,10 +19,10 @@ ulimit -n
 echo "Running compile gate..."
 
 $PYTHON_BIN -m py_compile \
-run_research.py \
-sweep_runner.py \
-strategy_engine.py \
-weightiz_profile_engine.py
+src/weightiz/cli/run_research.py \
+src/weightiz/module5/worker_io_guard.py \
+src/weightiz/module5/strategy_engine.py \
+src/weightiz/shared/io/profile_engine.py
 
 echo "Compile OK"
 

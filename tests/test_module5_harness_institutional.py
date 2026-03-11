@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import numpy as np
-import run_research
+from weightiz.cli import run_research
 
 try:
     import pandas as pd
@@ -21,7 +21,7 @@ from weightiz.module1.core import EngineConfig, deterministic_digest_sha256, pre
 from weightiz.module2.core import Module2Config
 from weightiz.module3.bridge import ContextIdx, Module3Config, Module3Output, Struct30mIdx
 from weightiz.module4.strategy_funnel import Module4Config, Module4SignalOutput
-from run_research import HarnessConfigModel
+from weightiz.cli.run_research import HarnessConfigModel
 import weightiz.module5.orchestrator as h
 
 

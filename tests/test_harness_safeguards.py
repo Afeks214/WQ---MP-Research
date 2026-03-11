@@ -153,7 +153,7 @@ class TestHarnessSafeguards(unittest.TestCase):
         with cfg_path.open("w", encoding="utf-8") as f:
             yaml.safe_dump(cfg, f, sort_keys=False)
 
-        cmd = [sys.executable, str(self.repo_root / "run_research.py"), "--config", str(cfg_path)]
+        cmd = [sys.executable, "-m", "weightiz.cli.run_research", "--config", str(cfg_path)]
         proc = subprocess.run(cmd, cwd=str(self.repo_root), capture_output=True, text=True, check=False)
         if proc.returncode != 0:
             raise RuntimeError(f"run_research rc={proc.returncode}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")

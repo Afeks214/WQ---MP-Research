@@ -190,7 +190,8 @@ class TestStrategyFactoryAcceptance(unittest.TestCase):
     def _execute_run(cls, cfg_path: Path) -> Path:
         cmd = [
             sys.executable,
-            str(cls.repo_root / "run_research.py"),
+            "-m",
+            "weightiz.cli.run_research",
             "--config",
             str(cfg_path),
         ]

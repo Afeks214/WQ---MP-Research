@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import run_research
+from weightiz.cli import run_research
 from tests.module6_testkit import make_test_config, run_module6_on_synthetic
 
 

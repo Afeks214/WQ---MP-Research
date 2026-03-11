@@ -1,5 +1,0 @@
-{"timestamp": "2026-03-11T13:45:14.340900+00:00", "level": "INFO", "message": "module5_harness_start", "run_id": "run_20260311_134514", "module": "module5_harness", "worker_id": "", "strategy_id": "", "event_type": "harness_start"}
-{"timestamp": "2026-03-11T13:45:16.170722+00:00", "level": "INFO", "message": "module2_profile_complete", "run_id": "", "module": "module2", "worker_id": "", "strategy_id": "", "event_type": "module2_complete"}
-{"timestamp": "2026-03-11T13:45:17.573544+00:00", "level": "INFO", "message": "module2_profile_complete", "run_id": "", "module": "module2", "worker_id": "", "strategy_id": "", "event_type": "module2_complete"}
-{"timestamp": "2026-03-11T13:45:19.398527+00:00", "level": "INFO", "message": "module2_profile_complete", "run_id": "", "module": "module2", "worker_id": "", "strategy_id": "", "event_type": "module2_complete"}
-{"timestamp": "2026-03-11T13:45:21.188385+00:00", "level": "INFO", "message": "module2_profile_complete", "run_id": "", "module": "module2", "worker_id": "", "strategy_id": "", "event_type": "module2_complete"}

@@ -28,7 +28,7 @@ def _run_research(
     quick_run: bool = False,
     log_dir: Path | None = None,
 ) -> Path:
-    cmd = [sys.executable, str(REPO_ROOT / "run_research.py"), "--config", str(config_path.resolve())]
+    cmd = [sys.executable, "-m", "weightiz.cli.run_research", "--config", str(config_path.resolve())]
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
     if quick_run:
@@ -61,6 +61,6 @@ def _run_research(
 if __name__ == "__main__":
     raise RuntimeError(
         "DEPRECATED_SWEEP_PIPELINE: scripts/run_sweep_auto.py is a compatibility shim only. "
-        "Use the unified pipeline: ./.venv/bin/python run_research.py --config <yaml>. "
+        "Use the unified pipeline: ./.venv/bin/python -m weightiz.cli.run_research --config <yaml>. "
         "Legacy implementation lives under scripts/_archive/legacy_sweep/run_sweep_auto.py"
     )

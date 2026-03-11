@@ -5,7 +5,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.append(str(REPO))
 
-from run_research import _load_config  # if this import fails, you must locate the real loader in run_research.py
+from weightiz.cli.run_research import _load_config
 
 def main():
     if len(sys.argv) < 2:

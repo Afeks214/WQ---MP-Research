@@ -87,7 +87,7 @@ Given `storage.root: ./data/alpaca`:
   - `data/alpaca/raw/<SYMBOL>/<START>_<END>_<FEED>_<ADJUSTMENT>.parquet`
 - Staging clean outputs (always written when cleaning succeeds):
   - `data/alpaca/clean_staging/<SYMBOL>.parquet`
-- Clean canonical cache (for `run_research.py`):
+- Clean canonical cache (for `weightiz.cli.run_research`):
   - `data/alpaca/clean/<SYMBOL>.parquet` (written only after QA pass)
 - Per-run QA report:
   - `data/alpaca/reports/<RUN_ID>_qa.json`

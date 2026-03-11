@@ -1,27 +1,27 @@
 # Sweep Code Map (Repo Truth, Code-Anchored)
 
 ## 1) Config Contract + Strict Validation
-- Loader: `run_research.py::_load_config`
-- Pydantic root model: `run_research.py::RunConfigModel` (`extra="forbid"`)
+- Loader: `weightiz.cli.run_research::_load_config`
+- Pydantic root model: `weightiz.cli.run_research::RunConfigModel` (`extra="forbid"`)
 - Strict component models:
-  - `run_research.py::Module2ConfigModel` (`extra="forbid"`)
-  - `run_research.py::Module3ConfigModel` (`extra="forbid"`)
-  - `run_research.py::Module4ConfigModel` (`extra="forbid"`)
-  - `run_research.py::HarnessConfigModel` (`extra="forbid"`)
+  - `weightiz.cli.run_research::Module2ConfigModel` (`extra="forbid"`)
+  - `weightiz.cli.run_research::Module3ConfigModel` (`extra="forbid"`)
+  - `weightiz.cli.run_research::Module4ConfigModel` (`extra="forbid"`)
+  - `weightiz.cli.run_research::HarnessConfigModel` (`extra="forbid"`)
 
 ### W/T/A/B schema keys (used for family sweeps)
 - `W` -> `module2_configs[*].profile_window_bars`
-  - Anchor: `run_research.py` (`Module2ConfigModel.profile_window_bars`)
+  - Anchor: `weightiz.cli.run_research` (`Module2ConfigModel.profile_window_bars`)
 - `T` -> `module4_configs[*].entry_threshold`
-  - Anchor: `run_research.py` (`Module4ConfigModel.entry_threshold`)
+  - Anchor: `weightiz.cli.run_research` (`Module4ConfigModel.entry_threshold`)
 - `A` -> `module4_configs[*].trend_poc_drift_min_abs`
-  - Anchor: `run_research.py` (`Module4ConfigModel.trend_poc_drift_min_abs`)
+  - Anchor: `weightiz.cli.run_research` (`Module4ConfigModel.trend_poc_drift_min_abs`)
 - `B` -> `module4_configs[*].neutral_poc_drift_max_abs`
-  - Anchor: `run_research.py` (`Module4ConfigModel.neutral_poc_drift_max_abs`)
+  - Anchor: `weightiz.cli.run_research` (`Module4ConfigModel.neutral_poc_drift_max_abs`)
 
 ### Cheap scaling axis confirmed
 - `module4_configs[*].top_k_intraday`
-  - Schema anchor: `run_research.py` (`Module4ConfigModel.top_k_intraday`)
+  - Schema anchor: `weightiz.cli.run_research` (`Module4ConfigModel.top_k_intraday`)
   - Strategy usage anchor: `weightiz_module4_strategy_funnel.py` (Top-K selection and sizing block)
 
 ## 2) Session Clock, Gap Reset, Warmup Neutralization
@@ -78,11 +78,11 @@
   - `weightiz_module5_harness.py` writes `run_manifest.json` and `run_status.json`
 
 ## 7) Family Mode Packaging (CLI-compatible extension)
-- Trigger: `run_research.py::_family_mode_enabled` for `run_name.startswith("sweep_family_")`
+- Trigger: `weightiz.cli.run_research::_family_mode_enabled` for `run_name.startswith("sweep_family_")`
 - Family outputs in `artifacts/<run_name>/`:
   - `pid`, `run.log`, `results.parquet`, `summary.json`, `audit_bundle/*`
 - Deterministic jitter:
-  - `run_research.py::_deterministic_jitter_seconds`
+  - `weightiz.cli.run_research::_deterministic_jitter_seconds`
   - `jitter = 10 + (sha256(run_name + seed) % 21)`
 - Strict worker cap:
-  - `run_research.py::main` raises fatal error if `harness.parallel_workers > 14`
+  - `weightiz.cli.run_research::main` raises fatal error if `harness.parallel_workers > 14`

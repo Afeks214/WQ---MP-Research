@@ -202,7 +202,7 @@ def run_benchmark(*, config_path: Path, label: str, sample_interval_sec: float) 
     stderr_path = report_dir.parent / f"{label}_stderr.log"
     summary_path = report_dir.parent / f"{label}_benchmark_summary.json"
 
-    cmd = [sys.executable, str(REPO_ROOT / "run_research.py"), "--config", str(config_path)]
+    cmd = [sys.executable, "-m", "weightiz.cli.run_research", "--config", str(config_path)]
     started_at = time.perf_counter()
     with stdout_path.open("w", encoding="utf-8") as stdout_fh, stderr_path.open("w", encoding="utf-8") as stderr_fh:
         proc = subprocess.Popen(

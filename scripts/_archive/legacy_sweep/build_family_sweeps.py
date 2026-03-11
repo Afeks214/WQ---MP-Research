@@ -37,7 +37,7 @@ FAMILY_MIN_W_COUNT: dict[str, int] = {
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-import run_research
+from weightiz.cli import run_research
 
 
 def _require_mapping(x: Any, name: str) -> dict[str, Any]:

@@ -728,7 +728,7 @@ def _run_research(
     quick_run: bool = False,
     log_dir: Optional[Path] = None,
 ) -> Path:
-    cmd = [sys.executable, str(REPO_ROOT / "run_research.py"), "--config", str(config_path.resolve())]
+    cmd = [sys.executable, "-m", "weightiz.cli.run_research", "--config", str(config_path.resolve())]
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
     if quick_run:
@@ -998,7 +998,7 @@ def _supports_manual_candidates() -> bool:
         repo_str = str(REPO_ROOT)
         if repo_str not in sys.path:
             sys.path.insert(0, repo_str)
-        from run_research import CandidatesModel, RunConfigModel  # type: ignore
+        from weightiz.cli.run_research import CandidatesModel, RunConfigModel  # type: ignore
 
         return bool(
             "candidates" in RunConfigModel.model_fields

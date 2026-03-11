@@ -1,6 +1,6 @@
 import pytest
 
-from sweep_runner import _install_worker_io_guard
+from weightiz.module5.worker_io_guard import _install_worker_io_guard
 
 
 def test_worker_io_guard_blocks_raw_reads() -> None:

@@ -4,8 +4,8 @@ import inspect
 
 import pytest
 
-import run_research
-import sweep_runner
+from weightiz.cli import run_research
+from weightiz.module5 import worker_io_guard as sweep_runner
 import weightiz.module2.core as m2
 import weightiz.module4.strategy_funnel as m4
 import weightiz.module5.orchestrator as h

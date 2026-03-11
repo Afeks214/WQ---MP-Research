@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import run_research as rr
+from weightiz.cli import run_research as rr
 
 
 def test_legacy_workers_alias_maps_to_harness():

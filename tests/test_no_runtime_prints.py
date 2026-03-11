@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
-import run_research
+from weightiz.cli import run_research
 import weightiz.module2.core as m2
 import weightiz.module3.bridge as m3
 import weightiz.module4.risk_engine as risk_engine

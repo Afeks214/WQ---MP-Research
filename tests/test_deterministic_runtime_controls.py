@@ -5,7 +5,7 @@ import random
 import numpy as np
 import pytest
 
-import run_research as rr
+from weightiz.cli import run_research as rr
 from weightiz.shared.validation.validation_suite import run_preflight_validation_suite
 
 

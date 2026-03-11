@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-import run_research as rr
+from weightiz.cli import run_research as rr
 
 
 def test_parallel_engine_forbidden_guard():

@@ -9,7 +9,7 @@ try:
 except Exception:  # pragma: no cover
     yaml = None  # type: ignore[assignment]
 
-from run_research import _load_config
+from weightiz.cli.run_research import _load_config
 from weightiz.module4.strategy_funnel import Module4Config
 
 

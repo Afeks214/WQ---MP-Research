@@ -5,11 +5,15 @@ __pycache__/
 .venv/
 .pytest_cache/
 .ipynb_checkpoints/
-artifacts/
+artifacts/*
+!artifacts/.gitkeep
 cache/
 datasets/
-logs/
+logs/*
+!logs/.gitkeep
 data/
+tmp/*
+!tmp/.gitkeep
 .env
 .env.*
 *.secrets

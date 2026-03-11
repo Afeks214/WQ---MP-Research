@@ -1,4 +1,0 @@
-2026-03-11 15:53:08,934 INFO run_id=run_20260311_135308 module=module5_harness worker= strategy= event=harness_start msg=module5_harness_start
-2026-03-11 15:53:10,776 INFO run_id= module=module2 worker= strategy= event=module2_complete msg=module2_profile_complete
-2026-03-11 15:53:12,257 INFO run_id= module=module2 worker= strategy= event=module2_complete msg=module2_profile_complete
-2026-03-11 15:53:20,345 INFO run_id= module=weightiz.cli.research worker= strategy= event=run_complete msg=run_complete

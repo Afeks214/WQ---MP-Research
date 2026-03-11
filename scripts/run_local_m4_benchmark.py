@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import run_research
+from weightiz.cli import run_research
 from weightiz.shared.io.hpc_market_profile_parity import compute_market_profile_features
 from weightiz.module5.strategy_engine import generate_strategy_specs
 
@@ -278,7 +278,7 @@ def _write_yaml_config(path: Path, workers: int, wf_splits_cap: int | None = Non
 
 def _run_research(config_path: Path, log_path: Path, env: dict[str, str]) -> tuple[Path, dict[str, Any]]:
     before = set((REPO_ROOT / "artifacts/zimtra_sweep").glob("run_*"))
-    cmd = [sys.executable, "run_research.py", "--config", str(config_path)]
+    cmd = [sys.executable, "-m", "weightiz.cli.run_research", "--config", str(config_path)]
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     t0 = time.perf_counter()

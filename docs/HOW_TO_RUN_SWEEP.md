@@ -8,7 +8,7 @@
 ## 2) Scout first (recommended)
 
 ```bash
-./.venv/bin/python run_research.py --config ./configs/sweep_scout_20x12.yaml
+./.venv/bin/python -m weightiz.cli.run_research --config ./configs/sweep_scout_20x12.yaml
 ```
 
 Use scout results (`robustness_leaderboard.csv` + `plateaus.json`) to identify stable regions.
@@ -17,7 +17,7 @@ Then launch the full 20x100 sweep constrained to winning plateaus.
 ## 3) Launch the full 20x100 sweep
 
 ```bash
-./.venv/bin/python run_research.py --config ./configs/sweep_20x100.yaml
+./.venv/bin/python -m weightiz.cli.run_research --config ./configs/sweep_20x100.yaml
 ```
 
 ## 4) Expected artifacts
@@ -95,7 +95,7 @@ Use the v2 orchestrator to auto-resolve symbols from `data/alpaca/clean`, genera
 Expected v2 outputs:
 - Inventory + manifest: `artifacts/sweep_v2/<UTC_TS>/data_inventory.csv` and `manifest.json`
 - Derived configs: `configs/_generated/sweep_auto_full_<UTC_TS>.yaml`, `sweep_auto_scout_<UTC_TS>.yaml`, `sweep_auto_focused_<UTC_TS>.yaml`
-- Run artifacts from `run_research.py` under `artifacts/module5_harness/run_...`
+- Run artifacts from `weightiz.cli.run_research` under `artifacts/module5_harness/run_...`
 
 ## 7) DQ artifacts (robustness hardening)
 

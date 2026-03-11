@@ -22,8 +22,8 @@ Canonical path enforced:
 
 ## Runtime Entry Points Analysis
 
-- `run_research.py` is active research entrypoint.
-- `sweep_runner.py` is fatal stub only:
+- `weightiz.cli.run_research` is active research entrypoint.
+- `weightiz.module5.worker_io_guard` is fatal stub only:
   - `run_zimtra_sweep(...)` raises `PARALLEL_ENGINE_FORBIDDEN`.
 
 ## Detected Violations (This Pass)
@@ -55,7 +55,7 @@ Canonical path enforced:
 
 ## Guards Inserted / Verified
 
-- `run_research.py` startup gate order includes:
+- `weightiz.cli.run_research` startup gate order includes:
   - architecture check
   - preflight validation
   - canonical harness dispatch

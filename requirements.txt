@@ -1,7 +1,0 @@
-numpy
-pandas
-pyarrow
-pyyaml
-pydantic>=2
-pytest
-scipy

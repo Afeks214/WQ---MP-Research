@@ -1,5 +1,8 @@
 run_dir: "./artifacts/server/compute_small/example_run"
 
 module6:
+  intake:
+    min_availability_ratio: 0.5
+    min_observed_sessions: 4
   export:
     output_subdir_name: "module6"

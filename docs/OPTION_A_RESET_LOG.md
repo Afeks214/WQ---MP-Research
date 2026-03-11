@@ -64,7 +64,7 @@
 - Files:
   - `docs/STAGE_AB_STRICT_REPORT.md`
 - Commands:
-  - `./.venv/bin/python run_research.py --config configs/_generated/stage_ab_breakout_STRICT.yaml`
+  - `./.venv/bin/python -m weightiz.cli.run_research --config configs/_generated/stage_ab_breakout_STRICT.yaml`
 - Result: FAIL (expected forensic capture)
   - Run aborted by systemic breaker on strict Module4 execution-price NaN path:
     - `RuntimeError|weightiz_module4_strategy_funnel.py:234:_execute_to_target`
@@ -145,7 +145,7 @@
 
 ## Option A Part 3 - Step 6 Strict Immutable Rerun (No Config Edits)
 - Command:
-  - `./.venv/bin/python run_research.py --config configs/_generated/stage_ab_breakout_STRICT.yaml`
+  - `./.venv/bin/python -m weightiz.cli.run_research --config configs/_generated/stage_ab_breakout_STRICT.yaml`
 - Result: PASS (run completed)
   - run dir: `artifacts/module5_harness/run_20260228_204134`
   - `aborted=false`

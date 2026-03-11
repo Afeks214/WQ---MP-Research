@@ -3,10 +3,10 @@
 ## 1) Run identifiers
 - Config used: [`configs/_generated/spec_mp_breakout_rejection_eval_small.yaml`](/Users/afekshusterman/Documents/New project/configs/_generated/spec_mp_breakout_rejection_eval_small.yaml)
 - Harness run dir: [`artifacts/module5_harness/run_20260227_121622`](/Users/afekshusterman/Documents/New project/artifacts/module5_harness/run_20260227_121622)
-- Sweep-v2 manifest: not used for this final run (direct `run_research.py` execution).
+- Sweep-v2 manifest: not used for this final run (direct `weightiz.cli.run_research` execution).
 - Command:
 ```bash
-./.venv/bin/python run_research.py --config ./configs/_generated/spec_mp_breakout_rejection_eval_small.yaml
+./.venv/bin/python -m weightiz.cli.run_research --config ./configs/_generated/spec_mp_breakout_rejection_eval_small.yaml
 ```
 
 ## 2) DQ summary
