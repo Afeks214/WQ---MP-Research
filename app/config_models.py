@@ -243,6 +243,37 @@ class HarnessConfigModel(BaseModel):
     failure_count_abort_threshold: int = 50
     payload_pickle_threshold_bytes: int = 131_072
     process_pool_candidate_chunk_size: int = 1
+    group_bound_execution_enabled: bool = True
+    group_dispatch_policy: str = "largest_first_stable"
+    group_max_in_flight_factor: int = 2
+    group_target_wall_time_sec: float = 30.0
+    group_max_result_payload_bytes: int = 4 * 1024 * 1024
+    group_max_memory_bytes: int = 0
+    group_min_candidates_per_chunk: int = 1
+    group_max_candidates_per_chunk_hard: int = 64
+    startup_default_candidate_loop_sec: float = 0.50
+    startup_default_result_payload_bytes: int = 32 * 1024
+    startup_default_candidate_incremental_bytes: int = 1 * 1024 * 1024
+    startup_default_module3_bytes: int = 512 * 1024 * 1024
+    scratch_mode: Literal["auto", "compact", "full"] = "auto"
+    strict_candidate_state_validation: Literal["compact_execution_view", "full_tensorstate"] = "compact_execution_view"
+    risk_breach_state_dump_enabled: bool = False
+    debug_full_state_payloads: bool = False
+    module3_output_mode: Literal["full_legacy", "signal_only"] = "full_legacy"
+    # Configured base-state transport mode:
+    # - auto: resolve to fork_cow only on linux+fork, otherwise fallback-only serialized_copy
+    # - fork_cow: require copy-on-write transport
+    # - explicit_shm: reserved and fail-closed until implemented
+    base_sharing_mode: Literal["auto", "fork_cow", "explicit_shm"] = "auto"
+    cow_private_ratio_threshold: float = 0.10
+    cow_probe_workers: int = 8
+    safety_margin_frac: float = 0.15
+    safety_margin_min_bytes: int = 8 * 1024 * 1024 * 1024
+    max_queue_bytes_frac: float = 0.02
+    max_result_buffer_bytes_frac: float = 0.05
+    throughput_minimal_observability: bool = False
+    health_check_interval: int = 50
+    progress_interval_seconds: int = 10
     test_fail_task_ids: list[str] = Field(default_factory=list)
     test_fail_ratio: float = 0.0
     cluster_corr_threshold: float = 0.90
@@ -292,6 +323,44 @@ class HarnessConfigModel(BaseModel):
             raise ValueError("harness.execution_extra_slippage_bps must be >=0")
         if int(self.execution_latency_bars) < 0:
             raise ValueError("harness.execution_latency_bars must be >=0")
+        if int(self.process_pool_candidate_chunk_size) < 1:
+            raise ValueError("harness.process_pool_candidate_chunk_size must be >=1")
+        if int(self.group_max_in_flight_factor) < 1:
+            raise ValueError("harness.group_max_in_flight_factor must be >=1")
+        if float(self.group_target_wall_time_sec) <= 0.0:
+            raise ValueError("harness.group_target_wall_time_sec must be >0")
+        if int(self.group_max_result_payload_bytes) < 1024:
+            raise ValueError("harness.group_max_result_payload_bytes must be >=1024")
+        if int(self.group_max_memory_bytes) < 0:
+            raise ValueError("harness.group_max_memory_bytes must be >=0")
+        if int(self.group_min_candidates_per_chunk) < 1:
+            raise ValueError("harness.group_min_candidates_per_chunk must be >=1")
+        if int(self.group_max_candidates_per_chunk_hard) < int(self.group_min_candidates_per_chunk):
+            raise ValueError("harness.group_max_candidates_per_chunk_hard must be >= harness.group_min_candidates_per_chunk")
+        if float(self.startup_default_candidate_loop_sec) <= 0.0:
+            raise ValueError("harness.startup_default_candidate_loop_sec must be >0")
+        if int(self.startup_default_result_payload_bytes) < 1024:
+            raise ValueError("harness.startup_default_result_payload_bytes must be >=1024")
+        if int(self.startup_default_candidate_incremental_bytes) < 1024:
+            raise ValueError("harness.startup_default_candidate_incremental_bytes must be >=1024")
+        if int(self.startup_default_module3_bytes) < 1024:
+            raise ValueError("harness.startup_default_module3_bytes must be >=1024")
+        if not (0.0 <= float(self.cow_private_ratio_threshold) <= 1.0):
+            raise ValueError("harness.cow_private_ratio_threshold must be in [0,1]")
+        if int(self.cow_probe_workers) < 1:
+            raise ValueError("harness.cow_probe_workers must be >=1")
+        if not (0.0 <= float(self.safety_margin_frac) <= 1.0):
+            raise ValueError("harness.safety_margin_frac must be in [0,1]")
+        if int(self.safety_margin_min_bytes) < 1024:
+            raise ValueError("harness.safety_margin_min_bytes must be >=1024")
+        if not (0.0 <= float(self.max_queue_bytes_frac) <= 1.0):
+            raise ValueError("harness.max_queue_bytes_frac must be in [0,1]")
+        if not (0.0 <= float(self.max_result_buffer_bytes_frac) <= 1.0):
+            raise ValueError("harness.max_result_buffer_bytes_frac must be in [0,1]")
+        if int(self.health_check_interval) < 1:
+            raise ValueError("harness.health_check_interval must be >=1")
+        if int(self.progress_interval_seconds) < 1:
+            raise ValueError("harness.progress_interval_seconds must be >=1")
         if int(self.regime_vol_window) < 2:
             raise ValueError("harness.regime_vol_window must be >=2")
         if int(self.regime_slope_window) < 2:

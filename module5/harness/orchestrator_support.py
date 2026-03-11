@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+import time
 from typing import Any, Callable
 
 import numpy as np
@@ -116,6 +117,7 @@ def finalize_run_outputs(
     tensor_json_path: Path,
     tensor_hash: str,
     run_status_path: Path,
+    group_runtime_stats_path: Path,
     deadletter_path: Path,
     self_audit_report_path: Path,
     compute_authority: dict[str, Any],
@@ -141,6 +143,7 @@ def finalize_run_outputs(
     dq_reject: str,
     harness_output_cls: type,
 ) -> Any:
+    artifact_t0 = time.perf_counter()
     eq_payloads = [r["equity_payload"] for r in ok_results if r.get("equity_payload") is not None]
     tr_payloads = [r["trade_payload"] for r in ok_results if r.get("trade_payload") is not None]
     micro_payloads = [r["micro_payload"] for r in ok_results if r.get("micro_payload") is not None]
@@ -336,8 +339,6 @@ def finalize_run_outputs(
         "feature_tensor_role": feature_tensor_role,
         "execution_topology": execution_topology_fn(execution_mode, use_process_pool),
     }
-    write_json_fn(run_status_path, run_status)
-
     manifest = {
         "run_id": run_id,
         "research_mode": str(getattr(harness_cfg, "research_mode", "standard")),
@@ -440,6 +441,7 @@ def finalize_run_outputs(
             "profile_rows_exported": int(len(profile_df)),
             "funnel_rows_exported": int(len(funnel_df)),
         },
+        "runtime_group_stats_path": str(group_runtime_stats_path),
         "dq": {
             "report_path": str(dq_report_path),
             "bar_flags_path": str(dq_bar_flags_path),
@@ -450,6 +452,10 @@ def finalize_run_outputs(
             "reject_count": int((dq_day_df.get("decision", pdx.Series(dtype=str)) == dq_reject).sum()) if dq_day_df.shape[0] > 0 else 0,
         },
     }
+    final_artifact_generation_sec = float(time.perf_counter() - artifact_t0)
+    run_status["final_artifact_generation_sec"] = float(final_artifact_generation_sec)
+    manifest["final_artifact_generation_sec"] = float(final_artifact_generation_sec)
+    write_json_fn(run_status_path, run_status)
     write_json_fn(manifest_path, manifest)
 
     artifact_paths = {
@@ -466,6 +472,7 @@ def finalize_run_outputs(
         "robustness_leaderboard_csv": str(robustness_csv_path),
         "plateaus": str(plateaus_path),
         "deadletter_tasks": str(deadletter_path),
+        "runtime_group_stats": str(group_runtime_stats_path),
         "dq_report_csv": str(dq_report_path),
         "dq_bar_flags_parquet": str(dq_bar_flags_path),
         "validation_report": str(validation_report_path),

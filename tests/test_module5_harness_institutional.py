@@ -750,6 +750,22 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
             self.assertFalse(bool(manifest.get("feature_tensor_role", {}).get("used_in_worker_compute", True)))
             self.assertTrue(bool(manifest.get("execution_topology", {}).get("grouped_post_m2_reuse_active", False)))
             self.assertTrue(bool(manifest.get("execution_topology", {}).get("grouped_post_m3_reuse_active", False)))
+            self.assertIn(
+                str(manifest.get("execution_topology", {}).get("base_sharing", {}).get("resolved_mode", "")),
+                {"fork_cow", "serialized_copy", ""},
+            )
+
+    def test_resolve_mp_context_uses_interpreter_default_on_linux(self) -> None:
+        fake_ctx = mock.Mock()
+        fake_ctx.get_start_method.return_value = "fork"
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WEIGHTIZ_MP_START_METHOD", None)
+            with mock.patch.object(h.sys, "platform", "linux"):
+                with mock.patch.object(h.mp, "get_context", return_value=fake_ctx) as mocked_get_context:
+                    ctx, method = h._resolve_mp_context()
+        mocked_get_context.assert_called_once_with()
+        self.assertIs(ctx, fake_ctx)
+        self.assertEqual(method, "fork")
 
     @unittest.skipIf(os.name == "nt", "process_pool fork context test is POSIX-only")
     def test_process_pool_executes_tasks_and_updates_status(self) -> None:
@@ -781,8 +797,12 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
                 {"fork", "spawn", "forkserver"},
             )
             self.assertTrue(bool(run_status.get("execution_topology", {}).get("process_pool_candidate_split", False)))
-            self.assertFalse(bool(run_status.get("execution_topology", {}).get("grouped_post_m2_reuse_active", True)))
-            self.assertFalse(bool(run_status.get("execution_topology", {}).get("grouped_post_m3_reuse_active", True)))
+            self.assertTrue(bool(run_status.get("execution_topology", {}).get("grouped_post_m2_reuse_active", False)))
+            self.assertTrue(bool(run_status.get("execution_topology", {}).get("grouped_post_m3_reuse_active", False)))
+            self.assertIn(
+                str(run_status.get("execution_topology", {}).get("base_sharing", {}).get("resolved_mode", "")),
+                {"fork_cow", "serialized_copy"},
+            )
 
     def test_single_candidate_group_reuses_stressed_clone(self) -> None:
         T, A = 12, 2
@@ -845,18 +865,6 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
         m3_cfgs = [Module3Config(block_minutes=5, min_block_valid_bars=1, min_block_valid_ratio=0.0)]
         m4_cfgs = [Module4Config()]
 
-        clone_counts = {"state": 0, "m3": 0}
-        orig_clone_state = h._clone_state
-        orig_clone_m3 = h._clone_m3
-
-        def wrap_clone_state(state: h.TensorState) -> h.TensorState:
-            clone_counts["state"] += 1
-            return orig_clone_state(state)
-
-        def wrap_clone_m3(m3: Module3Output) -> Module3Output:
-            clone_counts["m3"] += 1
-            return orig_clone_m3(m3)
-
         def wrap_m2(_state: h.TensorState, _cfg: Module2Config) -> None:
             return None
 
@@ -889,8 +897,6 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
             return _Res()
 
         with (
-            mock.patch.object(h, "_clone_state", side_effect=wrap_clone_state),
-            mock.patch.object(h, "_clone_m3", side_effect=wrap_clone_m3),
             mock.patch.object(h, "run_weightiz_profile_engine", side_effect=wrap_m2),
             mock.patch.object(h, "run_module3_structural_aggregation", side_effect=wrap_m3),
             mock.patch.object(h, "run_module4_signal_funnel", side_effect=wrap_m4),
@@ -910,8 +916,8 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(str(rows[0]["status"]), "ok")
-        self.assertEqual(clone_counts["state"], 1)
-        self.assertEqual(clone_counts["m3"], 0)
+        self.assertFalse(hasattr(h, "_clone_state"))
+        self.assertFalse(hasattr(h, "_clone_m3"))
 
     def test_bounded_active_worker_count_caps_pending_futures(self) -> None:
         self.assertEqual(h._bounded_active_worker_count(pending_count=910, effective_workers=7), 7)

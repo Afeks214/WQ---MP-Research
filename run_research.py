@@ -78,6 +78,7 @@ from app.data_resolution import (
     resolve_data_paths as _data_resolve_data_paths,
 )
 from app.stage_a_discovery import parse_stage_a_window_set
+from module5.harness.artifact_writers import write_json as _artifact_write_json
 
 
 def _require_pandas() -> Any:
@@ -662,10 +663,7 @@ def main() -> None:
             manifest_doc = json.loads(run_manifest_path.read_text(encoding="utf-8"))
             if isinstance(manifest_doc, dict):
                 manifest_doc["runtime_warning_count"] = int(runtime_warning_count)
-                run_manifest_path.write_text(
-                    json.dumps(manifest_doc, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
+                _artifact_write_json(run_manifest_path, manifest_doc)
         except Exception:
             pass
     if run_status_path.exists():
@@ -673,10 +671,7 @@ def main() -> None:
             status_doc = json.loads(run_status_path.read_text(encoding="utf-8"))
             if isinstance(status_doc, dict):
                 status_doc["runtime_warning_count"] = int(runtime_warning_count)
-                run_status_path.write_text(
-                    json.dumps(status_doc, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
+                _artifact_write_json(run_status_path, status_doc)
         except Exception:
             pass
 
@@ -693,8 +688,7 @@ def main() -> None:
         )
         research_report["config_path"] = str(config_path)
         research_report["plan_path"] = str(plan_path) if plan_path.exists() else None
-        with research_report_path.open("w", encoding="utf-8") as f:
-            json.dump(research_report, f, ensure_ascii=False, indent=2)
+        _artifact_write_json(research_report_path, research_report)
 
     report_root = Path(harness_cfg.report_dir).resolve()
     artifacts_root = report_root.parent if report_root.name == "module5_harness" else report_root
@@ -733,8 +727,7 @@ def main() -> None:
         summary["discovery_included_candidates"] = int(research_report.get("discovery_included_candidates", 0))
         summary["standard_reject_counts"] = research_report.get("standard_reject_counts", {})
 
-    with (run_dir / "run_summary.json").open("w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+    _artifact_write_json(run_dir / "run_summary.json", summary)
 
     log_event(logger, "INFO", "run_complete", event_type="run_complete")
 

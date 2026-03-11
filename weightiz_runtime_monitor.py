@@ -43,6 +43,7 @@ class RuntimeMonitor:
         ledger_path: Path,
         queue_backlog: int,
         memory_status: dict[str, Any],
+        extra_metrics: dict[str, Any] | None = None,
         require_ledger_exists: bool = False,
     ) -> None:
         assert_float64("runtime_monitor.tensor", np.asarray(tensor))
@@ -55,13 +56,14 @@ class RuntimeMonitor:
                 ledger_status=False,
                 memory_status=memory_status,
                 queue_backlog=int(queue_backlog),
+                extra_metrics=extra_metrics,
             )
             raise RuntimeError("RUNTIME_HEALTH_TEST_FAILED")
 
         has_nan = bool(np.isnan(t).any())
         tensor_valid = (not has_nan)
         workers_active = int(worker_status.get("active", 0))
-        workers_expected = int(self.expected_worker_count)
+        workers_expected = int(worker_status.get("expected", self.expected_worker_count))
         worker_ok = 0 <= workers_active <= max(1, workers_expected)
         ledger_exists = bool(Path(ledger_path).exists())
         ledger_ok = ledger_exists if require_ledger_exists else True
@@ -82,6 +84,7 @@ class RuntimeMonitor:
             },
             memory_status=memory_status,
             queue_backlog=int(queue_backlog),
+            extra_metrics=extra_metrics,
         )
         self._last_checked = int(strategies_completed)
 
@@ -97,6 +100,7 @@ class RuntimeMonitor:
         ledger_status: dict[str, Any] | bool,
         memory_status: dict[str, Any],
         queue_backlog: int,
+        extra_metrics: dict[str, Any] | None,
     ) -> None:
         row = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -109,5 +113,7 @@ class RuntimeMonitor:
             "memory_status": memory_status,
             "queue_backlog": int(queue_backlog),
         }
+        if extra_metrics:
+            row.update(dict(extra_metrics))
         with self.health_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")

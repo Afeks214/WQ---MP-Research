@@ -1416,7 +1416,7 @@ def run_module4_signal_funnel(
         profile_regime_tensor=profile_regime_tensor,
         tradable_mask=np.swapaxes(np.asarray(tradable_mask, dtype=bool), 0, 1),
         phase_code=np.asarray(state.phase, dtype=np.int64),
-        asset_enabled_mask=np.ones(A, dtype=bool),
+        asset_enabled_mask=np.asarray(getattr(state, "asset_enabled_mask", np.ones(A, dtype=bool)), dtype=bool),
         source_time_index_at=source_time_index_at,
         fail_on_non_finite_input=bool(cfg4.fail_on_non_finite_input),
     )

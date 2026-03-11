@@ -5,19 +5,19 @@ Weightiz Institutional Engine - Module 5 Part 2 (Validation Harness)
 Validation harness and research orchestrator:
 - Pandas IO boundary for minute OHLCV ingestion/alignment.
 - Leakage-safe WF/CPCV split generation with purge+embargo.
-- Adversarial stress perturbations on cloned tensor states.
+- Adversarial stress perturbations on per-group stressed state views.
 - Deterministic orchestration of stressed state -> Module 2 -> Module 3 -> Module 4.
 - Close-to-close daily return compression for candidate equity (overnight PnL preserved).
 - Artifact export and statistical verdict wiring to Module 5 Part 1.
 
 Important truth surfaces:
-- Worker compute authority is the stressed cloned TensorState path.
+- Worker compute authority is the stressed split-masked state path.
 - The published feature tensor and shared-memory store are diagnostics/cache only.
-- Process-pool candidate splitting disables cross-candidate grouped reuse for post-M2/post-M3 caches.
+- Group-bound execution reuses post-M2/post-M3 state within one semantic group task.
 
 Architecture map:
 1) Split construction: `_generate_wf_splits`, `_generate_cpcv_splits`.
-2) Task dispatch: `_build_group_tasks`, `_safe_execute_task`, process pool/serial loop in `run_weightiz_harness`.
+2) Task dispatch: group-bound semantic task planning, `_safe_execute_task`, process pool/serial loop in `run_weightiz_harness`.
 3) Candidate aggregation: `_aggregate_candidate_baseline_matrix` + `_build_candidate_artifacts`.
 4) Artifact writing: `run_weightiz_harness` (run-level) + `_build_candidate_artifacts` (candidate-level).
 5) Robustness scoring: `_build_candidate_artifacts` using `ROBUSTNESS_CAPS`.
@@ -26,12 +26,12 @@ Architecture map:
 
 from __future__ import annotations
 
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import dataclasses
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 import atexit
-import copy
 import hashlib
 import itertools
 import json
@@ -92,8 +92,10 @@ from module5.harness.candidate_artifacts import (
     summarize_fold_stats as _candidate_summarize_fold_stats,
 )
 from module5.harness.evaluation_path import (
+    assert_artifact_dependency_contract as _eval_assert_artifact_dependency_contract,
     asset_pnl_by_symbol_from_state as _eval_asset_pnl_by_symbol_from_state,
     benchmark_daily_returns as _eval_benchmark_daily_returns,
+    canonical_artifact_dependency_matrix as _eval_canonical_artifact_dependency_matrix,
     candidate_daily_returns_close_to_close as _eval_candidate_daily_returns_close_to_close,
     collect_funnel_payload as _eval_collect_funnel_payload,
     collect_micro_diagnostics_payload as _eval_collect_micro_diagnostics_payload,
@@ -104,6 +106,16 @@ from module5.harness.evaluation_path import (
     select_micro_rows as _eval_select_micro_rows,
     structural_weight_from_regime as _eval_structural_weight_from_regime,
     trade_log_payload as _eval_trade_log_payload,
+    validate_canonical_artifact_dependencies as _eval_validate_canonical_artifact_dependencies,
+)
+from module5.harness.group_executor import (
+    GroupExecutionResult,
+    GroupExecutionRuntimeStats,
+    GroupExecutionTask,
+    build_base_group_execution_tasks as _group_build_base_execution_tasks,
+    build_group_execution_tasks as _group_build_execution_tasks,
+    chunk_group_execution_task as _group_chunk_execution_task,
+    order_group_execution_tasks as _group_order_execution_tasks,
 )
 from module5.harness.failure_policy import (
     baseline_failure_reasons as _failure_baseline_failure_reasons,
@@ -120,10 +132,26 @@ from module5.harness.failure_policy import (
     should_abort_systemic as _failure_should_abort_systemic,
     update_failure_tracker as _failure_update_failure_tracker,
 )
+from module5.harness.memory_accounting import (
+    build_memory_accounting_estimate as _mem_build_memory_accounting_estimate,
+    chunk_policy_memory_cap as _mem_chunk_policy_memory_cap,
+    estimate_queue_bytes as _mem_estimate_queue_bytes,
+    estimate_result_buffer_bytes as _mem_estimate_result_buffer_bytes,
+    resolve_base_sharing_mode as _mem_resolve_base_sharing_mode,
+)
 from module5.harness.runtime_truth import (
     build_compute_authority as _truth_build_compute_authority,
     build_execution_topology as _truth_build_execution_topology,
     build_feature_tensor_role as _truth_build_feature_tensor_role,
+)
+from module5.harness.state_overlay import (
+    BaseTensorState,
+    CandidateScratch,
+    CombinedStateView,
+    FeatureOverlay,
+    MarketOverlay,
+    measure_module3_output_bytes,
+    validate_candidate_execution_view,
 )
 from module5.harness.orchestrator_support import (
     finalize_run_outputs as _orchestrator_finalize_run_outputs,
@@ -294,6 +322,35 @@ class Module5HarnessConfig:
     failure_count_abort_threshold: int = 50
     payload_pickle_threshold_bytes: int = 131_072
     process_pool_candidate_chunk_size: int = 1
+    group_bound_execution_enabled: bool = True
+    group_dispatch_policy: str = "largest_first_stable"
+    group_max_in_flight_factor: int = 2
+    group_target_wall_time_sec: float = 30.0
+    group_max_result_payload_bytes: int = 4 * 1024 * 1024
+    group_max_memory_bytes: int = 0
+    group_min_candidates_per_chunk: int = 1
+    group_max_candidates_per_chunk_hard: int = 64
+    startup_default_candidate_loop_sec: float = 0.50
+    startup_default_result_payload_bytes: int = 32 * 1024
+    startup_default_candidate_incremental_bytes: int = 1 * 1024 * 1024
+    startup_default_module3_bytes: int = 512 * 1024 * 1024
+    scratch_mode: str = "auto"
+    strict_candidate_state_validation: str = "compact_execution_view"
+    risk_breach_state_dump_enabled: bool = False
+    debug_full_state_payloads: bool = False
+    module3_output_mode: str = "full_legacy"
+    # Configured base-state transport mode:
+    # - auto: resolve to fork_cow only on linux+fork, otherwise fallback-only serialized_copy
+    # - fork_cow: require copy-on-write transport
+    # - explicit_shm: reserved and fail-closed until implemented
+    base_sharing_mode: str = "auto"
+    cow_private_ratio_threshold: float = 0.10
+    cow_probe_workers: int = 8
+    safety_margin_frac: float = 0.15
+    safety_margin_min_bytes: int = 8 * 1024**3
+    max_queue_bytes_frac: float = 0.02
+    max_result_buffer_bytes_frac: float = 0.05
+    throughput_minimal_observability: bool = False
     health_check_interval: int = 50
     progress_interval_seconds: int = 10
     # Test-only deterministic fault hooks.
@@ -368,14 +425,7 @@ class HarnessOutput:
     run_manifest: dict[str, object]
 
 
-@dataclass(frozen=True)
-class _GroupTask:
-    group_id: str
-    split_idx: int
-    scenario_idx: int
-    m2_idx: int
-    m3_idx: int
-    candidate_indices: tuple[int, ...]
+_GroupTask = GroupExecutionTask
 
 
 @dataclass(frozen=True)
@@ -578,15 +628,15 @@ def _resolve_mp_context() -> tuple[Any, str]:
     Deterministic process start policy:
     - honor WEIGHTIZ_MP_START_METHOD when explicitly set to spawn|fork|forkserver
     - default to fork on macOS to avoid large spawn bootstrap stalls
-    - otherwise use interpreter default
+    - otherwise use interpreter default for the active Python/runtime
     """
     forced = str(os.environ.get("WEIGHTIZ_MP_START_METHOD", "")).strip().lower()
     if forced in {"spawn", "fork", "forkserver"}:
         return mp.get_context(forced), forced
     if sys.platform == "darwin":
         return mp.get_context("fork"), "fork"
-    default_method = str(mp.get_start_method(allow_none=True) or "spawn")
-    return mp.get_context(default_method), default_method
+    default_ctx = mp.get_context()
+    return default_ctx, str(default_ctx.get_start_method())
 
 
 def _safe_execute_task(
@@ -611,7 +661,7 @@ def _safe_execute_task(
 
 
 def _init_worker_context(
-    base_state: TensorState,
+    base_state: Any,
     candidates: list[CandidateSpec],
     splits: list[SplitSpec],
     scenarios: list[StressScenario],
@@ -657,6 +707,7 @@ def _init_worker_context(
         "feature_registry": feature_registry,
         "feature_handles": feature_handles,
         "run_id": str(run_id),
+        "base_sharing_mode": str(getattr(harness_cfg, "base_sharing_mode", "auto")),
     }
 
 
@@ -700,35 +751,6 @@ def _recompute_module2_on_stressed_state(state: TensorState, cfg: Module2Config)
         )
     assert_float64("harness.stressed_module2.profile_stats", np.asarray(state.profile_stats, dtype=np.float64))
     assert_float64("harness.stressed_module2.scores", np.asarray(state.scores, dtype=np.float64))
-
-
-def _clone_state(state: TensorState) -> TensorState:
-    # Deep copy preserves strict immutability of base_state across workers/tasks.
-    return copy.deepcopy(state)
-
-
-def _clone_m3(m3: Module3Output) -> Module3Output:
-    return Module3Output(
-        structure_tensor=m3.structure_tensor.copy(),
-        context_tensor=m3.context_tensor.copy(),
-        profile_fingerprint_tensor=m3.profile_fingerprint_tensor.copy(),
-        profile_regime_tensor=m3.profile_regime_tensor.copy(),
-        context_valid_atw=None if m3.context_valid_atw is None else m3.context_valid_atw.copy(),
-        context_source_index_atw=(
-            None if m3.context_source_index_atw is None else m3.context_source_index_atw.copy()
-        ),
-        block_id_t=m3.block_id_t.copy(),
-        block_seq_t=m3.block_seq_t.copy(),
-        block_end_flag_t=m3.block_end_flag_t.copy(),
-        block_start_t_index_t=m3.block_start_t_index_t.copy(),
-        block_end_t_index_t=m3.block_end_t_index_t.copy(),
-        block_features_tak=m3.block_features_tak.copy(),
-        block_valid_ta=m3.block_valid_ta.copy(),
-        context_tac=m3.context_tac.copy(),
-        context_valid_ta=m3.context_valid_ta.copy(),
-        context_source_t_index_ta=m3.context_source_t_index_ta.copy(),
-        ib_defined_ta=None if m3.ib_defined_ta is None else m3.ib_defined_ta.copy(),
-    )
 
 
 def _tensor_nbytes_total(obj: Any, _seen: set[int] | None = None) -> int:
@@ -784,6 +806,36 @@ def _estimate_state_bytes(base_state: TensorState) -> int:
     state_bytes = max(1, _tensor_nbytes_total(base_state))
     overhead = 512 * 1024 * 1024
     return int(state_bytes * 2 + overhead)
+
+
+def _resolve_candidate_scratch_mode(harness_cfg: Module5HarnessConfig) -> str:
+    mode = str(harness_cfg.scratch_mode).strip().lower()
+    if mode == "auto":
+        if bool(harness_cfg.risk_breach_state_dump_enabled) or bool(harness_cfg.debug_full_state_payloads):
+            return "full"
+        if str(harness_cfg.strict_candidate_state_validation).strip().lower() == "full_tensorstate":
+            return "full"
+        return "compact"
+    if mode not in {"compact", "full"}:
+        raise RuntimeError(f"Unsupported candidate scratch mode={harness_cfg.scratch_mode!r}")
+    return mode
+
+
+def _estimate_group_runtime_bytes(
+    base_state: TensorState | BaseTensorState,
+    harness_cfg: Module5HarnessConfig,
+) -> tuple[int, int, int, int]:
+    base = base_state if isinstance(base_state, BaseTensorState) else BaseTensorState.from_tensor_state(base_state)
+    market_overlay = MarketOverlay.from_base(base)
+    feature_overlay = FeatureOverlay.allocate(base, module3_output_mode=str(harness_cfg.module3_output_mode))
+    scratch = CandidateScratch.allocate(base, _resolve_candidate_scratch_mode(harness_cfg))
+    module3_bytes = int(max(1, int(harness_cfg.startup_default_module3_bytes)))
+    return (
+        int(market_overlay.nbytes),
+        int(feature_overlay.feature_bytes),
+        int(module3_bytes),
+        int(scratch.nbytes),
+    )
 
 
 
@@ -1077,14 +1129,11 @@ def _split_group_tasks_by_candidate(
     chunk_size: int = 1,
 ) -> list[_GroupTask]:
     """
-    Deterministic process-pool chunking:
-    split grouped candidate batches into fixed-size chunks for simpler payloads,
-    earlier checkpoints, and stronger failure isolation.
+    Legacy candidate-fanout helper retained for compatibility and focused tests.
 
-    Important truth surface:
-    when process-pool mode uses candidate-sized chunks, cross-candidate reuse of
-    the stressed post-M2/post-M3 cache is not active for that execution mode.
-    Serial mode retains grouped reuse inside a _GroupTask.
+    It is not the authoritative V2 hot path when group-bound execution is
+    enabled. The live V2 runtime uses semantic base groups plus deterministic
+    group-local chunking in module5.harness.group_executor.
     """
     n = int(max(1, chunk_size))
     out: list[_GroupTask] = []
@@ -1106,6 +1155,154 @@ def _split_group_tasks_by_candidate(
                 )
             )
     return out
+
+
+def _build_base_group_execution_tasks(
+    candidates: list[CandidateSpec],
+    splits: list[SplitSpec],
+    scenarios: list[StressScenario],
+) -> list[_GroupTask]:
+    return [
+        _GroupTask(
+            group_id=str(task.group_id),
+            split_idx=int(task.split_idx),
+            scenario_idx=int(task.scenario_idx),
+            m2_idx=int(task.m2_idx),
+            m3_idx=int(task.m3_idx),
+            candidate_indices=tuple(int(x) for x in task.candidate_indices),
+            estimated_group_cost=int(task.estimated_group_cost),
+            chunk_candidate_cap=int(task.chunk_candidate_cap),
+            chunk_start=int(task.chunk_start),
+            chunk_end=int(task.chunk_end),
+            first_candidate_id=str(getattr(task, "first_candidate_id", "")),
+            module3_group_bytes_estimated=int(getattr(task, "module3_group_bytes_estimated", 0)),
+        )
+        for task in _group_build_base_execution_tasks(candidates, splits, scenarios)
+    ]
+
+
+def _build_group_execution_tasks(
+    candidates: list[CandidateSpec],
+    splits: list[SplitSpec],
+    scenarios: list[StressScenario],
+    harness_cfg: Module5HarnessConfig,
+    *,
+    group_fixed_bytes: int,
+    module3_group_bytes_estimated: int,
+    max_group_memory_bytes: int | None = None,
+    candidate_loop_sec_per_candidate_p95: float | None = None,
+    result_payload_bytes_per_candidate_p95: int | None = None,
+    candidate_incremental_bytes_p95: int | None = None,
+) -> list[_GroupTask]:
+    return [
+        _GroupTask(
+            group_id=str(task.group_id),
+            split_idx=int(task.split_idx),
+            scenario_idx=int(task.scenario_idx),
+            m2_idx=int(task.m2_idx),
+            m3_idx=int(task.m3_idx),
+            candidate_indices=tuple(int(x) for x in task.candidate_indices),
+            estimated_group_cost=int(task.estimated_group_cost),
+            chunk_candidate_cap=int(task.chunk_candidate_cap),
+            chunk_start=int(task.chunk_start),
+            chunk_end=int(task.chunk_end),
+            first_candidate_id=str(getattr(task, "first_candidate_id", "")),
+            module3_group_bytes_estimated=int(getattr(task, "module3_group_bytes_estimated", 0)),
+        )
+        for task in _group_build_execution_tasks(
+            candidates,
+            splits,
+            scenarios,
+            dispatch_policy=str(harness_cfg.group_dispatch_policy),
+            target_group_wall_time_sec=float(harness_cfg.group_target_wall_time_sec),
+            max_result_payload_bytes=int(harness_cfg.group_max_result_payload_bytes),
+            max_group_memory_bytes=int(
+                max(
+                    1,
+                    max_group_memory_bytes
+                    if max_group_memory_bytes is not None
+                    else (harness_cfg.group_max_memory_bytes or group_fixed_bytes * max(2, int(harness_cfg.parallel_workers))),
+                )
+            ),
+            min_candidates_per_chunk=int(harness_cfg.group_min_candidates_per_chunk),
+            max_candidates_per_chunk_hard=int(max(1, harness_cfg.group_max_candidates_per_chunk_hard)),
+            startup_default_candidate_loop_sec=float(harness_cfg.startup_default_candidate_loop_sec),
+            startup_default_result_payload_bytes=int(harness_cfg.startup_default_result_payload_bytes),
+            startup_default_candidate_incremental_bytes=int(harness_cfg.startup_default_candidate_incremental_bytes),
+            group_fixed_bytes=int(group_fixed_bytes),
+            module3_group_bytes_estimated=int(module3_group_bytes_estimated),
+            candidate_loop_sec_per_candidate_p95=candidate_loop_sec_per_candidate_p95,
+            result_payload_bytes_per_candidate_p95=result_payload_bytes_per_candidate_p95,
+            candidate_incremental_bytes_p95=candidate_incremental_bytes_p95,
+        )
+    ]
+
+
+def _chunk_group_execution_task(
+    base_group: _GroupTask,
+    candidates: list[CandidateSpec],
+    harness_cfg: Module5HarnessConfig,
+    *,
+    group_fixed_bytes: int,
+    module3_group_bytes_estimated: int,
+    max_group_memory_bytes: int,
+    candidate_loop_sec_per_candidate_p95: float | None = None,
+    result_payload_bytes_per_candidate_p95: int | None = None,
+    candidate_incremental_bytes_p95: int | None = None,
+) -> list[_GroupTask]:
+    return [
+        _GroupTask(
+            group_id=str(task.group_id),
+            split_idx=int(task.split_idx),
+            scenario_idx=int(task.scenario_idx),
+            m2_idx=int(task.m2_idx),
+            m3_idx=int(task.m3_idx),
+            candidate_indices=tuple(int(x) for x in task.candidate_indices),
+            estimated_group_cost=int(task.estimated_group_cost),
+            chunk_candidate_cap=int(task.chunk_candidate_cap),
+            chunk_start=int(task.chunk_start),
+            chunk_end=int(task.chunk_end),
+            first_candidate_id=str(getattr(task, "first_candidate_id", "")),
+            module3_group_bytes_estimated=int(getattr(task, "module3_group_bytes_estimated", 0)),
+        )
+        for task in _group_chunk_execution_task(
+            base_group,
+            candidates,
+            module3_group_bytes_estimated=int(module3_group_bytes_estimated),
+            target_group_wall_time_sec=float(harness_cfg.group_target_wall_time_sec),
+            max_result_payload_bytes=int(harness_cfg.group_max_result_payload_bytes),
+            max_group_memory_bytes=int(max(1, max_group_memory_bytes)),
+            min_candidates_per_chunk=int(harness_cfg.group_min_candidates_per_chunk),
+            max_candidates_per_chunk_hard=int(max(1, harness_cfg.group_max_candidates_per_chunk_hard)),
+            startup_default_candidate_loop_sec=float(harness_cfg.startup_default_candidate_loop_sec),
+            startup_default_result_payload_bytes=int(harness_cfg.startup_default_result_payload_bytes),
+            startup_default_candidate_incremental_bytes=int(harness_cfg.startup_default_candidate_incremental_bytes),
+            group_fixed_bytes=int(group_fixed_bytes),
+            candidate_loop_sec_per_candidate_p95=candidate_loop_sec_per_candidate_p95,
+            result_payload_bytes_per_candidate_p95=result_payload_bytes_per_candidate_p95,
+            candidate_incremental_bytes_p95=candidate_incremental_bytes_p95,
+        )
+    ]
+
+
+def _order_group_execution_tasks(group_tasks: list[_GroupTask], dispatch_policy: str) -> list[_GroupTask]:
+    return [
+        _GroupTask(
+            group_id=str(task.group_id),
+            split_idx=int(task.split_idx),
+            scenario_idx=int(task.scenario_idx),
+            m2_idx=int(task.m2_idx),
+            m3_idx=int(task.m3_idx),
+            candidate_indices=tuple(int(x) for x in task.candidate_indices),
+            estimated_group_cost=int(task.estimated_group_cost),
+            chunk_candidate_cap=int(task.chunk_candidate_cap),
+            chunk_start=int(task.chunk_start),
+            chunk_end=int(task.chunk_end),
+            first_candidate_id=str(getattr(task, "first_candidate_id", "")),
+            module3_group_bytes_estimated=int(getattr(task, "module3_group_bytes_estimated", 0)),
+        )
+        for task in _group_order_execution_tasks(group_tasks, dispatch_policy=str(dispatch_policy))
+    ]
 
 
 def _equity_curve_payload(
@@ -1211,9 +1408,45 @@ def _collect_funnel_payload(
     )
 
 
+def _extract_group_runtime_stats(rows: list[dict[str, Any]]) -> GroupExecutionRuntimeStats | None:
+    if not rows:
+        return None
+    raw = rows[0].get("group_runtime_stats")
+    if not isinstance(raw, dict):
+        return None
+    return GroupExecutionRuntimeStats(
+        split_stress_sec=float(raw.get("split_stress_sec", 0.0)),
+        module2_sec=float(raw.get("module2_sec", 0.0)),
+        module3_sec=float(raw.get("module3_sec", 0.0)),
+        candidate_loop_sec=float(raw.get("candidate_loop_sec", 0.0)),
+        candidate_count=int(raw.get("candidate_count", len(rows))),
+        market_overlay_bytes=int(raw.get("market_overlay_bytes", 0)),
+        feature_overlay_bytes=int(raw.get("feature_overlay_bytes", 0)),
+        module3_group_bytes_estimated=int(raw.get("module3_group_bytes_estimated", raw.get("module3_bytes", 0))),
+        module3_group_bytes_realized=int(raw.get("module3_group_bytes_realized", raw.get("module3_bytes", 0))),
+        module3_bytes=int(raw.get("module3_bytes", raw.get("module3_group_bytes_realized", 0))),
+        candidate_scratch_bytes=int(raw.get("candidate_scratch_bytes", 0)),
+        result_payload_bytes=int(raw.get("result_payload_bytes", 0)),
+    )
+
+
+def _rolling_p95_int(samples: list[int]) -> int | None:
+    if not samples:
+        return None
+    arr = np.asarray(samples, dtype=np.int64)
+    return int(np.quantile(arr, 0.95, method="higher"))
+
+
+def _rolling_p95_float(samples: list[float]) -> float | None:
+    if not samples:
+        return None
+    arr = np.asarray(samples, dtype=np.float64)
+    return float(np.quantile(arr, 0.95, method="higher"))
+
+
 def _run_group_task(
     group: _GroupTask,
-    base_state: TensorState,
+    base_state: Any,
     candidates: list[CandidateSpec],
     splits: list[SplitSpec],
     scenarios: list[StressScenario],
@@ -1225,44 +1458,78 @@ def _run_group_task(
     split = splits[group.split_idx]
     scenario = scenarios[group.scenario_idx]
 
+    base = base_state if isinstance(base_state, BaseTensorState) else BaseTensorState.from_tensor_state(base_state)
     group_seed = _seed_for_task(
         harness_cfg.seed,
-        group.group_id,
         split.split_id,
         scenario.scenario_id,
+        str(group.m2_idx),
+        str(group.m3_idx),
     )
     rng = np.random.default_rng(group_seed)
-
-    # Build the stressed post-M2/post-M3 cache for this concrete group unit.
-    # Candidate execution authority is the stressed cloned TensorState, not the
-    # shared diagnostics feature tensor published by the parent process.
-    cached_state = _clone_state(base_state)
-    active_t = _apply_split_domain_mask(cached_state, split)
-
-    _apply_missing_bursts(cached_state, active_t, scenario, rng)
-    _apply_jitter(cached_state, active_t, scenario, rng)
-    _recompute_bar_valid_inplace(cached_state)
-    _set_placeholders_from_bar_valid(cached_state)
-    _assert_placeholder_consistency(cached_state)
-
-    if harness_cfg.fail_on_non_finite:
-        _assert_active_domain_ohlc(cached_state, active_t)
-        _validate_loaded_market_slice_active_domain(cached_state, active_t)
-
-    _recompute_module2_on_stressed_state(cached_state, m2_configs[group.m2_idx])
-    post_m2_reasons = _apply_post_m2_invariants(cached_state, active_t)
-    m3_out_cached = run_module3_structural_aggregation(cached_state, m3_configs[group.m3_idx])
-    post_m3_reasons = _apply_post_m3_invariants(m3_out_cached)
-
     outputs: list[dict[str, Any]] = []
+    runtime_stats = GroupExecutionRuntimeStats()
+    market_overlay = MarketOverlay.from_base(base)
+    feature_overlay = FeatureOverlay.allocate(base, module3_output_mode=str(harness_cfg.module3_output_mode))
+    scratch = CandidateScratch.allocate(base, _resolve_candidate_scratch_mode(harness_cfg))
+    group_view = CombinedStateView(base, market_overlay, feature_overlay, CandidateScratch.template_from_base(base))
 
-    single_candidate_task = len(group.candidate_indices) == 1
+    t_group_build = time.perf_counter()
+    active_t = _apply_split_domain_mask(group_view, split)
+    _apply_missing_bursts(group_view, active_t, scenario, rng)
+    _apply_jitter(group_view, active_t, scenario, rng)
+    _recompute_bar_valid_inplace(group_view)
+    _set_placeholders_from_bar_valid(group_view)
+    _assert_placeholder_consistency(group_view)
+    if harness_cfg.fail_on_non_finite:
+        _assert_active_domain_ohlc(group_view, active_t)
+        _validate_loaded_market_slice_active_domain(group_view, active_t)
+    split_stress_sec = float(time.perf_counter() - t_group_build)
+
+    t_module2 = time.perf_counter()
+    _recompute_module2_on_stressed_state(group_view, m2_configs[group.m2_idx])
+    post_m2_reasons = _apply_post_m2_invariants(group_view, active_t)
+    module2_sec = float(time.perf_counter() - t_module2)
+
+    t_module3 = time.perf_counter()
+    m3_out_cached = run_module3_structural_aggregation(group_view, m3_configs[group.m3_idx])
+    post_m3_reasons = _apply_post_m3_invariants(m3_out_cached)
+    group_pre_m4_reasons = _apply_pre_m4_invariants(group_view, m3_out_cached)
+    feature_overlay.module3_output = m3_out_cached
+    feature_overlay.group_invariant_reason_codes = tuple(
+        sorted(set(post_m2_reasons + post_m3_reasons + group_pre_m4_reasons))
+    )
+    feature_overlay.module3_group_bytes = int(measure_module3_output_bytes(m3_out_cached))
+    feature_overlay.freeze_for_candidate_loop()
+    module3_sec = float(time.perf_counter() - t_module3)
+
+    dqs_src = getattr(base, "dqs_day_ta", None)
+    if dqs_src is None:
+        dqs_mat = np.ones((base.cfg.T, base.cfg.A), dtype=np.float64)
+    else:
+        dqs_mat = np.asarray(dqs_src, dtype=np.float64)
+    if dqs_mat.shape != (base.cfg.T, base.cfg.A):
+        raise RuntimeError(f"dqs_day_ta shape mismatch: got {dqs_mat.shape}, expected {(base.cfg.T, base.cfg.A)}")
+    dqs_scope = dqs_mat[np.asarray(market_overlay.bar_valid, dtype=bool)]
+    if dqs_scope.size <= 0:
+        dqs_scope = np.asarray([1.0], dtype=np.float64)
+    dqs_min = float(np.min(dqs_scope))
+    dqs_median = float(np.median(dqs_scope))
+    candidate_loop_t0 = time.perf_counter()
+    total_payload_bytes = 0
 
     for ci in group.candidate_indices:
         c = candidates[ci]
         task_id = f"{c.candidate_id}|{split.split_id}|{scenario.scenario_id}"
-        task_seed = _seed_for_task(group_seed, task_id)
-        st: TensorState | None = None
+        task_seed = _seed_for_task(group_seed, c.candidate_id, str(c.m4_idx))
+        scratch.reset_from_base(base)
+        st: CombinedStateView | None = CombinedStateView(
+            base,
+            market_overlay,
+            feature_overlay,
+            scratch,
+            asset_enabled_mask=np.asarray(c.enabled_assets_mask, dtype=bool),
+        )
         try:
             if task_id in set(harness_cfg.test_fail_task_ids):
                 raise RuntimeError("InjectedTaskFailure: task_id match")
@@ -1271,27 +1538,8 @@ def _run_group_task(
                 u = int.from_bytes(h[:8], "little", signed=False) / float(2**64 - 1)
                 if u < float(harness_cfg.test_fail_ratio):
                     raise RuntimeError("InjectedTaskFailure: ratio")
-
-            if single_candidate_task:
-                # Process-pool execution already split this group to one
-                # candidate, so reusing the stressed clone avoids a second
-                # full-state deep copy without weakening isolation.
-                st = cached_state
-                m3c = m3_out_cached
-            else:
-                st = _clone_state(cached_state)
-                m3c = _clone_m3(m3_out_cached)
-            _apply_enabled_assets(st, m3c, c.enabled_assets_mask)
-            pre_m4_reasons = _apply_pre_m4_invariants(st, m3c)
-            quality_reason_codes = sorted(set(post_m2_reasons + post_m3_reasons + pre_m4_reasons))
-            dqs_mat = np.asarray(getattr(st, "dqs_day_ta", np.ones((st.cfg.T, st.cfg.A), dtype=np.float64)), dtype=np.float64)
-            if dqs_mat.shape != (st.cfg.T, st.cfg.A):
-                raise RuntimeError(f"dqs_day_ta shape mismatch: got {dqs_mat.shape}, expected {(st.cfg.T, st.cfg.A)}")
-            dqs_scope = dqs_mat[np.asarray(st.bar_valid, dtype=bool)]
-            if dqs_scope.size <= 0:
-                dqs_scope = np.asarray([1.0], dtype=np.float64)
-            dqs_min = float(np.min(dqs_scope))
-            dqs_median = float(np.median(dqs_scope))
+            m3c = m3_out_cached
+            quality_reason_codes = sorted(set(feature_overlay.group_invariant_reason_codes))
             if dqs_min < 1.0:
                 quality_reason_codes = sorted(set(quality_reason_codes + ["DQ_DEGRADED_INPUT"]))
             if dqs_min <= 0.0:
@@ -1362,7 +1610,10 @@ def _run_group_task(
                 risk_cfg=RiskConfig(),
             )
             m4_out = _materialize_risk_outputs_into_state(st, m4_sig, risk_res_exec)
-            validate_state_hard(st)
+            if _resolve_candidate_scratch_mode(harness_cfg) == "full":
+                validate_state_hard(st)
+            else:
+                validate_candidate_execution_view(st)
 
             sess_ids, close_idx, daily_ret_exec = _candidate_daily_returns_close_to_close(
                 st,
@@ -1412,55 +1663,73 @@ def _run_group_task(
                 enabled_assets_mask=c.enabled_assets_mask,
                 cfg=harness_cfg,
             )
-
-            outputs.append(
-                {
-                    "task_id": task_id,
-                    "candidate_id": c.candidate_id,
-                    "split_id": split.split_id,
-                    "scenario_id": scenario.scenario_id,
-                    "status": "ok",
-                    "error": "",
-                    "session_ids": sess_ids,
-                    "session_ids_exec": sess_ids,
-                    "session_ids_raw": sess_ids_raw,
-                    # Compatibility contract: daily_returns remains execution-adjusted.
-                    # The explicit execution-adjusted alias is daily_returns_exec.
-                    # The raw no-latency/no-extra-friction series is daily_returns_raw.
-                    "daily_returns": daily_ret_exec,
-                    "daily_returns_exec": daily_ret_exec,
-                    "daily_returns_raw": daily_ret_raw,
-                    "equity_payload": _equity_curve_payload(st, c.candidate_id, split.split_id, scenario.scenario_id),
-                    "trade_payload": _trade_log_payload(st, m4_out, c.candidate_id, split.split_id, scenario.scenario_id),
-                    "asset_pnl_by_symbol": _asset_pnl_by_symbol_from_state(st, split),
-                    "micro_payload": micro_payload,
-                    "profile_payload": profile_payload,
-                    "funnel_payload": funnel_payload,
-                    "m2_idx": int(c.m2_idx),
-                    "m3_idx": int(c.m3_idx),
-                    "m4_idx": int(c.m4_idx),
-                    "tags": list(c.tags),
-                    "test_days": int(daily_ret_exec.shape[0]),
-                    "task_seed": int(task_seed),
-                    "quality_reason_codes": quality_reason_codes,
-                    "asset_keys": [st.symbols[i] for i in np.flatnonzero(c.enabled_assets_mask).tolist()],
-                    "exception_signature": "",
-                    "risk_engine_metrics": {
-                        "final_equity_raw": float(risk_res_raw.final_equity),
-                        "max_drawdown_raw": float(risk_res_raw.max_drawdown),
-                        "sharpe_raw": float(risk_res_raw.sharpe),
-                        "sortino_raw": float(risk_res_raw.sortino),
-                        "trades_raw": int(risk_res_raw.trades),
-                        "final_equity_exec": float(risk_res_exec.final_equity),
-                        "max_drawdown_exec": float(risk_res_exec.max_drawdown),
-                        "sharpe_exec": float(risk_res_exec.sharpe),
-                        "sortino_exec": float(risk_res_exec.sortino),
-                        "trades_exec": int(risk_res_exec.trades),
-                    },
-                    "dqs_min": dqs_min,
-                    "dqs_median": dqs_median,
-                }
+            payload_bytes = (
+                _tensor_nbytes_total(micro_payload)
+                + _tensor_nbytes_total(profile_payload)
+                + _tensor_nbytes_total(funnel_payload)
+                + _tensor_nbytes_total(risk_res_exec.equity_curve)
+                + _tensor_nbytes_total(risk_res_exec.filled_qty_ta)
+                + _tensor_nbytes_total(risk_res_exec.exec_price_ta)
+                + _tensor_nbytes_total(risk_res_exec.trade_cost_ta)
             )
+            total_payload_bytes += int(payload_bytes)
+
+            row = {
+                "task_id": task_id,
+                "candidate_id": c.candidate_id,
+                "split_id": split.split_id,
+                "scenario_id": scenario.scenario_id,
+                "status": "ok",
+                "error": "",
+                "session_ids": sess_ids,
+                "session_ids_exec": sess_ids,
+                "session_ids_raw": sess_ids_raw,
+                # Compatibility contract: daily_returns remains execution-adjusted.
+                # The explicit execution-adjusted alias is daily_returns_exec.
+                # The raw no-latency/no-extra-friction series is daily_returns_raw.
+                "daily_returns": daily_ret_exec,
+                "daily_returns_exec": daily_ret_exec,
+                "daily_returns_raw": daily_ret_raw,
+                "equity_payload": _equity_curve_payload(st, c.candidate_id, split.split_id, scenario.scenario_id),
+                "trade_payload": _trade_log_payload(st, m4_out, c.candidate_id, split.split_id, scenario.scenario_id),
+                "asset_pnl_by_symbol": _asset_pnl_by_symbol_from_state(st, split),
+                "micro_payload": micro_payload,
+                "profile_payload": profile_payload,
+                "funnel_payload": funnel_payload,
+                "m2_idx": int(c.m2_idx),
+                "m3_idx": int(c.m3_idx),
+                "m4_idx": int(c.m4_idx),
+                "tags": list(c.tags),
+                "test_days": int(daily_ret_exec.shape[0]),
+                "task_seed": int(task_seed),
+                "quality_reason_codes": quality_reason_codes,
+                "asset_keys": [st.symbols[i] for i in np.flatnonzero(c.enabled_assets_mask).tolist()],
+                "exception_signature": "",
+                "risk_engine_metrics": {
+                    "final_equity_raw": float(risk_res_raw.final_equity),
+                    "max_drawdown_raw": float(risk_res_raw.max_drawdown),
+                    "sharpe_raw": float(risk_res_raw.sharpe),
+                    "sortino_raw": float(risk_res_raw.sortino),
+                    "trades_raw": int(risk_res_raw.trades),
+                    "final_equity_exec": float(risk_res_exec.final_equity),
+                    "max_drawdown_exec": float(risk_res_exec.max_drawdown),
+                    "sharpe_exec": float(risk_res_exec.sharpe),
+                    "sortino_exec": float(risk_res_exec.sortino),
+                    "trades_exec": int(risk_res_exec.trades),
+                },
+                "group_runtime_stats": {
+                    "split_stress_sec": float(split_stress_sec),
+                    "module2_sec": float(module2_sec),
+                    "module3_sec": float(module3_sec),
+                },
+                "dqs_min": dqs_min,
+                "dqs_median": dqs_median,
+            }
+            _eval_assert_artifact_dependency_contract(
+                "strategy_results",
+                candidate_row=row,
+            )
+            outputs.append(row)
         except Exception as exc:
             err_type = type(exc).__name__
             err_msg = str(exc)
@@ -1515,11 +1784,32 @@ def _run_group_task(
                     "quality_reason_codes": quality_reason_codes,
                     "asset_keys": asset_keys,
                     "state_dump": state_dump,
+                    "group_runtime_stats": {
+                        "split_stress_sec": float(split_stress_sec),
+                        "module2_sec": float(module2_sec),
+                        "module3_sec": float(module3_sec),
+                    },
                     "dqs_min": 0.0,
                     "dqs_median": 0.0,
                 }
             )
-
+    candidate_loop_sec = float(time.perf_counter() - candidate_loop_t0)
+    runtime_stats = GroupExecutionRuntimeStats(
+        split_stress_sec=float(split_stress_sec),
+        module2_sec=float(module2_sec),
+        module3_sec=float(module3_sec),
+        candidate_loop_sec=float(candidate_loop_sec),
+        candidate_count=int(len(group.candidate_indices)),
+        market_overlay_bytes=int(market_overlay.nbytes),
+        feature_overlay_bytes=int(feature_overlay.feature_bytes),
+        module3_group_bytes_estimated=int(max(1, getattr(group, "module3_group_bytes_estimated", 0))),
+        module3_group_bytes_realized=int(feature_overlay.module3_group_bytes),
+        module3_bytes=int(feature_overlay.module3_group_bytes),
+        candidate_scratch_bytes=int(scratch.nbytes),
+        result_payload_bytes=int(total_payload_bytes),
+    )
+    for row in outputs:
+        row["group_runtime_stats"] = asdict(runtime_stats)
     return outputs
 
 
@@ -1965,31 +2255,72 @@ def run_weightiz_harness(
     if not scenarios:
         raise RuntimeError("No enabled stress scenarios")
 
-    # RAM policy: reduce worker count if projected footprint is too high.
+    _selected_artifacts = _eval_validate_canonical_artifact_dependencies(
+        scratch_mode=_resolve_candidate_scratch_mode(harness_cfg),
+        export_micro_diagnostics=bool(harness_cfg.export_micro_diagnostics),
+        export_micro_profile_blocks=bool(harness_cfg.micro_diag_export_block_profiles),
+        export_funnel_1545=bool(harness_cfg.micro_diag_export_funnel),
+    )
+    shared_base_state = BaseTensorState.from_tensor_state(base_state)
     avail = _available_memory_bytes()
-    est_state = _estimate_state_bytes(base_state)
     requested_workers = int(max(1, harness_cfg.parallel_workers))
-    max_workers = int(requested_workers)
-    budget = int(float(harness_cfg.max_ram_utilization_frac) * float(avail))
-
-    if est_state * max_workers > budget:
-        max_workers = max(1, budget // max(est_state, 1))
-    max_workers = max(1, max_workers)
-    process_pool_requested = bool(harness_cfg.parallel_backend == "process_pool" and requested_workers > 1)
+    requested_process_pool = bool(harness_cfg.parallel_backend == "process_pool" and requested_workers > 1)
     if quick_settings.enabled:
-        process_pool_requested = False
+        requested_process_pool = False
+    mp_ctx_pre, resolved_mp_start_method = _resolve_mp_context()
+    base_sharing_decision = _mem_resolve_base_sharing_mode(
+        configured_mode=str(harness_cfg.base_sharing_mode),
+        start_method=str(resolved_mp_start_method),
+        platform_name=sys.platform,
+    )
+    market_overlay_bytes, feature_overlay_bytes, startup_module3_bytes, candidate_scratch_bytes = _estimate_group_runtime_bytes(
+        shared_base_state,
+        harness_cfg,
+    )
+    initial_memory_estimate = _mem_build_memory_accounting_estimate(
+        available_bytes=int(avail),
+        max_ram_utilization_frac=float(harness_cfg.max_ram_utilization_frac),
+        safety_margin_frac=float(harness_cfg.safety_margin_frac),
+        safety_margin_min_bytes=int(harness_cfg.safety_margin_min_bytes),
+        base_bytes=int(shared_base_state.base_bytes),
+        market_overlay_bytes=int(market_overlay_bytes),
+        feature_overlay_bytes=int(feature_overlay_bytes),
+        module3_bytes=int(startup_module3_bytes),
+        candidate_scratch_bytes=int(candidate_scratch_bytes),
+        queue_bytes=0,
+        result_buffer_bytes=0,
+        requested_workers=int(requested_workers),
+    )
+    process_pool_requested = bool(requested_process_pool)
+    group_bound_execution_requested = bool(harness_cfg.group_bound_execution_enabled)
+    process_pool_group_reuse_requested = bool(process_pool_requested and group_bound_execution_requested)
+    initial_effective_workers = int(initial_memory_estimate.effective_workers)
 
-    process_pool_chunk_size = int(max(1, harness_cfg.process_pool_candidate_chunk_size))
-    process_pool_group_reuse_active = bool(process_pool_requested and process_pool_chunk_size > 1)
-
-    group_tasks = _build_group_tasks(candidates, splits, scenarios)
-    if process_pool_requested:
-        group_tasks = _split_group_tasks_by_candidate(group_tasks, chunk_size=process_pool_chunk_size)
-    if not group_tasks:
+    if group_bound_execution_requested:
+        base_group_tasks = _order_group_execution_tasks(
+            _build_base_group_execution_tasks(candidates, splits, scenarios),
+            dispatch_policy=str(harness_cfg.group_dispatch_policy),
+        )
+        legacy_group_tasks: list[_GroupTask] = []
+    else:
+        base_group_tasks = []
+        legacy_group_tasks = _build_group_tasks(candidates, splits, scenarios)
+        if process_pool_requested:
+            legacy_group_tasks = _split_group_tasks_by_candidate(
+                legacy_group_tasks,
+                chunk_size=int(max(1, harness_cfg.process_pool_candidate_chunk_size)),
+            )
+        legacy_group_tasks = _order_group_execution_tasks(
+            legacy_group_tasks,
+            dispatch_policy=str(harness_cfg.group_dispatch_policy),
+        )
+    if not base_group_tasks and not legacy_group_tasks:
         raise RuntimeError("No group tasks generated")
 
     all_results: list[dict[str, Any]] = []
-    tasks_submitted = int(sum(len(g.candidate_indices) for g in group_tasks))
+    tasks_submitted = int(
+        sum(len(g.candidate_indices) for g in (base_group_tasks if group_bound_execution_requested else legacy_group_tasks))
+    )
     tasks_completed = 0
     groups_completed = 0
     failure_count = 0
@@ -2002,6 +2333,243 @@ def run_weightiz_harness(
     run_t0 = time.perf_counter()
     checkpoint_every_groups = 10
     pool_heartbeat_seconds = 5.0
+    group_runtime_stats_path = report_root / "group_runtime_stats.jsonl"
+    planned_group_task_count = int(len(legacy_group_tasks))
+    next_base_group_idx = 0
+    base_group_count_total = int(len(base_group_tasks))
+    legacy_group_queue: deque[_GroupTask] = deque(legacy_group_tasks)
+    active_group_batch: deque[_GroupTask] = deque()
+    module3_realized_samples: list[int] = []
+    candidate_loop_per_candidate_samples: list[float] = []
+    result_payload_bytes_per_candidate_samples: list[int] = []
+    candidate_incremental_bytes_samples: list[int] = []
+    latest_group_runtime_stats: GroupExecutionRuntimeStats | None = None
+    worker_overhead_bytes = int(initial_memory_estimate.worker_overhead_bytes)
+    current_module3_group_bytes_estimated = int(max(1, startup_module3_bytes))
+    dynamic_effective_workers = int(initial_effective_workers)
+    max_in_flight = int(max(1, dynamic_effective_workers * max(1, int(harness_cfg.group_max_in_flight_factor))))
+    payload_task_sample = base_group_tasks if group_bound_execution_requested else legacy_group_tasks
+    payload_safe, payload_arg_max_bytes = _is_large_payload_safe(
+        payload_task_sample,
+        threshold_bytes=int(harness_cfg.payload_pickle_threshold_bytes),
+    )
+    queue_bytes = _mem_estimate_queue_bytes(
+        in_flight_count=int(max_in_flight),
+        sampled_task_bytes=int(payload_arg_max_bytes),
+    )
+    memory_estimate = _mem_build_memory_accounting_estimate(
+        available_bytes=int(avail),
+        max_ram_utilization_frac=float(harness_cfg.max_ram_utilization_frac),
+        safety_margin_frac=float(harness_cfg.safety_margin_frac),
+        safety_margin_min_bytes=int(harness_cfg.safety_margin_min_bytes),
+        base_bytes=int(shared_base_state.base_bytes),
+        market_overlay_bytes=int(market_overlay_bytes),
+        feature_overlay_bytes=int(feature_overlay_bytes),
+        module3_bytes=int(current_module3_group_bytes_estimated),
+        candidate_scratch_bytes=int(candidate_scratch_bytes),
+        queue_bytes=int(queue_bytes),
+        result_buffer_bytes=0,
+        requested_workers=int(requested_workers),
+        worker_overhead_bytes=int(worker_overhead_bytes),
+    )
+    max_workers = int(memory_estimate.effective_workers)
+    if process_pool_requested and max_workers <= 1:
+        execution_mode = "serial_forced_ram"
+    elif process_pool_requested and (not payload_safe):
+        execution_mode = "serial_forced_payload"
+    elif quick_settings.enabled:
+        execution_mode = "serial_quick_run"
+    elif process_pool_requested:
+        execution_mode = "process_pool"
+    else:
+        execution_mode = "serial"
+    use_process_pool = execution_mode == "process_pool"
+    dynamic_effective_workers = int(max_workers if use_process_pool else 1)
+    executor_worker_count = int(max(1, dynamic_effective_workers if use_process_pool else 1))
+    max_in_flight = int(max(1, dynamic_effective_workers * max(1, int(harness_cfg.group_max_in_flight_factor))))
+    process_pool_group_reuse_active = bool(group_bound_execution_requested)
+    base_sharing_runtime = {
+        "configured_mode": str(base_sharing_decision.configured_mode),
+        "resolved_mode": str(base_sharing_decision.mode),
+        "start_method": str(base_sharing_decision.start_method),
+        "shared_base_state_active": bool(use_process_pool and base_sharing_decision.shared_base_state_active),
+        "fallback_only": bool(base_sharing_decision.fallback_only),
+        "cow_probe_required": bool(use_process_pool and base_sharing_decision.cow_probe_required),
+        "reason": str(base_sharing_decision.reason),
+    }
+    large_payload_passing_avoided = bool((not use_process_pool) or payload_safe)
+    strategy_ledger_path = report_root / "strategy_results.parquet"
+    monitor = RuntimeMonitor(
+        run_id=run_id,
+        run_dir=report_root,
+        expected_tensor_shape=tuple(int(x) for x in feature_tensor.shape),
+        expected_worker_count=int(dynamic_effective_workers),
+        health_check_interval=int(max(1, harness_cfg.health_check_interval)),
+    )
+    progress_interval_seconds = int(max(1, harness_cfg.progress_interval_seconds))
+    last_progress_log = time.perf_counter()
+    feature_tensor_role = _truth_build_feature_tensor_role(shared_memory_published=True)
+    compute_authority = _truth_build_compute_authority()
+
+    def _current_candidate_loop_sec_per_candidate_p95() -> float | None:
+        return _rolling_p95_float(candidate_loop_per_candidate_samples)
+
+    def _current_result_payload_bytes_per_candidate_p95() -> int | None:
+        return _rolling_p95_int(result_payload_bytes_per_candidate_samples)
+
+    def _current_candidate_incremental_bytes_p95() -> int | None:
+        return _rolling_p95_int(candidate_incremental_bytes_samples)
+
+    def _recompute_memory_estimate(*, queue_backlog_groups: int, result_backlog_rows: int) -> None:
+        nonlocal current_module3_group_bytes_estimated, memory_estimate, max_workers, dynamic_effective_workers, max_in_flight
+        realized_module3_p95 = _rolling_p95_int(module3_realized_samples)
+        if realized_module3_p95 is not None:
+            current_module3_group_bytes_estimated = int(max(1, realized_module3_p95))
+        sampled_row_bytes = int(
+            max(
+                1,
+                _current_result_payload_bytes_per_candidate_p95()
+                or int(harness_cfg.startup_default_result_payload_bytes),
+            )
+        )
+        queue_bytes_hint = _mem_estimate_queue_bytes(
+            in_flight_count=int(max(0, queue_backlog_groups)),
+            sampled_task_bytes=int(payload_arg_max_bytes),
+        )
+        result_buffer_bytes_hint = _mem_estimate_result_buffer_bytes(
+            pending_rows=int(max(0, result_backlog_rows)),
+            sampled_row_bytes=int(sampled_row_bytes),
+        )
+        memory_estimate = _mem_build_memory_accounting_estimate(
+            available_bytes=int(avail),
+            max_ram_utilization_frac=float(harness_cfg.max_ram_utilization_frac),
+            safety_margin_frac=float(harness_cfg.safety_margin_frac),
+            safety_margin_min_bytes=int(harness_cfg.safety_margin_min_bytes),
+            base_bytes=int(shared_base_state.base_bytes),
+            market_overlay_bytes=int(market_overlay_bytes),
+            feature_overlay_bytes=int(feature_overlay_bytes),
+            module3_bytes=int(current_module3_group_bytes_estimated),
+            candidate_scratch_bytes=int(candidate_scratch_bytes),
+            queue_bytes=int(queue_bytes_hint),
+            result_buffer_bytes=int(result_buffer_bytes_hint),
+            requested_workers=int(requested_workers),
+            worker_overhead_bytes=int(worker_overhead_bytes),
+        )
+        max_workers = int(memory_estimate.effective_workers)
+        if use_process_pool:
+            dynamic_effective_workers = int(min(max_workers, executor_worker_count))
+        else:
+            dynamic_effective_workers = 1
+        max_in_flight = int(max(1, dynamic_effective_workers * max(1, int(harness_cfg.group_max_in_flight_factor))))
+
+    def _current_group_memory_cap(*, queue_backlog_groups: int, result_backlog_rows: int) -> int:
+        if int(harness_cfg.group_max_memory_bytes) > 0:
+            return int(harness_cfg.group_max_memory_bytes)
+        sampled_row_bytes = int(
+            max(
+                1,
+                _current_result_payload_bytes_per_candidate_p95()
+                or int(harness_cfg.startup_default_result_payload_bytes),
+            )
+        )
+        queue_bytes_hint = _mem_estimate_queue_bytes(
+            in_flight_count=int(max(0, queue_backlog_groups)),
+            sampled_task_bytes=int(payload_arg_max_bytes),
+        )
+        result_buffer_bytes_hint = _mem_estimate_result_buffer_bytes(
+            pending_rows=int(max(0, result_backlog_rows)),
+            sampled_row_bytes=int(sampled_row_bytes),
+        )
+        requested_for_cap = int(max(1, dynamic_effective_workers if use_process_pool else 1))
+        return int(
+            _mem_chunk_policy_memory_cap(
+                budget_bytes=int(memory_estimate.budget_bytes),
+                base_bytes=int(shared_base_state.base_bytes),
+                requested_workers=requested_for_cap,
+                queue_bytes=int(queue_bytes_hint),
+                result_buffer_bytes=int(result_buffer_bytes_hint),
+                safety_margin_bytes=int(memory_estimate.safety_margin_bytes),
+            )
+        )
+
+    def _append_group_runtime_stats(stats: GroupExecutionRuntimeStats) -> None:
+        row = asdict(stats)
+        row["group_sequence"] = int(groups_completed)
+        with group_runtime_stats_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def _record_group_runtime_stats(rows: list[dict[str, Any]]) -> GroupExecutionRuntimeStats | None:
+        nonlocal latest_group_runtime_stats
+        stats = _extract_group_runtime_stats(rows)
+        if stats is None:
+            return None
+        latest_group_runtime_stats = stats
+        _append_group_runtime_stats(stats)
+        if int(stats.module3_group_bytes_realized) > 0:
+            module3_realized_samples.append(int(stats.module3_group_bytes_realized))
+        if int(stats.candidate_count) > 0:
+            cand_count = int(stats.candidate_count)
+            candidate_loop_per_candidate_samples.append(float(stats.candidate_loop_sec) / float(cand_count))
+            payload_per_candidate = int(max(1, int(stats.result_payload_bytes) // cand_count))
+            result_payload_bytes_per_candidate_samples.append(payload_per_candidate)
+            candidate_incremental_bytes_samples.append(
+                int(max(1, int(stats.candidate_scratch_bytes) + payload_per_candidate))
+            )
+        return stats
+
+    def _plan_next_group_wave() -> deque[_GroupTask]:
+        nonlocal next_base_group_idx, planned_group_task_count
+        if not group_bound_execution_requested:
+            return deque()
+        if next_base_group_idx >= base_group_count_total:
+            return deque()
+        queue_backlog_groups = max(0, base_group_count_total - next_base_group_idx)
+        result_backlog_rows = max(0, len(all_results) - tasks_completed)
+        _recompute_memory_estimate(
+            queue_backlog_groups=queue_backlog_groups,
+            result_backlog_rows=result_backlog_rows,
+        )
+        groups_per_wave = int(max(1, max_in_flight))
+        base_batch = base_group_tasks[next_base_group_idx : next_base_group_idx + groups_per_wave]
+        next_base_group_idx += len(base_batch)
+        group_fixed_bytes = int(
+            market_overlay_bytes
+            + feature_overlay_bytes
+            + current_module3_group_bytes_estimated
+            + int(memory_estimate.worker_overhead_bytes)
+        )
+        group_memory_cap = _current_group_memory_cap(
+            queue_backlog_groups=max(0, base_group_count_total - next_base_group_idx),
+            result_backlog_rows=max(0, len(all_results) - tasks_completed),
+        )
+        planned = [
+            task
+            for base_group in base_batch
+            for task in _chunk_group_execution_task(
+                base_group,
+                candidates,
+                harness_cfg,
+                group_fixed_bytes=group_fixed_bytes,
+                module3_group_bytes_estimated=int(current_module3_group_bytes_estimated),
+                max_group_memory_bytes=int(group_memory_cap),
+                candidate_loop_sec_per_candidate_p95=_current_candidate_loop_sec_per_candidate_p95(),
+                result_payload_bytes_per_candidate_p95=_current_result_payload_bytes_per_candidate_p95(),
+                candidate_incremental_bytes_p95=_current_candidate_incremental_bytes_p95(),
+            )
+        ]
+        planned = _order_group_execution_tasks(planned, dispatch_policy=str(harness_cfg.group_dispatch_policy))
+        planned_group_task_count += int(len(planned))
+        return deque(planned)
+
+    def _groups_total_hint() -> int:
+        if group_bound_execution_requested:
+            return int(max(groups_completed, planned_group_task_count + max(0, base_group_count_total - next_base_group_idx)))
+        return int(len(legacy_group_tasks))
+
+    def _queue_backlog_hint(*, pending_count: int) -> int:
+        if group_bound_execution_requested:
+            return int(pending_count + len(active_group_batch) + max(0, base_group_count_total - next_base_group_idx))
+        return int(pending_count + len(legacy_group_queue))
 
     def _write_run_status_checkpoint(phase: str, execution_mode_now: str) -> None:
         elapsed = float(time.perf_counter() - run_t0)
@@ -2012,7 +2580,7 @@ def run_weightiz_harness(
                 "phase": str(phase),
                 "execution_mode": str(execution_mode_now),
                 "groups_done": int(groups_completed),
-                "groups_total": int(len(group_tasks)),
+                "groups_total": int(_groups_total_hint()),
                 "tasks_done": int(tasks_completed),
                 "tasks_total": int(tasks_submitted),
                 "failures_so_far": int(failure_count),
@@ -2023,42 +2591,13 @@ def run_weightiz_harness(
                     execution_mode_now,
                     use_process_pool,
                     process_pool_group_reuse_active,
+                    base_sharing=base_sharing_runtime,
                 ),
+                "artifact_dependency_matrix": _eval_canonical_artifact_dependency_matrix(),
+                "canonical_artifacts_selected": list(_selected_artifacts),
                 "updated_utc": datetime.now(timezone.utc).isoformat(),
             },
         )
-
-    payload_safe, payload_arg_max_bytes = _is_large_payload_safe(
-        group_tasks,
-        threshold_bytes=int(harness_cfg.payload_pickle_threshold_bytes),
-    )
-    ram_forces_serial = bool(process_pool_requested and max_workers <= 1)
-    payload_forces_serial = bool(process_pool_requested and (not payload_safe))
-
-    if quick_settings.enabled:
-        execution_mode = "serial_quick_run"
-    elif process_pool_requested and (not payload_forces_serial) and (not ram_forces_serial):
-        execution_mode = "process_pool"
-    elif payload_forces_serial:
-        execution_mode = "serial_forced_payload"
-    else:
-        execution_mode = "serial_forced_ram"
-
-    use_process_pool = execution_mode == "process_pool"
-    effective_workers = int(max_workers if use_process_pool else 1)
-    large_payload_passing_avoided = bool((not use_process_pool) or payload_safe)
-    strategy_ledger_path = report_root / "strategy_results.parquet"
-    monitor = RuntimeMonitor(
-        run_id=run_id,
-        run_dir=report_root,
-        expected_tensor_shape=tuple(int(x) for x in feature_tensor.shape),
-        expected_worker_count=int(effective_workers),
-        health_check_interval=int(max(1, harness_cfg.health_check_interval)),
-    )
-    progress_interval_seconds = int(max(1, harness_cfg.progress_interval_seconds))
-    last_progress_log = time.perf_counter()
-    feature_tensor_role = _truth_build_feature_tensor_role(shared_memory_published=True)
-    compute_authority = _truth_build_compute_authority()
     _write_run_status_checkpoint("running", execution_mode)
 
     def _maybe_emit_progress(active_workers: int) -> None:
@@ -2077,26 +2616,74 @@ def run_weightiz_harness(
             extra={
                 "strategies_completed": int(tasks_completed),
                 "workers_active": int(active_workers),
+                "workers_effective": int(dynamic_effective_workers),
                 "avg_strategy_time_sec": float(avg_strategy_time),
                 "diagnostic_feature_tensor_memory_gb": float(shm_mem_gb),
                 "feature_tensor_worker_role": str(feature_tensor_role["role"]),
-                "grouped_post_m2_reuse_active": bool((not use_process_pool) or process_pool_group_reuse_active),
-                "grouped_post_m3_reuse_active": bool((not use_process_pool) or process_pool_group_reuse_active),
+                "base_sharing_mode": str(base_sharing_runtime["resolved_mode"]),
+                "base_sharing_active": bool(base_sharing_runtime["shared_base_state_active"]),
+                "base_sharing_fallback_only": bool(base_sharing_runtime["fallback_only"]),
+                "grouped_post_m2_reuse_active": bool(group_bound_execution_requested),
+                "grouped_post_m3_reuse_active": bool(group_bound_execution_requested),
                 "elapsed_runtime_sec": float(elapsed),
             },
         )
         last_progress_log = now
 
-    def _maybe_health_check(active_workers: int, queue_backlog: int) -> None:
+    def _maybe_health_check(active_workers: int, queue_backlog: int, result_backlog_rows: int) -> None:
         if not monitor.should_check(int(tasks_completed)):
             return
+        sampled_row_bytes = int(
+            max(
+                1,
+                _current_result_payload_bytes_per_candidate_p95()
+                or int(harness_cfg.startup_default_result_payload_bytes),
+            )
+        )
+        result_buffer_bytes = _mem_estimate_result_buffer_bytes(
+            pending_rows=int(result_backlog_rows),
+            sampled_row_bytes=int(sampled_row_bytes),
+        )
+        realized_module3_p95 = _rolling_p95_int(module3_realized_samples)
         monitor.check_and_emit(
             strategies_completed=int(tasks_completed),
             tensor=feature_handles_master.array,
-            worker_status={"active": int(active_workers)},
+            worker_status={
+                "active": int(active_workers),
+                "expected": int(dynamic_effective_workers),
+                "ok": bool(int(active_workers) <= int(dynamic_effective_workers)),
+            },
             ledger_path=strategy_ledger_path,
             queue_backlog=int(queue_backlog),
-            memory_status={"ok": bool(feature_tensor.nbytes <= budget), "available_bytes": int(avail), "budget_bytes": int(budget)},
+            memory_status={
+                "ok": bool(memory_estimate.total_projected_bytes <= memory_estimate.budget_bytes),
+                "available_bytes": int(memory_estimate.available_bytes),
+                "budget_bytes": int(memory_estimate.budget_bytes),
+                "base_bytes": int(memory_estimate.base_bytes),
+                "market_overlay_bytes": int(memory_estimate.market_overlay_bytes),
+                "feature_overlay_bytes": int(memory_estimate.feature_overlay_bytes),
+                "module3_bytes": int(memory_estimate.module3_bytes),
+                "candidate_scratch_bytes": int(memory_estimate.candidate_scratch_bytes),
+                "queue_bytes": int(memory_estimate.queue_bytes),
+                "result_buffer_bytes": int(result_buffer_bytes),
+                "safety_margin_bytes": int(memory_estimate.safety_margin_bytes),
+            },
+            extra_metrics={
+                "requested_workers": int(requested_workers),
+                "effective_workers": int(dynamic_effective_workers),
+                "base_sharing_mode": str(base_sharing_runtime["resolved_mode"]),
+                "base_sharing_active": bool(base_sharing_runtime["shared_base_state_active"]),
+                "base_sharing_fallback_only": bool(base_sharing_runtime["fallback_only"]),
+                "groups_completed": int(groups_completed),
+                "groups_total_hint": int(_groups_total_hint()),
+                "tasks_total": int(tasks_submitted),
+                "result_backlog_rows": int(result_backlog_rows),
+                "result_backlog_bytes": int(result_buffer_bytes),
+                "module3_estimated_bytes": int(current_module3_group_bytes_estimated),
+                "module3_realized_bytes_p95": int(realized_module3_p95 or 0),
+                "latest_group_candidate_count": int(latest_group_runtime_stats.candidate_count) if latest_group_runtime_stats is not None else 0,
+                "rolling_tasks_per_sec": float(tasks_completed / max(1e-9, time.perf_counter() - run_t0)),
+            },
             require_ledger_exists=False,
         )
 
@@ -2113,15 +2700,43 @@ def run_weightiz_harness(
         first_exception_message = em or et
         first_exception_hash = eh or _error_hash(first_exception_class, first_exception_message)
 
+    def _process_group_rows(rows: list[dict[str, Any]], *, active_workers: int, queue_backlog: int) -> None:
+        nonlocal tasks_completed, groups_completed, failure_count, aborted, abort_reason
+        all_results.extend(rows)
+        tasks_completed += int(len(rows))
+        groups_completed += 1
+        _record_group_runtime_stats(rows)
+        err_rows = [r for r in rows if str(r.get("status", "")) != "ok"]
+        failure_count += int(len(err_rows))
+        for er in err_rows:
+            _capture_first_exception(er)
+            _update_failure_tracker(failure_tracker, er)
+            _record_deadletter(deadletter_path, er)
+            abort_now, reason_now = _should_abort_systemic(failure_tracker, er)
+            if abort_now:
+                aborted = True
+                abort_reason = reason_now
+                break
+        if (groups_completed % int(checkpoint_every_groups) == 0) or (
+            groups_completed >= int(_groups_total_hint())
+        ):
+            _write_run_status_checkpoint("running", execution_mode)
+        _maybe_emit_progress(active_workers=active_workers)
+        _maybe_health_check(
+            active_workers=active_workers,
+            queue_backlog=queue_backlog,
+            result_backlog_rows=max(0, len(all_results) - tasks_completed),
+        )
+
     mp_start_method = ""
     if use_process_pool:
-        mp_ctx, mp_start_method = _resolve_mp_context()
+        mp_ctx, mp_start_method = mp_ctx_pre, resolved_mp_start_method
         with ProcessPoolExecutor(
-            max_workers=effective_workers,
+            max_workers=int(executor_worker_count),
             mp_context=mp_ctx,
             initializer=_init_worker_context,
             initargs=(
-                base_state,
+                shared_base_state,
                 candidates,
                 splits,
                 scenarios,
@@ -2135,11 +2750,33 @@ def run_weightiz_harness(
             ),
         ) as ex:
             futs: dict[Any, _GroupTask] = {}
-            for g in group_tasks:
-                fut = ex.submit(_run_group_task_from_context, g)
-                futs[fut] = g
-            pending = set(futs.keys())
-            while pending:
+            pending: set[Any] = set()
+
+            def _next_task() -> _GroupTask | None:
+                nonlocal active_group_batch
+                if group_bound_execution_requested:
+                    if (not active_group_batch) and (not pending):
+                        active_group_batch = _plan_next_group_wave()
+                    if active_group_batch:
+                        return active_group_batch.popleft()
+                    return None
+                if legacy_group_queue:
+                    return legacy_group_queue.popleft()
+                return None
+
+            def _submit_more() -> None:
+                while len(pending) < int(max_in_flight):
+                    g = _next_task()
+                    if g is None:
+                        break
+                    fut = ex.submit(_run_group_task_from_context, g)
+                    futs[fut] = g
+                    pending.add(fut)
+
+            while True:
+                _submit_more()
+                if not pending:
+                    break
                 done, pending = wait(
                     pending,
                     timeout=float(pool_heartbeat_seconds),
@@ -2147,49 +2784,56 @@ def run_weightiz_harness(
                 )
                 active_workers = _bounded_active_worker_count(
                     pending_count=len(pending),
-                    effective_workers=effective_workers,
+                    effective_workers=int(executor_worker_count),
                 )
                 if not done:
                     _write_run_status_checkpoint("running", execution_mode)
                     _maybe_emit_progress(active_workers=active_workers)
-                    _maybe_health_check(active_workers=active_workers, queue_backlog=len(pending))
+                    _maybe_health_check(
+                        active_workers=active_workers,
+                        queue_backlog=_queue_backlog_hint(pending_count=len(pending)),
+                        result_backlog_rows=max(0, len(all_results) - tasks_completed),
+                    )
                     continue
                 for fut in sorted(done, key=lambda f: str(futs[f].group_id)):
-                    g = futs[fut]
+                    g = futs.pop(fut)
                     rows = _safe_execute_task(
                         g,
-                        lambda _g: fut.result(),
+                        lambda _g, _f=fut: _f.result(),
                         candidates=candidates,
                         splits=splits,
                         scenarios=scenarios,
                         harness_cfg=harness_cfg,
                     )
-                    all_results.extend(rows)
-                    tasks_completed += int(len(rows))
-                    groups_completed += 1
-                    err_rows = [r for r in rows if str(r.get("status", "")) != "ok"]
-                    failure_count += int(len(err_rows))
-                    for er in err_rows:
-                        _capture_first_exception(er)
-                        _update_failure_tracker(failure_tracker, er)
-                        _record_deadletter(deadletter_path, er)
-                        abort_now, reason_now = _should_abort_systemic(failure_tracker, er)
-                        if abort_now:
-                            aborted = True
-                            abort_reason = reason_now
-                            for rem in pending:
-                                rem.cancel()
-                            break
-                    if (groups_completed % int(checkpoint_every_groups) == 0) or (groups_completed == len(group_tasks)):
-                        _write_run_status_checkpoint("running", execution_mode)
-                    _maybe_emit_progress(active_workers=active_workers)
-                    _maybe_health_check(active_workers=active_workers, queue_backlog=len(pending))
+                    _process_group_rows(
+                        rows,
+                        active_workers=active_workers,
+                        queue_backlog=_queue_backlog_hint(pending_count=len(pending)),
+                    )
                     if aborted:
+                        for rem in list(pending):
+                            rem.cancel()
+                        pending.clear()
                         break
                 if aborted:
                     break
     else:
-        for g in group_tasks:
+        def _next_serial_group() -> _GroupTask | None:
+            nonlocal active_group_batch
+            if group_bound_execution_requested:
+                if not active_group_batch:
+                    active_group_batch = _plan_next_group_wave()
+                if active_group_batch:
+                    return active_group_batch.popleft()
+                return None
+            if legacy_group_queue:
+                return legacy_group_queue.popleft()
+            return None
+
+        while True:
+            g = _next_serial_group()
+            if g is None:
+                break
             timeout_sec = int(quick_settings.task_timeout_sec) if quick_settings.enabled else 0
             rows = _safe_execute_task(
                 g,
@@ -2197,7 +2841,7 @@ def run_weightiz_harness(
                     timeout_sec,
                     lambda: _run_group_task(
                         _g,
-                        base_state,
+                        shared_base_state,
                         candidates,
                         splits,
                         scenarios,
@@ -2212,31 +2856,21 @@ def run_weightiz_harness(
                 scenarios=scenarios,
                 harness_cfg=harness_cfg,
             )
-            all_results.extend(rows)
-            tasks_completed += int(len(rows))
-            groups_completed += 1
-            err_rows = [r for r in rows if str(r.get("status", "")) != "ok"]
-            failure_count += int(len(err_rows))
-            for er in err_rows:
-                _capture_first_exception(er)
-                _update_failure_tracker(failure_tracker, er)
-                _record_deadletter(deadletter_path, er)
-                abort_now, reason_now = _should_abort_systemic(failure_tracker, er)
-                if abort_now:
-                    aborted = True
-                    abort_reason = reason_now
-                    break
-            if quick_settings.enabled:
-                if (groups_completed % int(quick_settings.progress_every_groups) == 0) or (groups_completed == len(group_tasks)):
-                    _maybe_emit_progress(active_workers=1)
-            if (groups_completed % int(checkpoint_every_groups) == 0) or (groups_completed == len(group_tasks)):
-                _write_run_status_checkpoint("running", execution_mode)
-            _maybe_emit_progress(active_workers=1)
-            _maybe_health_check(active_workers=1, queue_backlog=0)
+            _process_group_rows(
+                rows,
+                active_workers=1,
+                queue_backlog=_queue_backlog_hint(pending_count=0),
+            )
+            if quick_settings.enabled and (
+                (groups_completed % int(quick_settings.progress_every_groups) == 0)
+                or (g is None)
+            ):
+                _maybe_emit_progress(active_workers=1)
             if aborted:
                 break
 
     aborted_early = bool(aborted and tasks_completed < tasks_submitted)
+    actual_group_task_count = int(planned_group_task_count if group_bound_execution_requested else len(legacy_group_tasks))
 
     # Deterministic collation order.
     all_results.sort(
@@ -2324,7 +2958,7 @@ def run_weightiz_harness(
                     "phase": "failed_pre_aggregation",
                     "execution_mode": str(execution_mode),
                     "groups_done": int(groups_completed),
-                    "groups_total": int(len(group_tasks)),
+                    "groups_total": int(_groups_total_hint()),
                     "tasks_done": int(tasks_completed),
                     "tasks_total": int(tasks_submitted),
                     "failures_so_far": int(failure_count),
@@ -2334,6 +2968,7 @@ def run_weightiz_harness(
                         execution_mode,
                         use_process_pool,
                         process_pool_group_reuse_active,
+                        base_sharing=base_sharing_runtime,
                     ),
                     "updated_utc": datetime.now(timezone.utc).isoformat(),
                     "first_exception": {
@@ -2398,8 +3033,8 @@ def run_weightiz_harness(
         dq_bundle=dq_bundle,
         feature_tensor=feature_tensor,
         feature_handles_master=feature_handles_master,
-        budget=budget,
-        avail=avail,
+        budget=int(memory_estimate.budget_bytes),
+        avail=int(memory_estimate.available_bytes),
         tasks_completed=tasks_completed,
         tasks_submitted=tasks_submitted,
         groups_completed=groups_completed,
@@ -2410,7 +3045,7 @@ def run_weightiz_harness(
         abort_reason=abort_reason,
         execution_mode=execution_mode,
         use_process_pool=use_process_pool,
-        effective_workers=effective_workers,
+        effective_workers=int(dynamic_effective_workers if use_process_pool else 1),
         payload_safe=payload_safe,
         payload_arg_max_bytes=payload_arg_max_bytes,
         large_payload_passing_avoided=large_payload_passing_avoided,
@@ -2421,8 +3056,8 @@ def run_weightiz_harness(
         symbols=symbols,
         keep_idx=keep_idx,
         ingest_meta=ingest_meta,
-        n_group_tasks=len(group_tasks),
-        est_state=est_state,
+        n_group_tasks=int(actual_group_task_count),
+        est_state=int(memory_estimate.per_worker_bytes),
         m2_configs=m2_configs,
         m3_configs=m3_configs,
         m4_configs=m4_configs,
@@ -2430,6 +3065,7 @@ def run_weightiz_harness(
         tensor_json_path=tensor_json_path,
         tensor_hash=tensor_hash,
         run_status_path=run_status_path,
+        group_runtime_stats_path=group_runtime_stats_path,
         deadletter_path=deadletter_path,
         self_audit_report_path=self_audit_report_path,
         compute_authority=compute_authority,
@@ -2453,6 +3089,7 @@ def run_weightiz_harness(
             execution_mode_now,
             use_process_pool_now,
             process_pool_group_reuse_active,
+            base_sharing=base_sharing_runtime,
         ),
         dq_accept=DQ_ACCEPT,
         dq_degrade=DQ_DEGRADE,

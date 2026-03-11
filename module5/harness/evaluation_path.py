@@ -9,8 +9,348 @@ from weightiz_module3_structure import ContextIdx, Module3Output
 from weightiz_module4_strategy_funnel import Module4SignalOutput, RegimeIdx
 
 
+_CANONICAL_ARTIFACT_DEPENDENCY_MATRIX: dict[str, dict[str, object]] = {
+    "strategy_results": {
+        "required_fields": (
+            "daily_returns_exec",
+            "daily_returns_raw",
+            "risk_engine_metrics",
+            "trade_payload",
+            "equity_payload",
+            "asset_pnl_by_symbol",
+            "quality_reason_codes",
+        ),
+        "required_accessors": (
+            "candidate_row.daily_returns_exec",
+            "candidate_row.daily_returns_raw",
+            "candidate_row.risk_engine_metrics",
+            "candidate_row.trade_payload",
+            "candidate_row.equity_payload",
+            "candidate_row.asset_pnl_by_symbol",
+            "candidate_row.quality_reason_codes",
+        ),
+        "compact_sources": (
+            "risk_res.equity_curve",
+            "risk_res.margin_used_t",
+            "canonical_session_daily_loss(state.session_id,state.open_px,state.close_px,risk_res.position_qty_ta,risk_res.equity_curve)",
+            "state.buying_power",
+            "trade_payload(state.order_side,state.order_flags,m4_out)",
+            "group overlays + module3 output",
+        ),
+        "full_sources": (
+            "full mutable candidate scratch",
+            "trade_payload(state.order_side,state.order_flags,m4_out)",
+            "group overlays + module3 output",
+        ),
+        "compact_supported": True,
+        "parity_risk": "low",
+    },
+    "trade_log": {
+        "required_fields": (
+            "m4_out.filled_qty_ta",
+            "m4_out.exec_price_ta",
+            "m4_out.trade_cost_ta",
+            "state.order_side",
+            "state.order_flags",
+        ),
+        "required_accessors": (
+            "m4_out.filled_qty_ta",
+            "m4_out.exec_price_ta",
+            "m4_out.trade_cost_ta",
+            "state.order_side",
+            "state.order_flags",
+        ),
+        "compact_sources": (
+            "risk_res.filled_qty_ta",
+            "risk_res.exec_price_ta",
+            "risk_res.trade_cost_ta",
+            "state.order_side",
+            "state.order_flags",
+        ),
+        "full_sources": (
+            "risk_res.filled_qty_ta",
+            "risk_res.exec_price_ta",
+            "risk_res.trade_cost_ta",
+            "state.order_side",
+            "state.order_flags",
+        ),
+        "compact_supported": True,
+        "parity_risk": "low",
+    },
+    "equity_curves": {
+        "required_fields": (
+            "state.equity",
+            "state.margin_used",
+            "state.buying_power",
+            "state.daily_loss",
+        ),
+        "required_accessors": (
+            "state.equity",
+            "state.margin_used",
+            "state.buying_power",
+            "state.daily_loss",
+        ),
+        "compact_sources": (
+            "risk_res.equity_curve",
+            "risk_res.margin_used_t",
+            "state.buying_power",
+            "canonical_session_daily_loss(state.session_id,state.open_px,state.close_px,risk_res.position_qty_ta,risk_res.equity_curve)",
+        ),
+        "full_sources": (
+            "state.equity",
+            "state.margin_used",
+            "state.buying_power",
+            "state.daily_loss",
+        ),
+        "compact_supported": True,
+        "parity_risk": "low",
+    },
+    "micro_diagnostics": {
+        "required_fields": (
+            "state.position_qty",
+            "state.atr_floor",
+            "state.rvol",
+            "module3_output",
+            "m4_out",
+        ),
+        "required_accessors": (
+            "state.position_qty",
+            "state.atr_floor",
+            "state.rvol",
+            "state.profile_stats",
+            "state.scores",
+            "m3.context_tac",
+            "m3.context_valid_ta",
+            "m4_out.regime_primary_ta",
+            "m4_out.regime_confidence_ta",
+            "m4_out.target_qty_ta",
+            "m4_out.filled_qty_ta",
+            "m4_out.exec_price_ta",
+            "m4_out.trade_cost_ta",
+        ),
+        "compact_sources": (
+            "state.position_qty",
+            "feature_overlay.atr_floor",
+            "feature_overlay.rvol",
+            "module3_output",
+            "execution_view",
+        ),
+        "full_sources": (
+            "state.position_qty",
+            "feature_overlay.atr_floor",
+            "feature_overlay.rvol",
+            "module3_output",
+            "execution_view",
+        ),
+        "compact_supported": True,
+        "parity_risk": "medium",
+    },
+    "micro_profile_blocks": {
+        "required_fields": (
+            "state.vp",
+            "state.vp_delta",
+            "state.atr_floor",
+            "state.close_px",
+            "module3_output",
+        ),
+        "required_accessors": (
+            "state.vp",
+            "state.vp_delta",
+            "state.atr_floor",
+            "state.close_px",
+            "m3.block_end_flag_t",
+            "m3.block_valid_ta",
+            "m3.block_seq_t",
+        ),
+        "compact_sources": (
+            "feature_overlay.vp",
+            "feature_overlay.vp_delta",
+            "feature_overlay.atr_floor",
+            "market_overlay.close_px",
+            "module3_output",
+        ),
+        "full_sources": (
+            "feature_overlay.vp",
+            "feature_overlay.vp_delta",
+            "feature_overlay.atr_floor",
+            "market_overlay.close_px",
+            "module3_output",
+        ),
+        "compact_supported": True,
+        "parity_risk": "low",
+    },
+    "funnel_1545": {
+        "required_fields": (
+            "state.profile_stats",
+            "state.rvol",
+            "m4_out",
+        ),
+        "required_accessors": (
+            "state.phase",
+            "state.profile_stats",
+            "state.rvol",
+            "m4_out.overnight_winner_t",
+            "m4_out.regime_primary_ta",
+        ),
+        "compact_sources": (
+            "feature_overlay.profile_stats",
+            "feature_overlay.rvol",
+            "execution_view",
+        ),
+        "full_sources": (
+            "feature_overlay.profile_stats",
+            "feature_overlay.rvol",
+            "execution_view",
+        ),
+        "compact_supported": True,
+        "parity_risk": "low",
+    },
+}
+
+
+def canonical_artifact_dependency_matrix() -> dict[str, dict[str, object]]:
+    return {
+        str(name): {str(key): value for key, value in spec.items()}
+        for name, spec in _CANONICAL_ARTIFACT_DEPENDENCY_MATRIX.items()
+    }
+
+
+def _resolve_artifact_dependency_accessor(
+    accessor: str,
+    *,
+    state: Any | None = None,
+    m3: Any | None = None,
+    m4_out: Any | None = None,
+    candidate_row: dict[str, Any] | None = None,
+) -> Any:
+    parts = [str(x) for x in str(accessor).split(".") if str(x)]
+    if not parts:
+        raise RuntimeError(f"Invalid artifact dependency accessor: {accessor!r}")
+    roots = {
+        "state": state,
+        "m3": m3,
+        "m4_out": m4_out,
+        "candidate_row": candidate_row,
+    }
+    current = roots.get(parts[0])
+    if current is None:
+        raise RuntimeError(f"Artifact dependency root unavailable: {parts[0]}")
+    for part in parts[1:]:
+        if isinstance(current, dict):
+            if part not in current:
+                raise RuntimeError(f"Artifact dependency missing key: {accessor}")
+            current = current[part]
+            continue
+        if not hasattr(current, part):
+            raise RuntimeError(f"Artifact dependency missing attribute: {accessor}")
+        current = getattr(current, part)
+    if current is None:
+        raise RuntimeError(f"Artifact dependency resolved to None: {accessor}")
+    return current
+
+
+def assert_artifact_dependency_contract(
+    artifact_name: str,
+    *,
+    state: Any | None = None,
+    m3: Any | None = None,
+    m4_out: Any | None = None,
+    candidate_row: dict[str, Any] | None = None,
+) -> None:
+    spec = _CANONICAL_ARTIFACT_DEPENDENCY_MATRIX.get(str(artifact_name))
+    if spec is None:
+        raise RuntimeError(f"Unknown canonical artifact dependency specification: {artifact_name}")
+    for accessor in tuple(spec.get("required_accessors", ())):
+        _resolve_artifact_dependency_accessor(
+            str(accessor),
+            state=state,
+            m3=m3,
+            m4_out=m4_out,
+            candidate_row=candidate_row,
+        )
+
+
+def canonical_session_daily_loss_from_risk_result(
+    *,
+    state: Any,
+    risk_res: Any,
+) -> np.ndarray:
+    t_count = int(state.cfg.T)
+    a_count = int(state.cfg.A)
+    equity = np.asarray(risk_res.equity_curve, dtype=np.float64)
+    pos = np.asarray(risk_res.position_qty_ta, dtype=np.float64)
+    raw_daily_loss = np.asarray(risk_res.daily_loss_t, dtype=np.float64)
+    if equity.shape != (t_count,):
+        raise RuntimeError(f"risk_res.equity_curve shape mismatch: got {equity.shape}, expected {(t_count,)}")
+    if pos.shape != (t_count, a_count):
+        raise RuntimeError(f"risk_res.position_qty_ta shape mismatch: got {pos.shape}, expected {(t_count, a_count)}")
+    if raw_daily_loss.shape != (t_count,):
+        raise RuntimeError(f"risk_res.daily_loss_t shape mismatch: got {raw_daily_loss.shape}, expected {(t_count,)}")
+    if np.any(~np.isfinite(raw_daily_loss)):
+        raise RuntimeError("AMBIGUOUS_DAILY_LOSS_CONTRACT_NONFINITE")
+    if np.any(raw_daily_loss < -1e-9):
+        raise RuntimeError("AMBIGUOUS_DAILY_LOSS_CONTRACT_NEGATIVE")
+
+    limit_abs = float(state.cfg.daily_loss_limit_abs)
+    if (not np.isfinite(limit_abs)) or limit_abs <= 0.0:
+        raise RuntimeError("AMBIGUOUS_DAILY_LOSS_LIMIT_CONTRACT")
+
+    session_id = np.asarray(state.session_id, dtype=np.int64)
+    open_px = np.asarray(state.open_px, dtype=np.float64)
+    close_px = np.asarray(state.close_px, dtype=np.float64)
+    if session_id.shape != (t_count,):
+        raise RuntimeError(f"session_id shape mismatch: got {session_id.shape}, expected {(t_count,)}")
+    if open_px.shape != (t_count, a_count):
+        raise RuntimeError(f"open_px shape mismatch: got {open_px.shape}, expected {(t_count, a_count)}")
+    if close_px.shape != (t_count, a_count):
+        raise RuntimeError(f"close_px shape mismatch: got {close_px.shape}, expected {(t_count, a_count)}")
+
+    canonical = np.zeros(t_count, dtype=np.float64)
+    session_start_equity = float(state.cfg.initial_cash)
+    zero_pos = np.zeros(a_count, dtype=np.float64)
+    for t in range(t_count):
+        if t == 0 or int(session_id[t]) != int(session_id[t - 1]):
+            prev_pos = zero_pos if t == 0 else np.asarray(pos[t - 1], dtype=np.float64)
+            prev_mark = (
+                np.where(np.isfinite(close_px[t - 1]), close_px[t - 1], np.where(np.isfinite(open_px[t - 1]), open_px[t - 1], 0.0))
+                if t > 0
+                else np.zeros(a_count, dtype=np.float64)
+            )
+            prev_cash = float(state.cfg.initial_cash) if t == 0 else float(equity[t - 1] - np.sum(prev_pos * prev_mark))
+            open_mark = np.where(np.isfinite(open_px[t]), open_px[t], np.where(np.isfinite(close_px[t]), close_px[t], 0.0))
+            session_start_equity = float(prev_cash + np.sum(prev_pos * open_mark))
+        canonical[t] = max(0.0, float(session_start_equity - equity[t]))
+    return canonical
+
+
+def validate_canonical_artifact_dependencies(
+    *,
+    scratch_mode: str,
+    export_micro_diagnostics: bool,
+    export_micro_profile_blocks: bool,
+    export_funnel_1545: bool,
+) -> tuple[str, ...]:
+    selected = {"strategy_results", "trade_log", "equity_curves"}
+    if bool(export_micro_diagnostics):
+        selected.add("micro_diagnostics")
+        if bool(export_micro_profile_blocks):
+            selected.add("micro_profile_blocks")
+        if bool(export_funnel_1545):
+            selected.add("funnel_1545")
+    mode = str(scratch_mode).strip().lower()
+    if mode not in {"compact", "full"}:
+        raise RuntimeError(f"Unsupported candidate scratch mode for artifact validation: {scratch_mode!r}")
+    for artifact_name in sorted(selected):
+        spec = _CANONICAL_ARTIFACT_DEPENDENCY_MATRIX.get(str(artifact_name))
+        if spec is None:
+            raise RuntimeError(f"Unknown canonical artifact dependency specification: {artifact_name}")
+        if mode == "compact" and not bool(spec.get("compact_supported", False)):
+            raise RuntimeError(f"COMPACT_SCRATCH_ARTIFACT_UNSUPPORTED: artifact={artifact_name}")
+    return tuple(sorted(selected))
+
+
 def materialize_risk_outputs_into_state(
-    state: TensorState,
+    state: Any,
     m4_sig: Module4SignalOutput,
     risk_res: Any,
     execution_view_cls: type,
@@ -31,12 +371,23 @@ def materialize_risk_outputs_into_state(
         0.0,
         float(state.cfg.intraday_leverage_max) * state.equity - state.margin_used,
     )
-    state.daily_loss[:] = np.asarray(risk_res.daily_loss_t, dtype=np.float64)
+    state.daily_loss[:] = canonical_session_daily_loss_from_risk_result(
+        state=state,
+        risk_res=risk_res,
+    )
+    if hasattr(state, "daily_loss_breach_flag"):
+        state.daily_loss_breach_flag[:] = (
+            np.asarray(state.daily_loss, dtype=np.float64) >= float(state.cfg.daily_loss_limit_abs)
+        ).astype(np.int8)
     side = np.zeros((t_count, a_count), dtype=np.int8)
     side[filled > 0.0] = 1
     side[filled < 0.0] = -1
     state.order_side[:, :] = side
     state.order_flags[:, :] = np.uint16(0)
+    scratch = getattr(state, "candidate_scratch", None)
+    if scratch is not None:
+        setattr(scratch, "risk_res", risk_res)
+        setattr(scratch, "m4_sig", m4_sig)
 
     return execution_view_cls(
         regime_primary_ta=np.asarray(m4_sig.regime_primary_ta, dtype=np.int8),
@@ -211,6 +562,7 @@ def equity_curve_payload(
     split_id: str,
     scenario_id: str,
 ) -> dict[str, np.ndarray]:
+    assert_artifact_dependency_contract("equity_curves", state=state)
     eq = state.equity.astype(np.float64)
     peak = np.maximum.accumulate(eq)
     dd = np.where(peak > 0.0, eq / peak - 1.0, 0.0)
@@ -238,6 +590,7 @@ def trade_log_payload(
     scenario_id: str,
     eps: float = 1e-12,
 ) -> dict[str, np.ndarray]:
+    assert_artifact_dependency_contract("trade_log", state=state, m4_out=m4_out)
     mask = np.isfinite(m4_out.exec_price_ta) & (np.abs(m4_out.filled_qty_ta) > float(eps))
     loc = np.argwhere(mask)
     if loc.size == 0:
@@ -355,6 +708,7 @@ def collect_micro_diagnostics_payload(
 ) -> dict[str, np.ndarray] | None:
     if not bool(cfg.export_micro_diagnostics):
         return None
+    assert_artifact_dependency_contract("micro_diagnostics", state=state, m3=m3, m4_out=m4_out)
 
     t_mask, a_mask = select_micro_rows(state, split, cfg, m4_out, enabled_assets_mask)
     if not np.any(t_mask) or not np.any(a_mask):
@@ -461,6 +815,7 @@ def collect_micro_profile_blocks_payload(
 ) -> dict[str, np.ndarray] | None:
     if not (bool(cfg.export_micro_diagnostics) and bool(cfg.micro_diag_export_block_profiles)):
         return None
+    assert_artifact_dependency_contract("micro_profile_blocks", state=state, m3=m3)
 
     a_count = state.cfg.A
     a_mask = np.asarray(enabled_assets_mask, dtype=bool)
@@ -521,6 +876,7 @@ def collect_funnel_payload(
 ) -> dict[str, np.ndarray] | None:
     if not (bool(cfg.export_micro_diagnostics) and bool(cfg.micro_diag_export_funnel)):
         return None
+    assert_artifact_dependency_contract("funnel_1545", state=state, m4_out=m4_out)
 
     a_count = state.cfg.A
     a_mask = np.asarray(enabled_assets_mask, dtype=bool)

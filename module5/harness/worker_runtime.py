@@ -27,7 +27,7 @@ def safe_execute_task(
     *,
     error_hash_fn: Callable[[str, str], str],
     normalized_top_frame_fn: Callable[[str], str],
-    seed_for_task_fn: Callable[[int, str], int],
+    seed_for_task_fn: Callable[..., int],
 ) -> list[dict[str, Any]]:
     try:
         return executor_fn(group)
@@ -44,10 +44,17 @@ def safe_execute_task(
         if isinstance(exc, TimeoutError):
             reason_codes.append("TIMEOUT")
         out: list[dict[str, Any]] = []
+        group_seed = seed_for_task_fn(
+            int(harness_cfg.seed),
+            str(split.split_id),
+            str(scenario.scenario_id),
+            str(group.m2_idx),
+            str(group.m3_idx),
+        )
         for ci in group.candidate_indices:
             c = candidates[int(ci)]
             task_id = f"{c.candidate_id}|{split.split_id}|{scenario.scenario_id}"
-            t_seed = seed_for_task_fn(int(harness_cfg.seed), task_id)
+            t_seed = seed_for_task_fn(int(group_seed), str(c.candidate_id), str(c.m4_idx))
             out.append(
                 {
                     "task_id": task_id,
