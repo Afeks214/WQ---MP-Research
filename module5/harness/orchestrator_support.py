@@ -8,6 +8,8 @@ from typing import Any, Callable
 
 import numpy as np
 
+from module5.harness.module6_bridge import build_module6_bridge_artifacts
+
 
 def build_candidate_results(
     all_results: list[dict[str, Any]],
@@ -234,6 +236,20 @@ def finalize_run_outputs(
         harness_cfg=harness_cfg,
     )
 
+    module6_bridge_paths, module6_bridge_summary = build_module6_bridge_artifacts(
+        report_root=report_root,
+        run_id=run_id,
+        execution_mode=execution_mode,
+        common_sessions=common_sessions,
+        baseline_candidate_ids=baseline_candidate_ids,
+        candidate_daily_mat=daily_mat_exec,
+        candidates=candidates,
+        candidate_rows=sorted(candidate_rows, key=lambda x: str(x["candidate_id"])),
+        all_results=all_results,
+        engine_cfg=engine_cfg,
+        require_pandas_fn=require_pandas_fn,
+    )
+
     leaderboard_csv_path = report_root / "leaderboard.csv"
     leaderboard_json_path = report_root / "leaderboard.json"
     robustness_csv_path = report_root / "robustness_leaderboard.csv"
@@ -451,6 +467,7 @@ def finalize_run_outputs(
             "degrade_count": int((dq_day_df.get("decision", pdx.Series(dtype=str)) == dq_degrade).sum()) if dq_day_df.shape[0] > 0 else 0,
             "reject_count": int((dq_day_df.get("decision", pdx.Series(dtype=str)) == dq_reject).sum()) if dq_day_df.shape[0] > 0 else 0,
         },
+        "module6_bridge": dict(module6_bridge_summary),
     }
     final_artifact_generation_sec = float(time.perf_counter() - artifact_t0)
     run_status["final_artifact_generation_sec"] = float(final_artifact_generation_sec)
@@ -485,6 +502,7 @@ def finalize_run_outputs(
             artifact_paths["micro_profile_blocks"] = str(micro_profile_blocks_path)
         if bool(harness_cfg.micro_diag_export_funnel):
             artifact_paths["funnel_1545"] = str(funnel_1545_path)
+    artifact_paths.update(module6_bridge_paths)
 
     return harness_output_cls(
         candidate_results=build_candidate_results(all_results, candidate_verdict),
