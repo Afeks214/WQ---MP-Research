@@ -68,7 +68,10 @@ def max_drawdown_from_returns(ret_1d: np.ndarray) -> float:
         return 0.0
     eq = np.cumprod(1.0 + r)
     peak = np.maximum.accumulate(eq)
-    dd = np.where(peak > 0.0, eq / peak - 1.0, 0.0)
+    dd = np.zeros_like(eq, dtype=np.float64)
+    peak_pos = peak > 0.0
+    np.divide(eq, peak, out=dd, where=peak_pos)
+    dd[peak_pos] -= 1.0
     return float(abs(np.min(dd)))
 
 

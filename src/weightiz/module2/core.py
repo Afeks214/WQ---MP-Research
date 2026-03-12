@@ -1264,7 +1264,7 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
             valid_ret = valid_win[1:] & valid_win[:-1] & np.isfinite(close_win[1:]) & np.isfinite(close_win[:-1])
             numer = close_win[1:] - close_win[:-1]
             denom_r = atr_t[None, :] + state.eps.eps_div[None, :]
-            r_k[1:] = np.where(valid_ret, numer / denom_r, 0.0)
+            np.divide(numer, denom_r, out=r_k[1:], where=valid_ret)
             med_r = _nanmedian_silent(np.where(valid_win, r_k, np.nan), axis=0)
             sr = 1.4826 * _nanmedian_silent(np.abs(np.where(valid_win, r_k, np.nan) - med_r[None, :]), axis=0)
             s_eff_r = np.maximum(np.where(np.isfinite(sr), sr, 0.0), 0.5 * dx)

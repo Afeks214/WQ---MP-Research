@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import warnings
 
 import numpy as np
 import pytest
@@ -9,6 +10,7 @@ pd = pytest.importorskip("pandas")
 
 from weightiz.module5.harness.evaluation_path import (
     assert_artifact_dependency_contract,
+    benchmark_daily_returns,
     collect_funnel_payload,
     collect_micro_diagnostics_payload,
     collect_micro_profile_blocks_payload,
@@ -296,6 +298,40 @@ def test_compact_artifact_builders_enforce_declared_dependencies_only() -> None:
     assert micro is not None and micro["position_qty"].shape[0] > 0
     assert profile is not None and profile["vp_block_blob"].shape[0] == 4
     assert funnel is not None and funnel["is_winner"].shape[0] == 2
+
+
+def test_benchmark_daily_returns_skips_all_invalid_basket_rows_without_warning() -> None:
+    state = _build_state(a_count=2)
+    state.bar_valid[1, :] = False
+    state.close_px[1, :] = np.nan
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        sess, ret = benchmark_daily_returns(
+            state,
+            benchmark_symbol="MISSING",
+            session_bounds_fn=lambda sid: (
+                np.asarray([0, 2], dtype=np.int64),
+                np.asarray([2, 4], dtype=np.int64),
+                np.asarray([0, 1], dtype=np.int64),
+            ),
+        )
+
+    assert sess.tolist() == [0, 1]
+    np.testing.assert_allclose(ret, np.array([0.0, -0.26], dtype=np.float64))
+    assert not any("Mean of empty slice" in str(w.message) for w in caught)
+
+
+def test_equity_curve_payload_avoids_zero_peak_division_warning() -> None:
+    view, _m3, _m4_out, _split, _cfg = _build_compact_execution_view()
+    view.equity[:] = 0.0
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        eq = equity_curve_payload(view, "cand", "wf_000", "baseline")
+
+    np.testing.assert_allclose(eq["drawdown"], np.zeros(view.cfg.T, dtype=np.float64))
+    assert not any("divide by zero" in str(w.message) or "invalid value" in str(w.message) for w in caught)
 
 
 def test_strategy_results_contract_fails_closed_when_required_field_missing() -> None:

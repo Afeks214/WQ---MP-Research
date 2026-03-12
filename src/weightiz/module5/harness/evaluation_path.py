@@ -532,8 +532,11 @@ def benchmark_daily_returns(
     for s0, s1, sid in zip(starts.tolist(), ends.tolist(), sessions.tolist()):
         close_seg = state.close_px[s0:s1]
         valid_seg = state.bar_valid[s0:s1]
-
-        basket_close = np.nanmean(np.where(valid_seg, close_seg, np.nan), axis=1)
+        valid_close = valid_seg & np.isfinite(close_seg)
+        basket_sum = np.sum(np.where(valid_close, close_seg, 0.0), axis=1, dtype=np.float64)
+        basket_count = np.sum(valid_close, axis=1, dtype=np.int64)
+        basket_close = np.full(close_seg.shape[0], np.nan, dtype=np.float64)
+        np.divide(basket_sum, basket_count, out=basket_close, where=(basket_count > 0))
         finite_idx = np.flatnonzero(np.isfinite(basket_close))
         if finite_idx.size == 0:
             continue
@@ -565,7 +568,10 @@ def equity_curve_payload(
     assert_artifact_dependency_contract("equity_curves", state=state)
     eq = state.equity.astype(np.float64)
     peak = np.maximum.accumulate(eq)
-    dd = np.where(peak > 0.0, eq / peak - 1.0, 0.0)
+    dd = np.zeros_like(eq, dtype=np.float64)
+    peak_pos = peak > 0.0
+    np.divide(eq, peak, out=dd, where=peak_pos)
+    dd[peak_pos] -= 1.0
     t_count = state.cfg.T
 
     return {
