@@ -22,7 +22,24 @@ def test_allocation_math_and_ranking_are_locked() -> None:
 
     np.testing.assert_allclose(out.allocation_score[:, 0], np.array([0.3, -0.3], dtype=np.float64))
     np.testing.assert_allclose(out.target_weight[:, 0], np.array([0.5, -0.5], dtype=np.float64))
-    np.testing.assert_array_equal(out.allocation_rank[:, 1], np.array([0, 1], dtype=np.int16))
+    np.testing.assert_array_equal(out.allocation_rank[:, 1], np.array([0, 0], dtype=np.int16))
+
+
+def test_allocation_ties_share_rank_bucket() -> None:
+    conviction = np.array([[0.4], [0.4], [0.2]], dtype=np.float64)
+    confidence = np.ones((3, 1), dtype=np.float64)
+    tradable = np.ones((3, 1), dtype=bool)
+    asset_enabled = np.array([True, True, True], dtype=bool)
+
+    out = compute_normalized_signal_allocation(
+        conviction_net=conviction,
+        regime_confidence=confidence,
+        tradable_mask=tradable,
+        asset_enabled_mask=asset_enabled,
+        cfg4=Module4Config(max_abs_weight=1.0, eps=1e-12),
+    )
+
+    np.testing.assert_array_equal(out.allocation_rank[:, 0], np.array([0, 0, 2], dtype=np.int16))
 
 
 def test_allocation_zeroes_masked_assets() -> None:

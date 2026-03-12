@@ -13,6 +13,29 @@ class AllocationResult:
     allocation_valid_mask: np.ndarray
 
 
+def _rank_with_tie_buckets(score_t: np.ndarray, abs_conv_t: np.ndarray, *, eps: float) -> np.ndarray:
+    score = np.asarray(score_t, dtype=np.float64)
+    abs_conv = np.asarray(abs_conv_t, dtype=np.float64)
+    idx = np.arange(score.shape[0], dtype=np.int64)
+    order = np.lexsort((idx, -abs_conv, -score))
+    ranks = np.empty(score.shape[0], dtype=np.int16)
+
+    start = 0
+    while start < order.shape[0]:
+        ref = int(order[start])
+        end = start + 1
+        while end < order.shape[0]:
+            cur = int(order[end])
+            same_score = np.isclose(score[cur], score[ref], rtol=0.0, atol=float(eps))
+            same_abs_conv = np.isclose(abs_conv[cur], abs_conv[ref], rtol=0.0, atol=float(eps))
+            if not (same_score and same_abs_conv):
+                break
+            end += 1
+        ranks[order[start:end]] = np.int16(start)
+        start = end
+    return ranks
+
+
 def compute_normalized_signal_allocation(
     *,
     conviction_net: np.ndarray,
@@ -43,14 +66,11 @@ def compute_normalized_signal_allocation(
     target_weight = np.where(asset_enabled[:, None], target_weight, 0.0)
 
     rank = np.zeros((A, T), dtype=np.int16)
-    idx = np.arange(A, dtype=np.int64)
+    eps = float(getattr(cfg4, "eps", 1e-12))
     for t in range(T):
         score_t = allocation_score[:, t]
         abs_conv_t = np.abs(conviction[:, t])
-        order = np.lexsort((idx, -abs_conv_t, -score_t))
-        inv = np.empty(A, dtype=np.int16)
-        inv[order] = np.arange(A, dtype=np.int16)
-        rank[:, t] = inv
+        rank[:, t] = _rank_with_tie_buckets(score_t, abs_conv_t, eps=eps)
 
     valid = np.isfinite(conviction) & np.isfinite(confidence)
     valid &= asset_enabled[:, None]
