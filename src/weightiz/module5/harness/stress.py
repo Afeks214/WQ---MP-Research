@@ -43,23 +43,25 @@ def apply_missing_bursts(
         return
 
     t_count, a_count = state.bar_valid.shape
-    start_mask = (rng.random((t_count, a_count)) < float(scenario.missing_burst_prob)) & active_t[:, None]
-    starts = np.argwhere(start_mask)
+    active = np.asarray(active_t, dtype=bool)
 
     lo_len = int(max(1, scenario.missing_burst_min))
     hi_len = int(max(lo_len, scenario.missing_burst_max))
 
-    for t0, a in starts.tolist():
-        length = int(rng.integers(lo_len, hi_len + 1))
-        t1 = min(t_count, int(t0) + length)
-        state.open_px[t0:t1, a] = np.nan
-        state.high_px[t0:t1, a] = np.nan
-        state.low_px[t0:t1, a] = np.nan
-        state.close_px[t0:t1, a] = np.nan
-        state.volume[t0:t1, a] = np.nan
-        state.rvol[t0:t1, a] = np.nan
-        state.atr_floor[t0:t1, a] = np.nan
-        state.bar_valid[t0:t1, a] = False
+    for a in range(a_count):
+        start_mask_col = (rng.random(t_count) < float(scenario.missing_burst_prob)) & active
+        starts = np.flatnonzero(start_mask_col).astype(np.int64)
+        for t0 in starts.tolist():
+            length = int(rng.integers(lo_len, hi_len + 1))
+            t1 = min(t_count, int(t0) + length)
+            state.open_px[t0:t1, a] = np.nan
+            state.high_px[t0:t1, a] = np.nan
+            state.low_px[t0:t1, a] = np.nan
+            state.close_px[t0:t1, a] = np.nan
+            state.volume[t0:t1, a] = np.nan
+            state.rvol[t0:t1, a] = np.nan
+            state.atr_floor[t0:t1, a] = np.nan
+            state.bar_valid[t0:t1, a] = False
 
 
 def apply_jitter(
