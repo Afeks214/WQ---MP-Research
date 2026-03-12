@@ -164,6 +164,54 @@ def build_memory_accounting_estimate(
     )
 
 
+def estimate_worker_pool_capacity(
+    *,
+    available_bytes: int,
+    max_ram_utilization_frac: float,
+    safety_margin_frac: float,
+    safety_margin_min_bytes: int,
+    base_bytes: int,
+    market_overlay_bytes: int,
+    feature_overlay_bytes: int,
+    queue_bytes: int,
+    result_buffer_bytes: int,
+    requested_workers: int,
+    worker_overhead_bytes: int | None = None,
+) -> int:
+    avail = int(max(0, available_bytes))
+    budget = int(max(0.0, float(max_ram_utilization_frac)) * float(avail))
+    safety_margin_bytes = int(max(int(safety_margin_min_bytes), float(safety_margin_frac) * float(avail)))
+    per_worker_overhead = int(
+        estimate_worker_overhead_bytes(
+            market_overlay_bytes=market_overlay_bytes,
+            feature_overlay_bytes=feature_overlay_bytes,
+            module3_bytes=0,
+            candidate_scratch_bytes=0,
+        )
+        if worker_overhead_bytes is None
+        else max(0, int(worker_overhead_bytes))
+    )
+    resident_per_worker_bytes = int(
+        max(1, int(market_overlay_bytes) + int(feature_overlay_bytes) + per_worker_overhead)
+    )
+    usable_budget = int(
+        max(
+            0,
+            budget
+            - int(base_bytes)
+            - int(queue_bytes)
+            - int(result_buffer_bytes)
+            - int(safety_margin_bytes),
+        )
+    )
+    return int(
+        min(
+            max(1, int(requested_workers)),
+            max(1, usable_budget // max(resident_per_worker_bytes, 1)),
+        )
+    )
+
+
 def chunk_policy_memory_cap(
     *,
     budget_bytes: int,

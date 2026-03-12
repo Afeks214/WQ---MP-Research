@@ -5,6 +5,7 @@ import pytest
 from weightiz.module5.harness.memory_accounting import (
     build_memory_accounting_estimate,
     chunk_policy_memory_cap,
+    estimate_worker_pool_capacity,
     resolve_base_sharing_mode,
 )
 
@@ -42,6 +43,40 @@ def test_chunk_policy_memory_cap_uses_requested_workers() -> None:
         result_buffer_bytes=1_000,
         safety_margin_bytes=1_000,
     ) == 1_250
+
+
+def test_estimate_worker_pool_capacity_separates_resident_pool_from_active_work() -> None:
+    estimate = build_memory_accounting_estimate(
+        available_bytes=17_179_869_184,
+        max_ram_utilization_frac=0.70,
+        safety_margin_frac=0.15,
+        safety_margin_min_bytes=8 * 1024**3,
+        base_bytes=1_658_736,
+        market_overlay_bytes=514_800,
+        feature_overlay_bytes=50_119_680,
+        module3_bytes=512 * 1024**2,
+        candidate_scratch_bytes=240_240,
+        queue_bytes=0,
+        result_buffer_bytes=0,
+        requested_workers=7,
+        worker_overhead_bytes=128 * 1024**2,
+    )
+    pool_capacity = estimate_worker_pool_capacity(
+        available_bytes=17_179_869_184,
+        max_ram_utilization_frac=0.70,
+        safety_margin_frac=0.15,
+        safety_margin_min_bytes=8 * 1024**3,
+        base_bytes=1_658_736,
+        market_overlay_bytes=514_800,
+        feature_overlay_bytes=50_119_680,
+        queue_bytes=0,
+        result_buffer_bytes=0,
+        requested_workers=7,
+        worker_overhead_bytes=128 * 1024**2,
+    )
+
+    assert estimate.effective_workers == 4
+    assert pool_capacity == 7
 
 
 def test_resolve_base_sharing_mode_prefers_fork_cow_only_on_linux_fork() -> None:

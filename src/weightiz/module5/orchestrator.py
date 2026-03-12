@@ -137,6 +137,7 @@ from weightiz.module5.harness.memory_accounting import (
     chunk_policy_memory_cap as _mem_chunk_policy_memory_cap,
     estimate_queue_bytes as _mem_estimate_queue_bytes,
     estimate_result_buffer_bytes as _mem_estimate_result_buffer_bytes,
+    estimate_worker_pool_capacity as _mem_estimate_worker_pool_capacity,
     resolve_base_sharing_mode as _mem_resolve_base_sharing_mode,
 )
 from weightiz.module5.harness.module6_bridge import (
@@ -2477,6 +2478,19 @@ def run_weightiz_harness(
         requested_workers=int(requested_workers),
         worker_overhead_bytes=int(worker_overhead_bytes),
     )
+    worker_pool_capacity = _mem_estimate_worker_pool_capacity(
+        available_bytes=int(avail),
+        max_ram_utilization_frac=float(harness_cfg.max_ram_utilization_frac),
+        safety_margin_frac=float(harness_cfg.safety_margin_frac),
+        safety_margin_min_bytes=int(harness_cfg.safety_margin_min_bytes),
+        base_bytes=int(shared_base_state.base_bytes),
+        market_overlay_bytes=int(market_overlay_bytes),
+        feature_overlay_bytes=int(feature_overlay_bytes),
+        queue_bytes=0,
+        result_buffer_bytes=0,
+        requested_workers=int(requested_workers),
+        worker_overhead_bytes=int(worker_overhead_bytes),
+    )
     max_workers = int(memory_estimate.effective_workers)
     if process_pool_requested and max_workers <= 1:
         execution_mode = "serial_forced_ram"
@@ -2490,7 +2504,7 @@ def run_weightiz_harness(
         execution_mode = "serial"
     use_process_pool = execution_mode == "process_pool"
     dynamic_effective_workers = int(max_workers if use_process_pool else 1)
-    executor_worker_count = int(max(1, dynamic_effective_workers if use_process_pool else 1))
+    executor_worker_count = int(max(1, worker_pool_capacity if use_process_pool else 1))
     max_in_flight = int(max(1, dynamic_effective_workers * max(1, int(harness_cfg.group_max_in_flight_factor))))
     process_pool_group_reuse_active = bool(group_bound_execution_requested)
     base_sharing_runtime = {
@@ -2870,7 +2884,8 @@ def run_weightiz_harness(
                 return None
 
             def _submit_more() -> None:
-                while len(pending) < int(max_in_flight):
+                submission_limit = int(max(1, dynamic_effective_workers))
+                while len(pending) < submission_limit:
                     g = _next_task()
                     if g is None:
                         break
