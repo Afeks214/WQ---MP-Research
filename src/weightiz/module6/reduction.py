@@ -23,6 +23,14 @@ class ReductionArtifacts:
     overlap_proxy: object
 
 
+def _instance_key_series(frame: pd.DataFrame, cols: list[str]) -> pd.Series:
+    if frame.shape[0] <= 0:
+        return pd.Series(index=frame.index, dtype=object)
+    vals = frame.loc[:, cols].astype(str).to_numpy(dtype=object, copy=False)
+    joined = ["|".join(str(part) for part in row.tolist()) for row in vals]
+    return pd.Series(joined, index=frame.index, dtype=object)
+
+
 def _standardize_columns(matrix: np.ndarray) -> np.ndarray:
     x = np.asarray(matrix, dtype=np.float64)
     if not np.isfinite(x).all():
@@ -81,9 +89,11 @@ def _build_overlap_trade_log(
     if not set(required_cols).issubset(set(overlap_trade_log.columns)):
         return overlap_trade_log
     overlap_trade_log = overlap_trade_log[required_cols].copy()
-    overlap_trade_log["instance_key"] = overlap_trade_log[required_cols[:3]].astype(str).agg("|".join, axis=1)
+    if overlap_trade_log.shape[0] <= 0:
+        return overlap_trade_log
+    overlap_trade_log["instance_key"] = _instance_key_series(overlap_trade_log, required_cols[:3])
     instance_rows = instance_rows[required_cols[:3]].drop_duplicates().copy()
-    instance_rows["instance_key"] = instance_rows.astype(str).agg("|".join, axis=1)
+    instance_rows["instance_key"] = _instance_key_series(instance_rows, required_cols[:3])
     direct_support_keys = set(overlap_trade_log["instance_key"].astype(str).tolist())
     missing = instance_rows.loc[~instance_rows["instance_key"].isin(direct_support_keys)].copy()
     if missing.shape[0] <= 0:

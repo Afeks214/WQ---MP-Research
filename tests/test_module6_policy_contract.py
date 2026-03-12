@@ -56,8 +56,35 @@ def _drop_trade_log_support_for_split(run_dir: Path, *, split_id: str) -> None:
     frame.to_parquet(path, index=False)
 
 
+def _clear_trade_log(run_dir: Path) -> None:
+    path = run_dir / "trade_log.parquet"
+    frame = pd.read_parquet(path)
+    frame.iloc[0:0].copy().to_parquet(path, index=False)
+
+
 def test_representative_discovery_config_resolves_explicit_policy() -> None:
     cfg = _load_config(Path("configs/local_discovery_short_7core.yaml"))
+    base_cfg = make_test_config()
+    assert cfg.harness.research_mode == "discovery"
+    assert int(cfg.module6["generator"]["random_sparse_quota"]) == 64
+    assert int(cfg.module6["generator"]["cluster_balanced_quota"]) == 16
+    assert int(cfg.module6["scoring"]["shortlist_session_keep"]) == 32
+    assert int(cfg.module6["scoring"]["final_primary_count"]) == 2
+    policy_class, min_availability_ratio, min_observed_sessions = resolve_intake_gate_thresholds(
+        replace(
+            base_cfg.intake,
+            run_policy_class=str(cfg.module6["intake"]["run_policy_class"]),
+            min_availability_ratio=float(cfg.module6["intake"]["min_availability_ratio"]),
+            min_observed_sessions=int(cfg.module6["intake"]["min_observed_sessions"]),
+        )
+    )
+    assert policy_class == MODULE6_RUN_POLICY_REPRESENTATIVE_DISCOVERY
+    assert min_availability_ratio == 0.25
+    assert min_observed_sessions == 2
+
+
+def test_adaptive_discovery_config_resolves_explicit_policy() -> None:
+    cfg = _load_config(Path("configs/local_adaptive_discovery_7core.yaml"))
     base_cfg = make_test_config()
     assert cfg.harness.research_mode == "discovery"
     assert int(cfg.module6["generator"]["random_sparse_quota"]) == 64
@@ -185,6 +212,42 @@ def test_reduction_uses_candidate_level_overlap_support_for_representative_disco
         config=cfg,
     )
     assert reduction.admitted_instances.shape[0] > 0
+
+
+def test_reduction_allows_empty_trade_log_for_representative_discovery(tmp_path: Path) -> None:
+    run_dir = build_synthetic_module5_run(tmp_path)
+    _rewrite_policy_contract(
+        run_dir,
+        policy_class=MODULE6_RUN_POLICY_REPRESENTATIVE_DISCOVERY,
+        reject=True,
+        module6_admit=True,
+    )
+    _clear_trade_log(run_dir)
+    base_cfg = make_test_config()
+    cfg = replace(
+        base_cfg,
+        intake=replace(
+            base_cfg.intake,
+            run_policy_class=MODULE6_RUN_POLICY_REPRESENTATIVE_DISCOVERY,
+            min_availability_ratio=0.75,
+            min_observed_sessions=20,
+        ),
+    )
+    loaded = load_module5_run(run_dir, cfg)
+    ledgers = materialize_canonical_ledgers(loaded, run_dir / "ledgers_empty_trade_log", cfg)
+    store = build_matrix_store(ledgers=ledgers, run=loaded, output_dir=run_dir / "matrix_empty_trade_log", config=cfg)
+    matrices = open_matrix_store(store)
+    matrices["column_index"] = store.column_index
+    reduction = reduce_universe(
+        ledgers=ledgers,
+        matrices=matrices,
+        run=loaded,
+        output_dir=run_dir / "reduce_empty_trade_log",
+        config=cfg,
+    )
+    assert reduction.admitted_instances.shape[0] > 0
+    assert int(reduction.overlap_proxy.symbol_support.nnz) == 0
+    assert int(reduction.overlap_proxy.composite.nnz) == 0
 
 
 def test_standard_policy_stays_fail_closed_when_canonical_symbol_support_is_missing(tmp_path: Path) -> None:

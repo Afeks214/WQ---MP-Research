@@ -2206,6 +2206,30 @@ harness:
   micro_diag_export_funnel: true
   micro_diag_max_rows: 5000000
   research_mode: discovery
+module6:
+  intake:
+    run_policy_class: representative_discovery
+    min_availability_ratio: 0.25
+    min_observed_sessions: 2
+  generator:
+    random_sparse_quota: 64
+    cluster_balanced_quota: 16
+    hrp_variant_quota: 12
+    mv_variant_quota: 2
+    random_sparse_batch_size: 16
+    active_cardinality_choices:
+    - 4
+    - 6
+    - 8
+    - 12
+    enable_mv_diagnostic: false
+  scoring:
+    min_cross_universe_support: 0.70
+    shortlist_session_keep: 32
+    shortlist_minute_keep: 12
+    final_scalar_keep: 8
+    final_primary_count: 2
+    final_alternate_count: 2
 stress_scenarios:
 - scenario_id: baseline
   name: baseline

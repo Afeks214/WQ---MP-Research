@@ -115,6 +115,15 @@ def build_execution_overlap_proxy(
     required_cols = {"candidate_id", "split_id", "scenario_id", "symbol"}
     if not required_cols.issubset(set(trade_log.columns)):
         raise Module6ValidationError("trade_log missing required columns for execution overlap proxy")
+    if trade_log.shape[0] <= 0:
+        empty = sparse.csr_matrix((n_count, n_count), dtype=np.float64)
+        return ExecutionOverlapComponents(
+            symbol_support=empty,
+            activity_concurrence=empty,
+            gross_exposure_concurrence=empty,
+            rebalance_collision=empty,
+            composite=empty,
+        )
 
     trade_log = trade_log.copy()
     trade_log["strategy_instance_key"] = (
