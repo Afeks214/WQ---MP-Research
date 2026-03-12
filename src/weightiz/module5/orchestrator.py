@@ -1674,6 +1674,7 @@ def _run_group_task(
                 ),
                 risk_cfg=RiskConfig(),
                 session_id_t=st.session_id,
+                volume_ta=st.volume,
             )
             exec_slippage_bps = (
                 float(m4_cfg.slippage_bps_mid_rvol)
@@ -1695,6 +1696,7 @@ def _run_group_task(
                 ),
                 risk_cfg=RiskConfig(),
                 session_id_t=st.session_id,
+                volume_ta=st.volume,
             )
             m4_out = _materialize_risk_outputs_into_state(st, m4_sig, risk_res_exec)
             if _resolve_candidate_scratch_mode(harness_cfg) == "full":

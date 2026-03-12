@@ -8,6 +8,7 @@ import numpy as np
 from weightiz.shared.validation.dtype_guard import assert_float64
 
 REASON_COST_MODEL_VIOLATION = "cost_model_violation"
+TRADING_DAYS_PER_YEAR = 252.0
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,7 @@ class CostConfig:
     short_borrow_apr: float = 0.0
     locate_fee_per_share_short_entry: float = 0.0
     slippage_bps: float = 0.0
+    debit_apr: float = 0.0
 
     def __post_init__(self) -> None:
         if self.reg_fee_per_share_sell is None:
@@ -104,6 +106,20 @@ def _legacy_exec_sell(price: float) -> float:
     return float(price - 0.01)
 
 
+def _session_financing_cost(
+    *,
+    qty: np.ndarray,
+    price: np.ndarray,
+    cash: float,
+    cost_cfg: CostConfig,
+) -> float:
+    short_qty = np.where(qty < 0.0, -qty, 0.0)
+    short_notional = float(np.sum(short_qty * price))
+    borrow_cost = short_notional * float(cost_cfg.short_borrow_apr) / TRADING_DAYS_PER_YEAR
+    debit_cost = max(-float(cash), 0.0) * float(cost_cfg.debit_apr) / TRADING_DAYS_PER_YEAR
+    return float(borrow_cost + debit_cost)
+
+
 def simulate_portfolio_from_signals(
     close_px_ta: np.ndarray,
     target_qty_ta: np.ndarray,
@@ -111,6 +127,7 @@ def simulate_portfolio_from_signals(
     cost_cfg: CostConfig,
     risk_cfg: RiskConfig,
     session_id_t: np.ndarray | None = None,
+    volume_ta: np.ndarray | None = None,
 ) -> SimulationResult:
     close_px_ta = np.asarray(close_px_ta)
     target_qty_ta = np.asarray(target_qty_ta)
@@ -127,6 +144,14 @@ def simulate_portfolio_from_signals(
         session_id_t = np.asarray(session_id_t, dtype=np.int64)
         if session_id_t.shape != (T,):
             raise RuntimeError(f"risk_engine session_id_t shape mismatch: got {session_id_t.shape}, expected {(T,)}")
+        if T > 1 and np.any(np.diff(session_id_t) < 0):
+            raise RuntimeError("risk_engine session_id_t must be nondecreasing")
+    if volume_ta is not None:
+        volume_ta = np.asarray(volume_ta)
+        assert_float64("risk_engine.volume_ta", volume_ta)
+        volume_ta = volume_ta.astype(np.float64, copy=False)
+        if volume_ta.shape != (T, A):
+            raise RuntimeError(f"risk_engine volume_ta shape mismatch: got {volume_ta.shape}, expected {(T, A)}")
     qty = np.zeros(A, dtype=np.float64)
     cash = float(initial_cash)
     eq = np.zeros(T, dtype=np.float64)
@@ -146,12 +171,27 @@ def simulate_portfolio_from_signals(
         if not np.all(np.isfinite(px)):
             raise RuntimeError("risk_engine non-finite price")
         if session_id_t is not None and t > 0 and int(session_id_t[t]) != int(session_id_t[t - 1]):
+            cash -= _session_financing_cost(
+                qty=qty,
+                price=close_px_ta[t - 1],
+                cash=cash,
+                cost_cfg=cost_cfg,
+            )
             day_start_eq = float(cash + np.sum(qty * px))
 
         for a in range(A):
             dq = float(tgt[a] - qty[a])
             if abs(dq) <= 0.0:
                 continue
+            fill_cap = np.inf
+            if volume_ta is not None:
+                volume_bar = float(volume_ta[t, a])
+                if (not np.isfinite(volume_bar)) or volume_bar <= 0.0:
+                    continue
+                fill_cap = float(np.floor(volume_bar))
+                dq = np.sign(dq) * min(abs(dq), fill_cap)
+                if abs(dq) <= 0.0:
+                    continue
             notional = abs(dq) * float(px[a])
             buying_power = max(0.0, day_start_eq)
             if notional > float(risk_cfg.max_position_buying_power_frac) * buying_power + 1e-12:
@@ -159,7 +199,9 @@ def simulate_portfolio_from_signals(
                 dq = np.sign(dq) * np.floor(allowed / max(float(px[a]), 1e-12))
                 if abs(dq) <= 0.0:
                     continue
-            slip = notional * float(cost_cfg.slippage_bps) * 1e-4
+            notional = abs(dq) * float(px[a])
+            participation = 0.0 if not np.isfinite(fill_cap) else abs(dq) / max(fill_cap, 1.0)
+            slip = notional * float(cost_cfg.slippage_bps) * 1e-4 * (1.0 + participation)
             comm = abs(dq) * float(cost_cfg.commission_per_share)
             loc = abs(dq) * float(cost_cfg.locate_fee_per_share_short_entry) if (dq < 0) else 0.0
             reg = 0.0
