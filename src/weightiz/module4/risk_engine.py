@@ -110,18 +110,23 @@ def simulate_portfolio_from_signals(
     initial_cash: float,
     cost_cfg: CostConfig,
     risk_cfg: RiskConfig,
+    session_id_t: np.ndarray | None = None,
 ) -> SimulationResult:
     close_px_ta = np.asarray(close_px_ta)
     target_qty_ta = np.asarray(target_qty_ta)
     assert_float64("risk_engine.close_px_ta", close_px_ta)
     assert_float64("risk_engine.target_qty_ta", target_qty_ta)
     close_px_ta = close_px_ta.astype(np.float64, copy=False)
-    target_qty_ta = target_qty_ta.astype(np.float64, copy=False)
+    target_qty_ta = np.trunc(target_qty_ta.astype(np.float64, copy=False))
 
     if close_px_ta.shape != target_qty_ta.shape:
         raise RuntimeError("risk_engine input shape mismatch")
 
     T, A = close_px_ta.shape
+    if session_id_t is not None:
+        session_id_t = np.asarray(session_id_t, dtype=np.int64)
+        if session_id_t.shape != (T,):
+            raise RuntimeError(f"risk_engine session_id_t shape mismatch: got {session_id_t.shape}, expected {(T,)}")
     qty = np.zeros(A, dtype=np.float64)
     cash = float(initial_cash)
     eq = np.zeros(T, dtype=np.float64)
@@ -140,6 +145,8 @@ def simulate_portfolio_from_signals(
         tgt = target_qty_ta[t]
         if not np.all(np.isfinite(px)):
             raise RuntimeError("risk_engine non-finite price")
+        if session_id_t is not None and t > 0 and int(session_id_t[t]) != int(session_id_t[t - 1]):
+            day_start_eq = float(cash + np.sum(qty * px))
 
         for a in range(A):
             dq = float(tgt[a] - qty[a])
