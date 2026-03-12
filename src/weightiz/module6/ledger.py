@@ -9,7 +9,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from weightiz.module6.config import Module6Config
+from weightiz.module6.config import (
+    MODULE6_RUN_POLICY_STANDARD,
+    Module6Config,
+    normalize_module6_run_policy_class,
+)
 from weightiz.module6.constants import BASE_AVAIL_ALLOWED_CODES
 from weightiz.module6.io import LoadedModule5Run
 from weightiz.module6.utils import Module6ValidationError, assert_no_duplicates, count_flag_tokens, ensure_directory, stable_sha256_parts
@@ -34,11 +38,72 @@ def _metric_scalar(payload: Any, key: str, default: float) -> float:
         return float(default)
 
 
+def _coerce_bool_series(series: pd.Series, *, default: bool) -> pd.Series:
+    if series is None:
+        return pd.Series([], dtype=bool)
+    if series.dtype == bool:
+        return series.fillna(default).astype(bool)
+    normalized = series.fillna(default).map(
+        lambda value: (
+            value
+            if isinstance(value, bool)
+            else str(value).strip().lower() in {"1", "true", "t", "yes", "y"}
+        )
+    )
+    return normalized.astype(bool)
+
+
+def _resolve_module6_admission_contract(
+    leaderboard: pd.DataFrame,
+    *,
+    configured_policy_class: str,
+) -> pd.DataFrame:
+    resolved_policy_class = normalize_module6_run_policy_class(configured_policy_class)
+    df = leaderboard.copy()
+    has_explicit_contract = {
+        "module6_policy_class",
+        "module6_admit",
+    }.issubset(df.columns)
+
+    if has_explicit_contract:
+        df["module6_policy_class"] = df["module6_policy_class"].map(normalize_module6_run_policy_class)
+        df["module6_admit"] = _coerce_bool_series(df["module6_admit"], default=False)
+        if "module6_admission_basis" not in df.columns:
+            df["module6_admission_basis"] = ""
+    elif resolved_policy_class != MODULE6_RUN_POLICY_STANDARD:
+        raise Module6ValidationError(
+            "explicit Module 6 admission contract required for non-standard run policy"
+        )
+    else:
+        df["module6_policy_class"] = MODULE6_RUN_POLICY_STANDARD
+        reject = _coerce_bool_series(df.get("reject", pd.Series(False, index=df.index)), default=False)
+        df["module6_admit"] = ~reject
+        df["module6_admission_basis"] = np.where(
+            df["module6_admit"].astype(bool),
+            "legacy_standard_reject_clear",
+            "legacy_standard_reject_blocked",
+        )
+
+    observed_policy_classes = {
+        normalize_module6_run_policy_class(value)
+        for value in pd.unique(df["module6_policy_class"]).tolist()
+    }
+    if observed_policy_classes != {resolved_policy_class}:
+        raise Module6ValidationError(
+            "module6 admission policy mismatch between config and candidate artifacts: "
+            f"configured={resolved_policy_class} observed={sorted(observed_policy_classes)}"
+        )
+    return df
+
+
 def build_strategy_instance_master(run: LoadedModule5Run, config: Module6Config) -> pd.DataFrame:
     run_id = str(run.run_manifest["run_id"])
     dataset_hash = str(run.run_manifest["dataset_hash"])
     selection = run.strategy_instance_selection.copy()
-    leaderboard = run.leaderboard.copy()
+    leaderboard = _resolve_module6_admission_contract(
+        run.leaderboard.copy(),
+        configured_policy_class=str(config.intake.run_policy_class),
+    )
     candidate_cfg_rows: list[dict[str, Any]] = []
     candidates_root = run.paths.run_dir / "candidates"
     for cdir in sorted(candidates_root.iterdir()):
@@ -144,7 +209,7 @@ def build_strategy_instance_master(run: LoadedModule5Run, config: Module6Config)
     )
     merged["portfolio_admit_flag"] = ~(
         merged["failed"].fillna(False).astype(bool)
-        | merged["reject"].fillna(False).astype(bool)
+        | (~_coerce_bool_series(merged["module6_admit"], default=False))
         | merged["candidate_metrics_failed"].fillna(False).astype(bool)
     )
     merged["constraint_flag_count"] = merged["zimtra_compliance_flags"].fillna("").astype(str).map(count_flag_tokens)
@@ -299,6 +364,9 @@ def build_strategy_master(
         "window_set_size",
         "tags_serialized",
         "portfolio_admit_flag",
+        "module6_policy_class",
+        "module6_admit",
+        "module6_admission_basis",
         "failed",
         "reject",
         "pass",

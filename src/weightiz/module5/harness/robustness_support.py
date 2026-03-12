@@ -6,6 +6,10 @@ from typing import Any, Callable
 
 import numpy as np
 
+from weightiz.module6.config import (
+    MODULE6_RUN_POLICY_REPRESENTATIVE_DISCOVERY,
+    MODULE6_RUN_POLICY_STANDARD,
+)
 from weightiz.module5.regime_detector import RegimeConfig, build_regime_masks, detect_regimes, regime_sample_counts
 from weightiz.module5.strategy_embedding import cluster_strategies_hierarchical_threshold
 from weightiz.module5.stats import (
@@ -15,6 +19,37 @@ from weightiz.module5.stats import (
     spa_test,
     white_reality_check,
 )
+
+
+def resolve_module6_policy_class_from_research_mode(research_mode: str | None) -> str:
+    mode = str(research_mode or "standard").strip().lower()
+    if mode == "discovery":
+        return MODULE6_RUN_POLICY_REPRESENTATIVE_DISCOVERY
+    return MODULE6_RUN_POLICY_STANDARD
+
+
+def resolve_module6_admission_verdict(
+    *,
+    policy_class: str,
+    discovery_included: bool,
+    in_mcs: bool,
+    reject: bool,
+    robustness_score: float,
+) -> tuple[bool, str]:
+    if str(policy_class) == MODULE6_RUN_POLICY_STANDARD:
+        admit = bool(not reject)
+        basis = "standard_reject_clear" if admit else "standard_reject_blocked"
+        return admit, basis
+
+    score_finite = bool(np.isfinite(float(robustness_score)))
+    admit = bool(discovery_included and in_mcs and score_finite)
+    if admit:
+        return True, "representative_discovery_mcs_included"
+    if not discovery_included:
+        return False, "representative_discovery_not_included"
+    if not in_mcs:
+        return False, "representative_discovery_mcs_excluded"
+    return False, "representative_discovery_nonfinite_score"
 
 
 def _slice_score_from_stats(
@@ -204,6 +239,7 @@ def compute_stats_verdict(
     rep_pos_by_col = {int(col): int(i) for i, col in enumerate(cluster_reps.tolist())}
     research_mode = str(getattr(harness_cfg, "research_mode", "standard")).strip().lower()
     discovery_mode = research_mode == "discovery"
+    module6_policy_class = resolve_module6_policy_class_from_research_mode(research_mode)
 
     leaderboard: list[dict[str, Any]] = []
     for j, cid in enumerate(candidate_ids):
@@ -226,6 +262,13 @@ def compute_stats_verdict(
         reject = bool(score < float(harness_cfg.robustness_reject_threshold))
         fragile = bool(exec_j < float(harness_cfg.execution_fragile_threshold))
         pass_flag = bool((not reject) and in_mcs)
+        module6_admit, module6_admission_basis = resolve_module6_admission_verdict(
+            policy_class=module6_policy_class,
+            discovery_included=bool(discovery_mode),
+            in_mcs=in_mcs,
+            reject=reject,
+            robustness_score=score,
+        )
         leaderboard.append(
             {
                 "candidate_id": str(cid),
@@ -244,6 +287,9 @@ def compute_stats_verdict(
                 "standard_reject": reject,
                 "standard_pass": pass_flag,
                 "discovery_included": bool(discovery_mode),
+                "module6_policy_class": str(module6_policy_class),
+                "module6_admit": bool(module6_admit),
+                "module6_admission_basis": str(module6_admission_basis),
                 "fragile": fragile,
                 "reject": reject,
                 "pass": pass_flag,

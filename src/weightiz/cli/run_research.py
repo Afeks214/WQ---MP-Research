@@ -272,6 +272,10 @@ def _build_research_distribution_report(
     research_mode: str,
     plan_doc: Optional[dict[str, Any]],
 ) -> dict[str, Any]:
+    def _normalize_optional_text_series(series: Any) -> Any:
+        normalized = series.fillna("").astype(str).str.strip()
+        return normalized.mask(normalized.str.lower().isin({"nan", "none"}), "")
+
     report: dict[str, Any] = {
         "run_dir": str(run_dir),
         "research_mode": str(research_mode),
@@ -290,6 +294,18 @@ def _build_research_distribution_report(
     if leaderboard.shape[0] <= 0:
         report["notes"].append("empty_robustness_leaderboard.csv")
         return report
+
+    for col in [
+        "family_name",
+        "family_id",
+        "window_set",
+        "hypothesis_id",
+        "parameter_hash",
+        "evaluation_role",
+        "zimtra_compliance_flags",
+    ]:
+        if col in leaderboard.columns:
+            leaderboard[col] = _normalize_optional_text_series(leaderboard[col])
 
     standard_reject_col = "standard_reject" if "standard_reject" in leaderboard.columns else "reject"
     standard_pass_col = "standard_pass" if "standard_pass" in leaderboard.columns else "pass"

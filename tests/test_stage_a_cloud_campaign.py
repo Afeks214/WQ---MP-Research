@@ -220,3 +220,43 @@ def test_research_distribution_report_includes_stage_a_multi_window_surfaces() -
         assert int(report["count_discovery_included"]) == 4
         assert int(report["positive_expectancy_count"]) == 3
         assert int(report["cross_window_consistency_summary"]["hypothesis_count"]) == 2
+
+
+def test_research_distribution_report_ignores_empty_stage_a_metadata_rows() -> None:
+    with tempfile.TemporaryDirectory(prefix="stage_a_report_empty_meta_") as td:
+        run_dir = Path(td) / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        pd.DataFrame(
+            [
+                {
+                    "candidate_id": "cand_0000",
+                    "family_id": "",
+                    "family_name": "",
+                    "hypothesis_id": "",
+                    "parameter_hash": "p0",
+                    "window_set": "",
+                    "evaluation_role": "",
+                    "evaluation_window": np.nan,
+                    "block_minutes": 15,
+                    "cluster_id": 0,
+                    "robustness_score": 0.37,
+                    "execution_robustness": 0.0,
+                    "cum_return": 0.0,
+                    "cost_adjusted_expectancy": 0.0,
+                    "max_drawdown": 0.0,
+                    "standard_reject": True,
+                    "standard_pass": False,
+                    "discovery_included": True,
+                }
+            ]
+        ).to_csv(run_dir / "robustness_leaderboard.csv", index=False)
+
+        report = run_research._build_research_distribution_report(
+            run_dir=run_dir,
+            research_mode="discovery",
+            plan_doc={"adaptive_local_run": {"family_entries": []}},
+        )
+
+        assert report["hypothesis_level_summary"] == []
+        assert int(report["candidate_count"]) == 1

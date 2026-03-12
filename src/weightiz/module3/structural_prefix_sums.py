@@ -15,7 +15,8 @@ def build_prefix_sum(series_atw: np.ndarray) -> np.ndarray:
     x = _assert_atw("series_atw", np.asarray(series_atw, dtype=np.float64))
     A, T, W = x.shape
     prefix = np.zeros((A, T + 1, W), dtype=np.float64)
-    prefix[:, 1:, :] = np.cumsum(x, axis=1, dtype=np.float64)
+    # Neutralize non-finite values so a single invalid sample cannot poison later windows.
+    prefix[:, 1:, :] = np.cumsum(np.where(np.isfinite(x), x, 0.0), axis=1, dtype=np.float64)
     return prefix
 
 

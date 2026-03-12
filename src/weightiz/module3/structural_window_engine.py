@@ -78,9 +78,10 @@ def _rolling_mean_for_series(
 ) -> np.ndarray:
     s = np.asarray(series_atw, dtype=np.float64)
     v = np.asarray(valid_atw, dtype=bool)
-    masked = np.where(v, s, 0.0)
+    effective_valid = v & np.isfinite(s)
+    masked = np.where(effective_valid, s, 0.0)
     ps = build_prefix_sum(masked)
-    pc = build_prefix_count(v)
+    pc = build_prefix_count(effective_valid)
     return rolling_mean_from_prefix(ps, pc, int(window), eps=float(eps))
 
 

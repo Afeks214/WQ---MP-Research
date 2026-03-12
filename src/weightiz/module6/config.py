@@ -10,15 +10,52 @@ from weightiz.module6.constants import (
     MODULE6_SUPPORT_POLICY_VERSION,
 )
 
+MODULE6_RUN_POLICY_STANDARD = "standard"
+MODULE6_RUN_POLICY_REPRESENTATIVE_DISCOVERY = "representative_discovery"
+
+
+def normalize_module6_run_policy_class(raw: str | None) -> str:
+    policy = str(raw or MODULE6_RUN_POLICY_STANDARD).strip().lower()
+    if policy not in {
+        MODULE6_RUN_POLICY_STANDARD,
+        MODULE6_RUN_POLICY_REPRESENTATIVE_DISCOVERY,
+    }:
+        raise ValueError(f"unsupported Module 6 run policy class: {policy}")
+    return policy
+
 
 @dataclass(frozen=True)
 class IntakeConfig:
-    min_availability_ratio: float = 0.95
-    min_observed_sessions: int = 126
+    run_policy_class: str = MODULE6_RUN_POLICY_STANDARD
+    min_availability_ratio: float | None = None
+    min_observed_sessions: int | None = None
     require_bridge_artifacts: bool = True
     canonical_selection_stage: str = "module5_bridge_canonical_baseline_v1"
     require_zero_filled_daily_returns_non_authoritative: bool = True
     required_comparison_support: float = 0.85
+
+
+def resolve_intake_gate_thresholds(intake: IntakeConfig) -> tuple[str, float, int]:
+    policy = normalize_module6_run_policy_class(intake.run_policy_class)
+    raw_min_availability = intake.min_availability_ratio
+    raw_min_sessions = intake.min_observed_sessions
+
+    if policy == MODULE6_RUN_POLICY_STANDARD:
+        min_availability_ratio = 0.95 if raw_min_availability is None else float(raw_min_availability)
+        min_observed_sessions = 126 if raw_min_sessions is None else int(raw_min_sessions)
+    elif raw_min_availability is None or raw_min_sessions is None:
+        raise ValueError(
+            "representative_discovery intake requires explicit min_availability_ratio and min_observed_sessions"
+        )
+    else:
+        min_availability_ratio = float(raw_min_availability)
+        min_observed_sessions = int(raw_min_sessions)
+
+    if not (0.0 <= float(min_availability_ratio) <= 1.0):
+        raise ValueError("module6.intake.min_availability_ratio must be in [0,1]")
+    if int(min_observed_sessions) < 1:
+        raise ValueError("module6.intake.min_observed_sessions must be >=1")
+    return policy, float(min_availability_ratio), int(min_observed_sessions)
 
 
 @dataclass(frozen=True)
@@ -133,4 +170,3 @@ class Module6Config:
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
-

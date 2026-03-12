@@ -12,6 +12,8 @@ from weightiz.module3.bridge import (
     Struct30mIdx,
     run_module3_structural_aggregation,
 )
+from weightiz.module3.structural_prefix_sums import build_prefix_count, build_prefix_sum, rolling_mean_from_prefix
+from weightiz.module3.structural_window_engine import _rolling_mean_for_series
 
 
 def _fill_required_channels(state) -> None:
@@ -87,6 +89,36 @@ def _set_vp_peak(state, t: int, a: int, bins, values):
 
 
 class TestModule3Structure(unittest.TestCase):
+    def test_build_prefix_sum_neutralizes_mid_series_nan(self):
+        series = np.array([[[1.0], [2.0], [np.nan], [4.0], [5.0]]], dtype=np.float64)
+        prefix = build_prefix_sum(series)
+        np.testing.assert_allclose(
+            prefix[:, :, 0],
+            np.array([[0.0, 1.0, 3.0, 3.0, 7.0, 12.0]], dtype=np.float64),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_prefix_mean_matches_finite_reference_when_nan_appears_mid_series(self):
+        series = np.array([[[1.0], [2.0], [np.nan], [4.0], [5.0]]], dtype=np.float64)
+        valid = np.isfinite(series)
+        pref = rolling_mean_from_prefix(build_prefix_sum(series), build_prefix_count(valid), 2)
+        naive = np.full(series.shape, np.nan, dtype=np.float64)
+        for t in range(series.shape[1]):
+            lo = t - 1
+            if lo < 0:
+                continue
+            seg = series[:, lo : t + 1, :]
+            naive[:, t, :] = np.nanmean(seg, axis=1)
+        np.testing.assert_allclose(pref, naive, atol=1e-12, rtol=0.0, equal_nan=True)
+
+    def test_active_rolling_mean_counts_only_finite_samples(self):
+        series = np.array([[[1.0], [2.0], [np.nan], [4.0], [5.0]]], dtype=np.float64)
+        valid = np.ones_like(series, dtype=bool)
+        got = _rolling_mean_for_series(series, valid, 2, eps=1e-12)
+        expected = np.array([[[np.nan], [1.5], [2.0], [4.0], [4.5]]], dtype=np.float64)
+        np.testing.assert_allclose(got, expected, atol=1e-12, rtol=0.0, equal_nan=True)
+
     def test_window_context_validity_ignores_optional_regime_channels_in_non_regime_modes(self):
         A = 1
         T = 3

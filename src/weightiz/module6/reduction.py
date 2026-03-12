@@ -5,7 +5,11 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from weightiz.module6.config import Module6Config
+from weightiz.module6.config import (
+    MODULE6_RUN_POLICY_REPRESENTATIVE_DISCOVERY,
+    Module6Config,
+    resolve_intake_gate_thresholds,
+)
 from weightiz.module6.execution_overlap import build_execution_overlap_proxy
 from weightiz.module6.types import ReducedUniverseSpec
 from weightiz.module6.utils import Module6ValidationError, stable_sha256_parts
@@ -64,6 +68,64 @@ def _projection_neighbors(z: np.ndarray, width: int, seed: int, top_k: int) -> l
     return sorted(pairs)
 
 
+def _build_overlap_trade_log(
+    *,
+    instance_rows: pd.DataFrame,
+    trade_log: pd.DataFrame,
+    intake_policy_class: str,
+) -> pd.DataFrame:
+    overlap_trade_log = trade_log.copy()
+    if str(intake_policy_class) != MODULE6_RUN_POLICY_REPRESENTATIVE_DISCOVERY:
+        return overlap_trade_log
+    required_cols = ["candidate_id", "split_id", "scenario_id", "symbol"]
+    if not set(required_cols).issubset(set(overlap_trade_log.columns)):
+        return overlap_trade_log
+    overlap_trade_log = overlap_trade_log[required_cols].copy()
+    overlap_trade_log["instance_key"] = overlap_trade_log[required_cols[:3]].astype(str).agg("|".join, axis=1)
+    instance_rows = instance_rows[required_cols[:3]].drop_duplicates().copy()
+    instance_rows["instance_key"] = instance_rows.astype(str).agg("|".join, axis=1)
+    direct_support_keys = set(overlap_trade_log["instance_key"].astype(str).tolist())
+    missing = instance_rows.loc[~instance_rows["instance_key"].isin(direct_support_keys)].copy()
+    if missing.shape[0] <= 0:
+        return overlap_trade_log.drop(columns=["instance_key"])
+    candidate_symbol_map = (
+        overlap_trade_log.groupby("candidate_id", dropna=False)["symbol"]
+        .agg(lambda s: tuple(sorted(pd.unique(s.astype(str)).tolist())))
+        .to_dict()
+    )
+    alias_rows: list[dict[str, object]] = []
+    unresolved_candidates: list[str] = []
+    for row in missing.itertuples(index=False):
+        candidate_id = str(row.candidate_id)
+        symbols = tuple(candidate_symbol_map.get(candidate_id, ()))
+        if not symbols:
+            unresolved_candidates.append(candidate_id)
+            continue
+        for symbol in symbols:
+            alias_rows.append(
+                {
+                    "candidate_id": candidate_id,
+                    "split_id": str(row.split_id),
+                    "scenario_id": str(row.scenario_id),
+                    "symbol": str(symbol),
+                }
+            )
+    if unresolved_candidates:
+        unresolved_unique = sorted(set(unresolved_candidates))
+        raise Module6ValidationError(
+            "representative discovery overlap proxy missing candidate-level symbol support: "
+            + ",".join(unresolved_unique[:10])
+        )
+    if alias_rows:
+        overlap_trade_log = pd.concat(
+            [overlap_trade_log.drop(columns=["instance_key"]), pd.DataFrame(alias_rows)],
+            ignore_index=True,
+        ).drop_duplicates(required_cols, keep="first")
+    else:
+        overlap_trade_log = overlap_trade_log.drop(columns=["instance_key"])
+    return overlap_trade_log
+
+
 def reduce_universe(
     *,
     ledgers: dict[str, pd.DataFrame],
@@ -75,12 +137,34 @@ def reduce_universe(
     strategy_master = ledgers["strategy_master"].copy()
     instance_master = ledgers["strategy_instance_master"].copy()
     session_ledger = ledgers["strategy_session_ledger"].copy()
+    try:
+        intake_policy_class, min_availability_ratio, min_observed_sessions = resolve_intake_gate_thresholds(
+            config.intake
+        )
+    except ValueError as exc:
+        raise Module6ValidationError(str(exc)) from exc
+    if "module6_policy_class" not in strategy_master.columns:
+        raise Module6ValidationError("strategy_master missing module6_policy_class")
+    observed_policy_classes = {
+        str(value).strip().lower()
+        for value in pd.unique(strategy_master["module6_policy_class"]).tolist()
+    }
+    if observed_policy_classes != {str(intake_policy_class)}:
+        raise Module6ValidationError(
+            "strategy_master policy class mismatch for reduction intake: "
+            f"configured={intake_policy_class} observed={sorted(observed_policy_classes)}"
+        )
+    reject_gate = (
+        ~strategy_master["reject"].fillna(False).astype(bool)
+        if str(intake_policy_class) == "standard"
+        else pd.Series(True, index=strategy_master.index, dtype=bool)
+    )
     admitted = strategy_master.loc[
         strategy_master["portfolio_admit_flag"].astype(bool)
         & (~strategy_master["failed"].fillna(False).astype(bool))
-        & (~strategy_master["reject"].fillna(False).astype(bool))
-        & (pd.to_numeric(strategy_master["availability_ratio"], errors="coerce").fillna(0.0) >= float(config.intake.min_availability_ratio))
-        & (pd.to_numeric(strategy_master["observed_session_count"], errors="coerce").fillna(0).astype(int) >= int(config.intake.min_observed_sessions))
+        & reject_gate
+        & (pd.to_numeric(strategy_master["availability_ratio"], errors="coerce").fillna(0.0) >= float(min_availability_ratio))
+        & (pd.to_numeric(strategy_master["observed_session_count"], errors="coerce").fillna(0).astype(int) >= int(min_observed_sessions))
         & (pd.to_numeric(strategy_master["avg_turnover_metrics"], errors="coerce").fillna(0.0) >= 0.0)
     ].copy()
     if admitted.shape[0] <= 0:
@@ -109,7 +193,7 @@ def reduce_universe(
     r_sub = r_exec[:, column_idx]
     a_sub = a[:, column_idx]
     support_ratio = np.mean(a_sub, axis=0)
-    keep_mask = support_ratio >= float(config.intake.min_availability_ratio)
+    keep_mask = support_ratio >= float(min_availability_ratio)
     canonical_instances = canonical_instances.loc[keep_mask].reset_index(drop=True)
     column_idx = canonical_instances["column_idx"].to_numpy(dtype=np.int64)
     r_sub = r_exec[:, column_idx]
@@ -153,9 +237,14 @@ def reduce_universe(
         seed=int(config.runtime.random_projection_seed),
         top_k=int(config.reduction.ann_top_k),
     )
+    overlap_trade_log = _build_overlap_trade_log(
+        instance_rows=canonical_instances[["candidate_id", "split_id", "scenario_id"]],
+        trade_log=run.trade_log,
+        intake_policy_class=str(intake_policy_class),
+    )
     overlap = build_execution_overlap_proxy(
         instance_rows=canonical_instances[["strategy_instance_pk", "candidate_id", "split_id", "scenario_id"]],
-        trade_log=run.trade_log,
+        trade_log=overlap_trade_log,
         turnover_matrix=u[:, column_idx],
         gross_peak_matrix=gross_peak[:, column_idx],
         config=config.dependence,
