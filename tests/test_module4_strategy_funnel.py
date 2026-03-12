@@ -76,6 +76,10 @@ class TestModule4StrategyFunnel(unittest.TestCase):
 
         self.assertEqual(out.regime_primary_ta.shape, (st.cfg.T, st.cfg.A))
         self.assertEqual(out.target_qty_ta.shape, (st.cfg.T, st.cfg.A))
+        self.assertEqual(out.allocation_score_ta.shape, (st.cfg.T, st.cfg.A))
+        self.assertEqual(out.conviction_net_ta.shape, (st.cfg.T, st.cfg.A))
+        self.assertEqual(out.target_weight_ta.shape, (st.cfg.T, st.cfg.A))
+        self.assertEqual(out.decision_reason_code_ta.shape, (st.cfg.T, st.cfg.A))
         np.testing.assert_array_equal(st.position_qty, position_before)
         np.testing.assert_array_equal(st.equity, equity_before)
 
@@ -101,11 +105,16 @@ class TestModule4StrategyFunnel(unittest.TestCase):
         self.assertTrue(vals.issubset(valid))
         self.assertTrue(np.any(out.regime_primary_ta != np.int8(RegimeIdx.NONE)))
 
-    def test_target_qty_is_finite_bounded_signal_weight(self):
+    def test_target_qty_is_discrete_position_signal_and_weight_telemetry_is_preserved(self):
         st = _mk_state(T=30, A=10)
         out = run_module4_signal_funnel(st, _mk_canonical_m3(st.cfg.T, st.cfg.A), Module4Config(max_abs_weight=0.8))
         self.assertTrue(np.all(np.isfinite(out.target_qty_ta)))
-        self.assertTrue(np.all(np.abs(out.target_qty_ta) <= 0.8 + 1e-12))
+        self.assertTrue(np.all(np.isin(out.target_qty_ta, np.array([-1.0, 0.0, 1.0], dtype=np.float64))))
+        self.assertIsNotNone(out.target_weight_ta)
+        assert out.target_weight_ta is not None
+        self.assertTrue(np.all(np.isfinite(out.target_weight_ta)))
+        self.assertTrue(np.all(np.abs(out.target_weight_ta) <= 0.8 + 1e-12))
+        np.testing.assert_array_equal(out.target_qty_ta, np.sign(out.target_weight_ta))
 
     def test_topk_intraday_is_compatibility_only_in_signal_path(self):
         st = _mk_state(T=30, A=5)

@@ -169,6 +169,33 @@ def test_simulate_portfolio_caps_fills_to_reported_bar_volume() -> None:
 
     np.testing.assert_allclose(out.filled_qty_ta[:, 0], np.array([5.0, 5.0, -5.0, -5.0], dtype=np.float64))
     np.testing.assert_allclose(out.position_qty_ta[:, 0], np.array([5.0, 10.0, 5.0, 0.0], dtype=np.float64))
+    assert out.execution_diagnostics is not None
+    assert int(out.execution_diagnostics["desired_fill_attempt_count"]) == 4
+    assert int(out.execution_diagnostics["volume_cap_hit_count"]) == 2
+    np.testing.assert_allclose(float(out.execution_diagnostics["volume_cap_clipped_qty_abs_sum"]), 10.0, rtol=0.0, atol=1e-12)
+
+
+def test_simulate_portfolio_records_buying_power_cap_reduction() -> None:
+    px = np.full((1, 1), 100.0, dtype=np.float64)
+    tgt = np.full((1, 1), 10.0, dtype=np.float64)
+
+    out = simulate_portfolio_from_signals(
+        px,
+        tgt,
+        1_000.0,
+        CostConfig(),
+        RiskConfig(
+            max_position_buying_power_frac=0.25,
+            overnight_exposure_equity_mult=100.0,
+            daily_loss_limit_frac=1.0,
+            account_disable_equity=0.0,
+        ),
+    )
+
+    np.testing.assert_allclose(out.filled_qty_ta[:, 0], np.array([2.0], dtype=np.float64))
+    assert out.execution_diagnostics is not None
+    assert int(out.execution_diagnostics["buying_power_cap_hit_count"]) == 1
+    np.testing.assert_allclose(float(out.execution_diagnostics["buying_power_cap_clipped_qty_abs_sum"]), 8.0, rtol=0.0, atol=1e-12)
 
 
 def test_simulate_portfolio_slippage_scales_with_participation_and_zero_trade_is_stable() -> None:
