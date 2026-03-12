@@ -189,6 +189,22 @@ class Module4SignalOutput:
             if arr.dtype != dtype:
                 raise RuntimeError(f"{name} dtype must be {dtype}, got {arr.dtype}")
 
+    @property
+    def conviction_net_ta(self) -> np.ndarray | None:
+        return getattr(self, "_conviction_net_ta", None)
+
+    @property
+    def allocation_score_ta(self) -> np.ndarray | None:
+        return getattr(self, "_allocation_score_ta", None)
+
+    @property
+    def target_weight_ta(self) -> np.ndarray | None:
+        return getattr(self, "_target_weight_ta", None)
+
+    @property
+    def decision_reason_code_ta(self) -> np.ndarray | None:
+        return getattr(self, "_decision_reason_code_ta", None)
+
 
 class NonFiniteExecutionPriceError(RuntimeError):
     def __init__(self, reason_code: str, exec_px_dump: dict[str, Any], message: str) -> None:
@@ -381,13 +397,34 @@ def _execute_to_target(
 
 
 def _decision_to_signal_output(decision: Any) -> Module4SignalOutput:
-    return Module4SignalOutput(
+    out = Module4SignalOutput(
         regime_primary_ta=np.ascontiguousarray(np.asarray(decision.regime_id).T, dtype=np.int8),
         regime_confidence_ta=np.ascontiguousarray(np.asarray(decision.regime_confidence).T, dtype=np.float64),
         intent_long_ta=np.ascontiguousarray(np.asarray(decision.intent_long).T, dtype=bool),
         intent_short_ta=np.ascontiguousarray(np.asarray(decision.intent_short).T, dtype=bool),
-        target_qty_ta=np.ascontiguousarray(np.asarray(decision.target_weight).T, dtype=np.float64),
+        target_qty_ta=np.ascontiguousarray(np.asarray(decision.target_position).T, dtype=np.float64),
     )
+    object.__setattr__(
+        out,
+        "_conviction_net_ta",
+        np.ascontiguousarray(np.asarray(decision.conviction_net).T, dtype=np.float64),
+    )
+    object.__setattr__(
+        out,
+        "_allocation_score_ta",
+        np.ascontiguousarray(np.asarray(decision.allocation_score).T, dtype=np.float64),
+    )
+    object.__setattr__(
+        out,
+        "_target_weight_ta",
+        np.ascontiguousarray(np.asarray(decision.target_weight).T, dtype=np.float64),
+    )
+    object.__setattr__(
+        out,
+        "_decision_reason_code_ta",
+        np.ascontiguousarray(np.asarray(decision.telemetry.decision_reason_code).T, dtype=np.int16),
+    )
+    return out
 
 
 def _build_exec_px_dump(

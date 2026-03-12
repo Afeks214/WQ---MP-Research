@@ -23,6 +23,7 @@ class Module4DecisionOutput:
     conviction_long: np.ndarray
     conviction_short: np.ndarray
     conviction_net: np.ndarray
+    allocation_score: np.ndarray
     target_weight: np.ndarray
     target_position: np.ndarray
     target_delta_signal: np.ndarray
@@ -39,6 +40,7 @@ class Module4DecisionOutput:
         conviction_long = np.asarray(self.conviction_long)
         conviction_short = np.asarray(self.conviction_short)
         conviction_net = np.asarray(self.conviction_net)
+        allocation_score = np.asarray(self.allocation_score)
         target_weight = np.asarray(self.target_weight)
         target_position = np.asarray(self.target_position)
         target_delta_signal = np.asarray(self.target_delta_signal)
@@ -56,6 +58,7 @@ class Module4DecisionOutput:
             ("conviction_long", conviction_long, np.float64),
             ("conviction_short", conviction_short, np.float64),
             ("conviction_net", conviction_net, np.float64),
+            ("allocation_score", allocation_score, np.float64),
             ("target_weight", target_weight, np.float64),
             ("target_position", target_position, np.float64),
             ("target_delta_signal", target_delta_signal, np.float64),
@@ -360,6 +363,7 @@ def run_module4_funnel(
         conviction_long=np.ascontiguousarray(conviction_long, dtype=np.float64),
         conviction_short=np.ascontiguousarray(conviction_short, dtype=np.float64),
         conviction_net=np.ascontiguousarray(conviction_net, dtype=np.float64),
+        allocation_score=np.ascontiguousarray(allocation_score, dtype=np.float64),
         target_weight=np.ascontiguousarray(target_weight, dtype=np.float64),
         target_position=np.ascontiguousarray(target_position, dtype=np.float64),
         target_delta_signal=np.ascontiguousarray(target_delta_signal, dtype=np.float64),

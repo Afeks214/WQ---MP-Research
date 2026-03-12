@@ -9,6 +9,7 @@ from typing import Any, Callable
 import numpy as np
 
 from weightiz.module5.harness.module6_bridge import build_module6_bridge_artifacts
+from weightiz.module5.harness.trade_blocker_diagnostics import write_trade_blocker_artifacts
 
 
 def _module6_split_order_key(split_id: str) -> tuple[int, str]:
@@ -295,6 +296,12 @@ def finalize_run_outputs(
         engine_cfg=engine_cfg,
         require_pandas_fn=require_pandas_fn,
     )
+    diagnostic_artifact_paths, diagnostic_summary = write_trade_blocker_artifacts(
+        all_results=all_results,
+        report_root=report_root,
+        require_pandas_fn=require_pandas_fn,
+        write_json_fn=write_json_fn,
+    )
 
     leaderboard_csv_path = report_root / "leaderboard.csv"
     leaderboard_json_path = report_root / "leaderboard.json"
@@ -514,6 +521,7 @@ def finalize_run_outputs(
             "reject_count": int((dq_day_df.get("decision", pdx.Series(dtype=str)) == dq_reject).sum()) if dq_day_df.shape[0] > 0 else 0,
         },
         "module6_bridge": dict(module6_bridge_summary),
+        "trade_blocker_diagnostics": dict(diagnostic_summary),
     }
     final_artifact_generation_sec = float(time.perf_counter() - artifact_t0)
     run_status["final_artifact_generation_sec"] = float(final_artifact_generation_sec)
@@ -548,6 +556,7 @@ def finalize_run_outputs(
             artifact_paths["micro_profile_blocks"] = str(micro_profile_blocks_path)
         if bool(harness_cfg.micro_diag_export_funnel):
             artifact_paths["funnel_1545"] = str(funnel_1545_path)
+    artifact_paths.update(diagnostic_artifact_paths)
     artifact_paths.update(module6_bridge_paths)
 
     return harness_output_cls(

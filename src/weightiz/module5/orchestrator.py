@@ -150,6 +150,10 @@ from weightiz.module5.harness.runtime_truth import (
     build_execution_topology as _truth_build_execution_topology,
     build_feature_tensor_role as _truth_build_feature_tensor_role,
 )
+from weightiz.module5.harness.trade_blocker_diagnostics import (
+    build_candidate_path_diagnostics as _diag_build_candidate_path_diagnostics,
+    build_error_candidate_path_diagnostics as _diag_build_error_candidate_path_diagnostics,
+)
 from weightiz.module5.harness.state_overlay import (
     BaseTensorState,
     CandidateScratch,
@@ -1827,6 +1831,22 @@ def _run_group_task(
                 },
                 "dqs_min": dqs_min,
                 "dqs_median": dqs_median,
+                "execution_path_diagnostics": _diag_build_candidate_path_diagnostics(
+                    task_id=task_id,
+                    candidate_id=str(c.candidate_id),
+                    split_id=str(split.split_id),
+                    scenario_id=str(scenario.scenario_id),
+                    status="ok",
+                    m2_idx=int(c.m2_idx),
+                    m3_idx=int(c.m3_idx),
+                    m4_idx=int(c.m4_idx),
+                    enabled_assets_mask=np.asarray(c.enabled_assets_mask, dtype=bool),
+                    quality_reason_codes=quality_reason_codes,
+                    m4_sig=m4_sig,
+                    target_qty_exec=target_qty_exec,
+                    risk_res_exec=risk_res_exec,
+                    trade_payload=trade_payload,
+                ),
             }
             _eval_assert_artifact_dependency_contract(
                 "strategy_results",
@@ -1883,6 +1903,20 @@ def _run_group_task(
                     "m4_idx": int(c.m4_idx),
                     "tags": list(c.tags),
                     "test_days": 0,
+                    "execution_path_diagnostics": _diag_build_error_candidate_path_diagnostics(
+                        task_id=task_id,
+                        candidate_id=str(c.candidate_id),
+                        split_id=str(split.split_id),
+                        scenario_id=str(scenario.scenario_id),
+                        status="error",
+                        m2_idx=int(c.m2_idx),
+                        m3_idx=int(c.m3_idx),
+                        m4_idx=int(c.m4_idx),
+                        enabled_asset_count=int(np.sum(np.asarray(c.enabled_assets_mask, dtype=bool))),
+                        quality_reason_codes=quality_reason_codes,
+                        error_type=err_type,
+                        error_message=err_msg,
+                    ),
                     "task_seed": int(task_seed),
                     "quality_reason_codes": quality_reason_codes,
                     "dq_invalidated": bool("DQ_REJECTED_INPUT" in quality_reason_codes),

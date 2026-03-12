@@ -74,31 +74,40 @@ def in_memory_date_filter_loader(data_cfg: DataConfigModel) -> Callable[[str, st
         else:
             df = pdx.read_csv(p)
 
+        ts: Any
         if data_cfg.timestamp_column is not None:
             ts_col = find_col(df, (data_cfg.timestamp_column.strip().lower(),), "timestamp")
+            ts = pdx.to_datetime(df[ts_col], utc=True, errors="coerce")
         else:
-            ts_col = find_col(df, ("timestamp", "ts", "datetime", "date", "time"), "timestamp")
+            try:
+                ts_col = find_col(df, ("timestamp", "ts", "datetime", "date", "time"), "timestamp")
+            except RuntimeError:
+                if isinstance(df.index, pdx.DatetimeIndex):
+                    ts = pdx.to_datetime(df.index, utc=True, errors="coerce")
+                else:
+                    raise
+            else:
+                ts = pdx.to_datetime(df[ts_col], utc=True, errors="coerce")
 
         o_col = find_col(df, ("open", "o"), "open")
         h_col = find_col(df, ("high", "h"), "high")
         l_col = find_col(df, ("low", "l"), "low")
         c_col = find_col(df, ("close", "c"), "close")
         v_col = find_col(df, ("volume", "vol", "v"), "volume")
-
-        ts = pdx.to_datetime(df[ts_col], utc=True, errors="coerce")
-        keep = ts.notna().to_numpy(dtype=bool)
+        keep = np.asarray(pdx.notna(ts), dtype=bool)
 
         if start_utc is not None:
-            keep &= (ts >= start_utc).to_numpy(dtype=bool)
+            keep &= np.asarray(ts >= start_utc, dtype=bool)
         if end_utc is not None:
-            keep &= (ts <= end_utc).to_numpy(dtype=bool)
+            keep &= np.asarray(ts <= end_utc, dtype=bool)
 
         if not np.any(keep):
             raise RuntimeError(f"No rows after timestamp/date filtering for {path}")
 
+        filtered_ts = pdx.DatetimeIndex(ts[keep]).floor("min")
         out = pdx.DataFrame(
             {
-                "timestamp": ts[keep].dt.floor("min"),
+                "timestamp": filtered_ts,
                 "open": pdx.to_numeric(df.loc[keep, o_col], errors="coerce"),
                 "high": pdx.to_numeric(df.loc[keep, h_col], errors="coerce"),
                 "low": pdx.to_numeric(df.loc[keep, l_col], errors="coerce"),

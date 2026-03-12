@@ -61,6 +61,7 @@ class SimulationResult:
     gross_exposure_peak: float = 0.0
     trade_log: list[dict[str, Any]] | None = None
     per_asset_cumret: dict[str, float] | None = None
+    execution_diagnostics: dict[str, Any] | None = None
 
 
 def _max_drawdown(eq: np.ndarray) -> float:
@@ -164,6 +165,21 @@ def simulate_portfolio_from_signals(
     daily_loss_t = np.zeros(T, dtype=np.float64)
     trades = 0
     day_start_eq = float(initial_cash)
+    execution_diagnostics: dict[str, Any] = {
+        "desired_fill_attempt_count": 0,
+        "desired_fill_qty_abs_sum": 0.0,
+        "filled_trade_count": 0,
+        "filled_qty_abs_sum": 0.0,
+        "volume_cap_hit_count": 0,
+        "volume_cap_rejected_count": 0,
+        "volume_cap_desired_qty_abs_sum": 0.0,
+        "volume_cap_filled_qty_abs_sum": 0.0,
+        "volume_cap_clipped_qty_abs_sum": 0.0,
+        "buying_power_cap_hit_count": 0,
+        "buying_power_cap_desired_qty_abs_sum": 0.0,
+        "buying_power_cap_filled_qty_abs_sum": 0.0,
+        "buying_power_cap_clipped_qty_abs_sum": 0.0,
+    }
 
     for t in range(T):
         px = close_px_ta[t]
@@ -180,23 +196,44 @@ def simulate_portfolio_from_signals(
             day_start_eq = float(cash + np.sum(qty * px))
 
         for a in range(A):
-            dq = float(tgt[a] - qty[a])
-            if abs(dq) <= 0.0:
+            desired_dq = float(tgt[a] - qty[a])
+            if abs(desired_dq) <= 0.0:
                 continue
+            execution_diagnostics["desired_fill_attempt_count"] += 1
+            execution_diagnostics["desired_fill_qty_abs_sum"] += abs(desired_dq)
+            dq = float(desired_dq)
             fill_cap = np.inf
             if volume_ta is not None:
                 volume_bar = float(volume_ta[t, a])
                 if (not np.isfinite(volume_bar)) or volume_bar <= 0.0:
+                    execution_diagnostics["volume_cap_hit_count"] += 1
+                    execution_diagnostics["volume_cap_rejected_count"] += 1
+                    execution_diagnostics["volume_cap_desired_qty_abs_sum"] += abs(desired_dq)
+                    execution_diagnostics["volume_cap_clipped_qty_abs_sum"] += abs(desired_dq)
                     continue
                 fill_cap = float(np.floor(volume_bar))
+                dq_before_volume_cap = float(dq)
                 dq = np.sign(dq) * min(abs(dq), fill_cap)
+                if abs(dq) + 1.0e-12 < abs(dq_before_volume_cap):
+                    execution_diagnostics["volume_cap_hit_count"] += 1
+                    execution_diagnostics["volume_cap_desired_qty_abs_sum"] += abs(dq_before_volume_cap)
+                    execution_diagnostics["volume_cap_filled_qty_abs_sum"] += abs(dq)
+                    execution_diagnostics["volume_cap_clipped_qty_abs_sum"] += abs(dq_before_volume_cap) - abs(dq)
+                    if abs(dq) <= 0.0:
+                        execution_diagnostics["volume_cap_rejected_count"] += 1
                 if abs(dq) <= 0.0:
                     continue
             notional = abs(dq) * float(px[a])
             buying_power = max(0.0, day_start_eq)
             if notional > float(risk_cfg.max_position_buying_power_frac) * buying_power + 1e-12:
                 allowed = float(risk_cfg.max_position_buying_power_frac) * buying_power
+                dq_before_buying_power_cap = float(dq)
                 dq = np.sign(dq) * np.floor(allowed / max(float(px[a]), 1e-12))
+                if abs(dq) + 1.0e-12 < abs(dq_before_buying_power_cap):
+                    execution_diagnostics["buying_power_cap_hit_count"] += 1
+                    execution_diagnostics["buying_power_cap_desired_qty_abs_sum"] += abs(dq_before_buying_power_cap)
+                    execution_diagnostics["buying_power_cap_filled_qty_abs_sum"] += abs(dq)
+                    execution_diagnostics["buying_power_cap_clipped_qty_abs_sum"] += abs(dq_before_buying_power_cap) - abs(dq)
                 if abs(dq) <= 0.0:
                     continue
             notional = abs(dq) * float(px[a])
@@ -215,6 +252,8 @@ def simulate_portfolio_from_signals(
             exec_price[t, a] = float(px[a])
             trade_cost[t, a] = float(total_cost)
             trades += 1
+            execution_diagnostics["filled_trade_count"] += 1
+            execution_diagnostics["filled_qty_abs_sum"] += abs(dq)
 
         market_value = float(np.sum(qty * px))
         equity = float(cash + market_value)
@@ -266,6 +305,7 @@ def simulate_portfolio_from_signals(
         gross_exposure_peak=float(np.max(margin_used_t)) if margin_used_t.size else 0.0,
         trade_log=[],
         per_asset_cumret={},
+        execution_diagnostics=execution_diagnostics,
     )
 
 
@@ -419,4 +459,5 @@ def simulate_portfolio_task(*args: Any, **kwargs: Any) -> SimulationResult:
         gross_exposure_peak=float(max_gross),
         trade_log=trade_log,
         per_asset_cumret=per_asset_cumret,
+        execution_diagnostics=None,
     )
