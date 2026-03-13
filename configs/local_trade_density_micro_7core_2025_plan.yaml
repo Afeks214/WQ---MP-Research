@@ -1,0 +1,126 @@
+plan_name: local_trade_density_micro_7core_2025_plan
+source_config: configs/local_trade_density_micro_7core_2025.yaml
+research_mode: discovery
+
+baseline_reference:
+  run_dir: /Users/afekshusterman/Documents/New project/artifacts/run_20260312_224716
+  candidates: 768
+  tasks: 2304
+  trade_log_rows: 157850
+  dry_paths: 768
+  dry_path_ratio: 0.3333333333333333
+  traded_paths: 1536
+  traded_path_ratio: 0.6666666666666666
+  dominant_dry_split: wf_000
+  strongest_families:
+    - family_c_regime_classification
+    - family_a_activation_frontier
+
+micro_campaign_policy:
+  intent: targeted_trade_density_micro_campaign
+  split_reshape_reason: extend local horizon and weaken single-split dominance
+  family_reshape_reason: move budget toward live axes and away from dead magnitude knobs
+  bounded_execution: true
+  canonical_pipeline: Module2 -> Module3 -> Module4(signal-only) -> Module5/risk/execution -> Module6
+
+split_design:
+  data_start_utc: '2025-01-02T00:00:00Z'
+  data_end_utc: '2025-01-31T23:59:59Z'
+  expected_sessions: 20
+  wf_train_sessions: 4
+  wf_test_sessions: 6
+  wf_step_sessions: 2
+  expected_splits: 6
+  rationale: >
+    Replace the prior 8-session 2x2 campaign with a 20-session 4x6 step-2 walk-forward
+    so one dead split cannot dominate one-third of the total outcomes while satisfying
+    representative_discovery availability coverage.
+
+module3_budget:
+  m3_config_count: 4
+  selected_windows:
+    - 15
+    - 20
+    - 30
+    - 40
+  removed_variants:
+    - include_partial_last_block=false duplicates
+  rationale: Module3 axes were weak in the baseline; keep only a lean representative set.
+
+family_budget:
+  total_m4_configs: 36
+  total_candidates: 144
+  expected_tasks: 864
+  families:
+    - family_name: family_a_activation_frontier_expanded
+      research_purpose: increase setup admission with lower confidence floors and tighter entry bands
+      m4_index_range: [0, 7]
+      m4_config_count: 8
+      candidate_budget: 32
+      live_axes:
+        entry_threshold: [0.48, 0.54, 0.60, 0.66]
+        regime_confidence_min: [0.40, 0.50]
+      removed_axes:
+        - high confidence sparse corner >= 0.64
+    - family_name: family_b2_persistence_small
+      research_purpose: retain a minimal persistence check with live axes only
+      m4_index_range: [8, 11]
+      m4_config_count: 4
+      candidate_budget: 16
+      live_axes:
+        entry_threshold: [0.50, 0.58]
+        exit_threshold: [0.10, 0.20]
+      removed_axes:
+        - conviction_scale
+    - family_name: family_c_regime_classification_density
+      research_purpose: maximize directional regime admission in the productive shape/confidence band
+      m4_index_range: [12, 23]
+      m4_config_count: 12
+      candidate_budget: 48
+      live_axes:
+        trend_spread_min: [0.05, 0.07, 0.09]
+        shape_skew_min_abs: [0.35, 0.50]
+        regime_confidence_min: [0.50, 0.58]
+      removed_axes:
+        - shape_skew_min_abs=0.20
+        - regime_confidence_min=0.68
+    - family_name: family_d2_short_window_trade_density
+      research_purpose: force short-window specialists with live setup-density controls only
+      m4_index_range: [24, 35]
+      m4_config_count: 12
+      candidate_budget: 48
+      live_axes:
+        fixed_window_index: [0, 1, 2]
+        regime_confidence_min: [0.50, 0.58]
+        entry_threshold: [0.50, 0.58]
+      removed_axes:
+        - max_abs_weight
+        - conviction_clip
+
+live_axes:
+  - module3.block_minutes
+  - module4.entry_threshold
+  - module4.exit_threshold
+  - module4.regime_confidence_min
+  - module4.window_selection_mode
+  - module4.fixed_window_index
+  - module4.anchor_window_index
+  - module4.trend_spread_min
+  - module4.trend_poc_drift_min_abs
+  - module4.neutral_poc_drift_max_abs
+  - module4.shape_skew_min_abs
+  - module4.double_dist_sep_x
+  - module4.double_dist_valley_frac
+
+removed_dead_axis_budget:
+  - module4.conviction_scale
+  - module4.conviction_clip
+  - module4.max_abs_weight
+
+kpi_targets:
+  setup_path_pct_min: 85
+  nontrivial_signal_pct_min: 85
+  fill_attempt_pct_min: 80
+  trade_log_path_pct_min: 80
+  dry_path_pct_max: 20
+  active_path_trade_density_range: [90, 160]
