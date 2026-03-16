@@ -9,6 +9,8 @@ from weightiz.shared.validation.dtype_guard import assert_float64
 
 REASON_COST_MODEL_VIOLATION = "cost_model_violation"
 TRADING_DAYS_PER_YEAR = 252.0
+EXECUTION_COST_MODEL_STATIC = "static_mid_rvol_legacy"
+EXECUTION_COST_MODEL_DYNAMIC = "dynamic_bucketed_v1"
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,50 @@ class CostConfig:
         if self.reg_fee_per_share_sell is None:
             object.__setattr__(self, "reg_fee_per_share_sell", float(self.finra_taf_per_share_sell))
         object.__setattr__(self, "finra_taf_per_share_sell", float(self.reg_fee_per_share_sell))
+
+
+@dataclass(frozen=True)
+class ExecutionRealismConfig:
+    cost_model: str = EXECUTION_COST_MODEL_STATIC
+    max_volume_participation: float = 1.0
+    # RVOL buckets model liquidity scarcity, not volatility stress:
+    # lower RVOL defaults to wider slippage and higher RVOL to tighter slippage.
+    low_rvol_slippage_bps: float = 3.0
+    mid_rvol_slippage_bps: float = 2.0
+    high_rvol_slippage_bps: float = 1.5
+    spread_tick_mult: float = 1.5
+    open_bucket_minutes: int = 30
+    close_bucket_minutes: int = 30
+    open_slippage_mult: float = 1.25
+    mid_slippage_mult: float = 1.0
+    close_slippage_mult: float = 1.15
+    participation_slippage_coeff: float = 1.0
+    dynamic_slippage_bps_cap: float = 50.0
+    rth_open_minute: int = 570
+    flat_time_minute: int = 945
+    rvol_ta: np.ndarray | None = None
+    tick_size_a: np.ndarray | None = None
+    minute_of_day_t: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if str(self.cost_model).strip() not in {EXECUTION_COST_MODEL_STATIC, EXECUTION_COST_MODEL_DYNAMIC}:
+            raise RuntimeError(f"unsupported execution cost model: {self.cost_model!r}")
+        if not (0.0 < float(self.max_volume_participation) <= 1.0):
+            raise RuntimeError("execution_max_volume_participation must be in (0, 1]")
+        if int(self.open_bucket_minutes) < 0:
+            raise RuntimeError("execution_open_bucket_minutes must be >= 0")
+        if int(self.close_bucket_minutes) < 0:
+            raise RuntimeError("execution_close_bucket_minutes must be >= 0")
+        if float(self.open_slippage_mult) < 0.0:
+            raise RuntimeError("execution_open_slippage_mult must be >= 0")
+        if float(self.mid_slippage_mult) < 0.0:
+            raise RuntimeError("execution_mid_slippage_mult must be >= 0")
+        if float(self.close_slippage_mult) < 0.0:
+            raise RuntimeError("execution_close_slippage_mult must be >= 0")
+        if float(self.participation_slippage_coeff) < 0.0:
+            raise RuntimeError("execution_participation_slippage_coeff must be >= 0")
+        if float(self.dynamic_slippage_bps_cap) < 0.0:
+            raise RuntimeError("execution_dynamic_slippage_bps_cap must be >= 0")
 
 
 @dataclass(frozen=True)
@@ -59,6 +105,20 @@ class SimulationResult:
     sharpe: float
     sortino: float
     gross_exposure_peak: float = 0.0
+    desired_qty_ta: np.ndarray | None = None
+    unfilled_qty_ta: np.ndarray | None = None
+    fill_cap_qty_ta: np.ndarray | None = None
+    participation_rate_ta: np.ndarray | None = None
+    fill_capped_flag_ta: np.ndarray | None = None
+    fill_rejected_flag_ta: np.ndarray | None = None
+    slippage_cost_ta: np.ndarray | None = None
+    commission_cost_ta: np.ndarray | None = None
+    regulatory_cost_ta: np.ndarray | None = None
+    locate_cost_ta: np.ndarray | None = None
+    borrow_cost_t: np.ndarray | None = None
+    debit_cost_t: np.ndarray | None = None
+    session_start_equity_t: np.ndarray | None = None
+    execution_cost_model: str = EXECUTION_COST_MODEL_STATIC
     trade_log: list[dict[str, Any]] | None = None
     per_asset_cumret: dict[str, float] | None = None
     execution_diagnostics: dict[str, Any] | None = None
@@ -114,11 +174,120 @@ def _session_financing_cost(
     cash: float,
     cost_cfg: CostConfig,
 ) -> float:
+    borrow_cost, debit_cost = _session_financing_cost_breakdown(
+        qty=qty,
+        price=price,
+        cash=cash,
+        cost_cfg=cost_cfg,
+    )
+    return float(borrow_cost + debit_cost)
+
+
+def _session_financing_cost_breakdown(
+    *,
+    qty: np.ndarray,
+    price: np.ndarray,
+    cash: float,
+    cost_cfg: CostConfig,
+) -> tuple[float, float]:
     short_qty = np.where(qty < 0.0, -qty, 0.0)
     short_notional = float(np.sum(short_qty * price))
     borrow_cost = short_notional * float(cost_cfg.short_borrow_apr) / TRADING_DAYS_PER_YEAR
     debit_cost = max(-float(cash), 0.0) * float(cost_cfg.debit_apr) / TRADING_DAYS_PER_YEAR
-    return float(borrow_cost + debit_cost)
+    return float(borrow_cost), float(debit_cost)
+
+
+def _validate_execution_realism_inputs(
+    *,
+    execution_realism: ExecutionRealismConfig | None,
+    t_count: int,
+    a_count: int,
+) -> ExecutionRealismConfig:
+    realism = execution_realism if execution_realism is not None else ExecutionRealismConfig()
+    if str(realism.cost_model).strip() != EXECUTION_COST_MODEL_DYNAMIC:
+        return realism
+
+    if realism.rvol_ta is None:
+        raise RuntimeError("dynamic execution cost model requires rvol_ta")
+    if realism.tick_size_a is None:
+        raise RuntimeError("dynamic execution cost model requires tick_size_a")
+    if realism.minute_of_day_t is None:
+        raise RuntimeError("dynamic execution cost model requires minute_of_day_t")
+
+    rvol_ta = np.asarray(realism.rvol_ta)
+    assert_float64("risk_engine.execution_realism.rvol_ta", rvol_ta)
+    if rvol_ta.shape != (t_count, a_count):
+        raise RuntimeError(
+            f"dynamic execution cost model rvol_ta shape mismatch: got {rvol_ta.shape}, expected {(t_count, a_count)}"
+        )
+    tick_size_a = np.asarray(realism.tick_size_a)
+    assert_float64("risk_engine.execution_realism.tick_size_a", tick_size_a)
+    if tick_size_a.shape != (a_count,):
+        raise RuntimeError(
+            f"dynamic execution cost model tick_size_a shape mismatch: got {tick_size_a.shape}, expected {(a_count,)}"
+        )
+    minute_of_day_t = np.asarray(realism.minute_of_day_t)
+    if minute_of_day_t.shape != (t_count,):
+        raise RuntimeError(
+            f"dynamic execution cost model minute_of_day_t shape mismatch: got {minute_of_day_t.shape}, expected {(t_count,)}"
+        )
+    if np.any(~np.isfinite(tick_size_a)) or np.any(tick_size_a <= 0.0):
+        raise RuntimeError("dynamic execution cost model tick_size_a must be finite and > 0")
+    return realism
+
+
+def _bucket_slippage_bps(
+    *,
+    rvol: float,
+    execution_realism: ExecutionRealismConfig,
+) -> float:
+    # These buckets intentionally treat RVOL as a liquidity proxy.
+    if rvol < 0.8:
+        return float(execution_realism.low_rvol_slippage_bps)
+    if rvol < 1.5:
+        return float(execution_realism.mid_rvol_slippage_bps)
+    return float(execution_realism.high_rvol_slippage_bps)
+
+
+def _session_slippage_mult(
+    *,
+    minute_of_day: int,
+    execution_realism: ExecutionRealismConfig,
+) -> float:
+    open_cut = int(execution_realism.rth_open_minute) + int(execution_realism.open_bucket_minutes)
+    close_cut = int(execution_realism.flat_time_minute) - int(execution_realism.close_bucket_minutes)
+    if minute_of_day < open_cut:
+        return float(execution_realism.open_slippage_mult)
+    if minute_of_day >= close_cut:
+        return float(execution_realism.close_slippage_mult)
+    return float(execution_realism.mid_slippage_mult)
+
+
+def _dynamic_slippage_bps(
+    *,
+    t_index: int,
+    asset_index: int,
+    price: float,
+    participation_rate: float,
+    rvol_ta: np.ndarray,
+    tick_size_a: np.ndarray,
+    minute_of_day_t: np.ndarray,
+    execution_realism: ExecutionRealismConfig,
+) -> float:
+    rvol = float(rvol_ta[t_index, asset_index])
+    tick_size = float(tick_size_a[asset_index])
+    minute_of_day = int(minute_of_day_t[t_index])
+    if not np.isfinite(rvol):
+        raise RuntimeError("dynamic execution cost model requires finite rvol on traded bars")
+    if not np.isfinite(tick_size) or tick_size <= 0.0:
+        raise RuntimeError("dynamic execution cost model requires finite positive tick_size on traded bars")
+    half_spread_bps = 0.5 * float(execution_realism.spread_tick_mult) * tick_size / max(float(price), tick_size) * 1.0e4
+    session_mult = _session_slippage_mult(minute_of_day=minute_of_day, execution_realism=execution_realism)
+    safe_participation = float(max(participation_rate, 0.0)) if np.isfinite(float(participation_rate)) else 0.0
+    raw_bps = (
+        _bucket_slippage_bps(rvol=rvol, execution_realism=execution_realism) + half_spread_bps
+    ) * session_mult * (1.0 + float(execution_realism.participation_slippage_coeff) * safe_participation)
+    return float(min(float(raw_bps), float(execution_realism.dynamic_slippage_bps_cap)))
 
 
 def simulate_portfolio_from_signals(
@@ -129,6 +298,7 @@ def simulate_portfolio_from_signals(
     risk_cfg: RiskConfig,
     session_id_t: np.ndarray | None = None,
     volume_ta: np.ndarray | None = None,
+    execution_realism: ExecutionRealismConfig | None = None,
 ) -> SimulationResult:
     close_px_ta = np.asarray(close_px_ta)
     target_qty_ta = np.asarray(target_qty_ta)
@@ -153,16 +323,41 @@ def simulate_portfolio_from_signals(
         volume_ta = volume_ta.astype(np.float64, copy=False)
         if volume_ta.shape != (T, A):
             raise RuntimeError(f"risk_engine volume_ta shape mismatch: got {volume_ta.shape}, expected {(T, A)}")
+    realism = _validate_execution_realism_inputs(
+        execution_realism=execution_realism,
+        t_count=T,
+        a_count=A,
+    )
+    dynamic_rvol_ta: np.ndarray | None = None
+    dynamic_tick_size_a: np.ndarray | None = None
+    dynamic_minute_of_day_t: np.ndarray | None = None
+    if str(realism.cost_model).strip() == EXECUTION_COST_MODEL_DYNAMIC:
+        dynamic_rvol_ta = np.asarray(realism.rvol_ta, dtype=np.float64)
+        dynamic_tick_size_a = np.asarray(realism.tick_size_a, dtype=np.float64)
+        dynamic_minute_of_day_t = np.asarray(realism.minute_of_day_t, dtype=np.int32)
     qty = np.zeros(A, dtype=np.float64)
     cash = float(initial_cash)
     eq = np.zeros(T, dtype=np.float64)
     filled_qty = np.zeros((T, A), dtype=np.float64)
     exec_price = np.full((T, A), np.nan, dtype=np.float64)
     trade_cost = np.zeros((T, A), dtype=np.float64)
+    desired_qty = np.zeros((T, A), dtype=np.float64)
+    unfilled_qty = np.zeros((T, A), dtype=np.float64)
+    fill_cap_qty = np.full((T, A), np.nan, dtype=np.float64)
+    participation_rate_ta = np.zeros((T, A), dtype=np.float64)
+    fill_capped_flag_ta = np.zeros((T, A), dtype=np.int8)
+    fill_rejected_flag_ta = np.zeros((T, A), dtype=np.int8)
+    slippage_cost_ta = np.zeros((T, A), dtype=np.float64)
+    commission_cost_ta = np.zeros((T, A), dtype=np.float64)
+    regulatory_cost_ta = np.zeros((T, A), dtype=np.float64)
+    locate_cost_ta = np.zeros((T, A), dtype=np.float64)
     position_qty = np.zeros((T, A), dtype=np.float64)
     margin_used_t = np.zeros(T, dtype=np.float64)
     buying_power_t = np.zeros(T, dtype=np.float64)
     daily_loss_t = np.zeros(T, dtype=np.float64)
+    borrow_cost_t = np.zeros(T, dtype=np.float64)
+    debit_cost_t = np.zeros(T, dtype=np.float64)
+    session_start_equity_t = np.zeros(T, dtype=np.float64)
     trades = 0
     day_start_eq = float(initial_cash)
     execution_diagnostics: dict[str, Any] = {
@@ -179,6 +374,13 @@ def simulate_portfolio_from_signals(
         "buying_power_cap_desired_qty_abs_sum": 0.0,
         "buying_power_cap_filled_qty_abs_sum": 0.0,
         "buying_power_cap_clipped_qty_abs_sum": 0.0,
+        "fill_rejected_count": 0,
+        "slippage_cost_total": 0.0,
+        "commission_cost_total": 0.0,
+        "regulatory_cost_total": 0.0,
+        "locate_cost_total": 0.0,
+        "borrow_cost_total": 0.0,
+        "debit_cost_total": 0.0,
     }
 
     for t in range(T):
@@ -187,16 +389,23 @@ def simulate_portfolio_from_signals(
         if not np.all(np.isfinite(px)):
             raise RuntimeError("risk_engine non-finite price")
         if session_id_t is not None and t > 0 and int(session_id_t[t]) != int(session_id_t[t - 1]):
-            cash -= _session_financing_cost(
+            borrow_cost, debit_cost = _session_financing_cost_breakdown(
                 qty=qty,
                 price=close_px_ta[t - 1],
                 cash=cash,
                 cost_cfg=cost_cfg,
             )
+            cash -= borrow_cost + debit_cost
+            borrow_cost_t[t] = float(borrow_cost)
+            debit_cost_t[t] = float(debit_cost)
+            execution_diagnostics["borrow_cost_total"] += float(borrow_cost)
+            execution_diagnostics["debit_cost_total"] += float(debit_cost)
             day_start_eq = float(cash + np.sum(qty * px))
+        session_start_equity_t[t] = float(day_start_eq)
 
         for a in range(A):
             desired_dq = float(tgt[a] - qty[a])
+            desired_qty[t, a] = float(desired_dq)
             if abs(desired_dq) <= 0.0:
                 continue
             execution_diagnostics["desired_fill_attempt_count"] += 1
@@ -208,10 +417,15 @@ def simulate_portfolio_from_signals(
                 if (not np.isfinite(volume_bar)) or volume_bar <= 0.0:
                     execution_diagnostics["volume_cap_hit_count"] += 1
                     execution_diagnostics["volume_cap_rejected_count"] += 1
+                    execution_diagnostics["fill_rejected_count"] += 1
                     execution_diagnostics["volume_cap_desired_qty_abs_sum"] += abs(desired_dq)
                     execution_diagnostics["volume_cap_clipped_qty_abs_sum"] += abs(desired_dq)
+                    fill_rejected_flag_ta[t, a] = np.int8(1)
+                    fill_capped_flag_ta[t, a] = np.int8(1)
+                    unfilled_qty[t, a] = float(desired_dq)
                     continue
-                fill_cap = float(np.floor(volume_bar))
+                fill_cap = float(np.floor(volume_bar * float(realism.max_volume_participation)))
+                fill_cap_qty[t, a] = float(fill_cap)
                 dq_before_volume_cap = float(dq)
                 dq = np.sign(dq) * min(abs(dq), fill_cap)
                 if abs(dq) + 1.0e-12 < abs(dq_before_volume_cap):
@@ -219,10 +433,16 @@ def simulate_portfolio_from_signals(
                     execution_diagnostics["volume_cap_desired_qty_abs_sum"] += abs(dq_before_volume_cap)
                     execution_diagnostics["volume_cap_filled_qty_abs_sum"] += abs(dq)
                     execution_diagnostics["volume_cap_clipped_qty_abs_sum"] += abs(dq_before_volume_cap) - abs(dq)
+                    fill_capped_flag_ta[t, a] = np.int8(1)
                     if abs(dq) <= 0.0:
                         execution_diagnostics["volume_cap_rejected_count"] += 1
+                        execution_diagnostics["fill_rejected_count"] += 1
+                        fill_rejected_flag_ta[t, a] = np.int8(1)
                 if abs(dq) <= 0.0:
+                    unfilled_qty[t, a] = float(desired_dq)
                     continue
+            else:
+                fill_cap_qty[t, a] = np.nan
             notional = abs(dq) * float(px[a])
             buying_power = max(0.0, day_start_eq)
             if notional > float(risk_cfg.max_position_buying_power_frac) * buying_power + 1e-12:
@@ -235,12 +455,32 @@ def simulate_portfolio_from_signals(
                     execution_diagnostics["buying_power_cap_filled_qty_abs_sum"] += abs(dq)
                     execution_diagnostics["buying_power_cap_clipped_qty_abs_sum"] += abs(dq_before_buying_power_cap) - abs(dq)
                 if abs(dq) <= 0.0:
+                    unfilled_qty[t, a] = float(desired_dq)
                     continue
             notional = abs(dq) * float(px[a])
             participation = 0.0 if not np.isfinite(fill_cap) else abs(dq) / max(fill_cap, 1.0)
-            slip = notional * float(cost_cfg.slippage_bps) * 1e-4 * (1.0 + participation)
+            participation_rate_ta[t, a] = float(participation)
+            if str(realism.cost_model).strip() == EXECUTION_COST_MODEL_DYNAMIC:
+                if dynamic_rvol_ta is None or dynamic_tick_size_a is None or dynamic_minute_of_day_t is None:
+                    raise RuntimeError("dynamic execution cost model arrays missing after validation")
+                slippage_bps = _dynamic_slippage_bps(
+                    t_index=t,
+                    asset_index=a,
+                    price=float(px[a]),
+                    participation_rate=float(participation),
+                    rvol_ta=dynamic_rvol_ta,
+                    tick_size_a=dynamic_tick_size_a,
+                    minute_of_day_t=dynamic_minute_of_day_t,
+                    execution_realism=realism,
+                )
+                slip = notional * slippage_bps * 1.0e-4
+            else:
+                slip = notional * float(cost_cfg.slippage_bps) * 1e-4 * (1.0 + participation)
             comm = abs(dq) * float(cost_cfg.commission_per_share)
-            loc = abs(dq) * float(cost_cfg.locate_fee_per_share_short_entry) if (dq < 0) else 0.0
+            short_before = max(-float(qty[a]), 0.0)
+            short_after = max(-(float(qty[a]) + float(dq)), 0.0)
+            short_entry_shares = max(short_after - short_before, 0.0)
+            loc = short_entry_shares * float(cost_cfg.locate_fee_per_share_short_entry)
             reg = 0.0
             if dq < 0:
                 reg += abs(dq) * float(cost_cfg.finra_taf_per_share_sell)
@@ -251,9 +491,18 @@ def simulate_portfolio_from_signals(
             filled_qty[t, a] = float(dq)
             exec_price[t, a] = float(px[a])
             trade_cost[t, a] = float(total_cost)
+            unfilled_qty[t, a] = float(desired_dq - dq)
+            slippage_cost_ta[t, a] = float(slip)
+            commission_cost_ta[t, a] = float(comm)
+            regulatory_cost_ta[t, a] = float(reg)
+            locate_cost_ta[t, a] = float(loc)
             trades += 1
             execution_diagnostics["filled_trade_count"] += 1
             execution_diagnostics["filled_qty_abs_sum"] += abs(dq)
+            execution_diagnostics["slippage_cost_total"] += float(slip)
+            execution_diagnostics["commission_cost_total"] += float(comm)
+            execution_diagnostics["regulatory_cost_total"] += float(reg)
+            execution_diagnostics["locate_cost_total"] += float(loc)
 
         market_value = float(np.sum(qty * px))
         equity = float(cash + market_value)
@@ -303,6 +552,20 @@ def simulate_portfolio_from_signals(
         sharpe=float(sharpe),
         sortino=float(sortino),
         gross_exposure_peak=float(np.max(margin_used_t)) if margin_used_t.size else 0.0,
+        desired_qty_ta=desired_qty,
+        unfilled_qty_ta=unfilled_qty,
+        fill_cap_qty_ta=fill_cap_qty,
+        participation_rate_ta=participation_rate_ta,
+        fill_capped_flag_ta=fill_capped_flag_ta,
+        fill_rejected_flag_ta=fill_rejected_flag_ta,
+        slippage_cost_ta=slippage_cost_ta,
+        commission_cost_ta=commission_cost_ta,
+        regulatory_cost_ta=regulatory_cost_ta,
+        locate_cost_ta=locate_cost_ta,
+        borrow_cost_t=borrow_cost_t,
+        debit_cost_t=debit_cost_t,
+        session_start_equity_t=session_start_equity_t,
+        execution_cost_model=str(realism.cost_model),
         trade_log=[],
         per_asset_cumret={},
         execution_diagnostics=execution_diagnostics,

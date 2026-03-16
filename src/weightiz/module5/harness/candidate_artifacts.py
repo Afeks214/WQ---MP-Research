@@ -9,6 +9,7 @@ from typing import Any, Callable
 import numpy as np
 
 from weightiz.module5.stage_a_discovery import parse_stage_a_tags, parse_stage_a_window_set, stable_stage_a_hash
+from weightiz.module5.strategy_registry import StrategyWhyRecord, strategy_why_dict
 from weightiz.module5.stats import deflated_sharpe_ratio, run_full_stats
 
 
@@ -28,6 +29,27 @@ def _safe_mean(values: list[float] | np.ndarray) -> float:
     if arr.size <= 0:
         return float("nan")
     return float(np.mean(arr))
+
+
+def _explicit_cost_total(row: dict[str, Any]) -> float:
+    metrics = dict(row.get("risk_engine_metrics", {}))
+    return float(
+        float(metrics.get("slippage_cost_total_exec", 0.0))
+        + float(metrics.get("commission_cost_total_exec", 0.0))
+        + float(metrics.get("regulatory_cost_total_exec", 0.0))
+        + float(metrics.get("locate_cost_total_exec", 0.0))
+        + float(metrics.get("borrow_cost_total_exec", 0.0))
+        + float(metrics.get("debit_cost_total_exec", 0.0))
+    )
+
+
+def _fill_failure_rate(row: dict[str, Any]) -> float:
+    metrics = dict(row.get("risk_engine_metrics", {}))
+    desired = float(metrics.get("desired_fill_qty_abs_sum_exec", 0.0))
+    clipped = float(metrics.get("volume_cap_clipped_qty_abs_sum_exec", 0.0))
+    if desired <= 0.0:
+        return 0.0
+    return float(clipped / max(desired, 1.0e-12))
 
 
 def _stage_a_metadata(
@@ -68,6 +90,22 @@ def _stage_a_metadata(
     else:
         out["evaluation_window"] = None
     return out
+
+
+def _resolve_strategy_why(
+    *,
+    stage_a_meta: dict[str, Any],
+    strategy_registry: dict[str, StrategyWhyRecord] | None,
+) -> dict[str, Any] | None:
+    family_id = str(stage_a_meta.get("family_id", "")).strip()
+    if family_id == "":
+        return None
+    if strategy_registry is None:
+        raise RuntimeError(f"strategy registry missing for active family_id={family_id}")
+    record = strategy_registry.get(family_id)
+    if record is None:
+        raise RuntimeError(f"strategy registry missing active family_id={family_id}")
+    return strategy_why_dict(record)
 
 
 def _overnight_suitability_score(rows_all: list[dict[str, Any]]) -> float:
@@ -267,6 +305,8 @@ def build_candidate_artifacts(
     asset_pnl_concentration_from_result_rows_fn: Callable[[list[dict[str, Any]]], float],
     asset_notional_concentration_from_trade_payloads_fn: Callable[[list[dict[str, np.ndarray]]], float],
     robustness_caps: dict[str, float],
+    strategy_registry: dict[str, StrategyWhyRecord] | None = None,
+    strategy_registry_hash: str = "",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     pdx = require_pandas_fn()
 
@@ -274,6 +314,7 @@ def build_candidate_artifacts(
     candidates_dir.mkdir(parents=True, exist_ok=True)
     baseline_col = {str(cid): j for j, cid in enumerate(baseline_candidate_ids)}
     scenario_ids = [str(s.scenario_id) for s in scenarios]
+    scenario_by_id = {str(s.scenario_id): s for s in scenarios}
     initial_cash = float(engine_cfg.initial_cash)
 
     candidate_rows: list[dict[str, Any]] = []
@@ -401,6 +442,9 @@ def build_candidate_artifacts(
                     "cum_return_mean": 0.0,
                     "max_drawdown_median": 0.0,
                     "turnover_median": 0.0,
+                    "trade_count_median": 0.0,
+                    "explicit_cost_total_median": 0.0,
+                    "fill_failure_rate_median": 0.0,
                 }
                 continue
             ret_list = [
@@ -415,6 +459,9 @@ def build_candidate_artifacts(
                     "cum_return_mean": 0.0,
                     "max_drawdown_median": 0.0,
                     "turnover_median": 0.0,
+                    "trade_count_median": 0.0,
+                    "explicit_cost_total_median": 0.0,
+                    "fill_failure_rate_median": 0.0,
                 }
                 continue
             cum = np.asarray([cum_return_fn(x) for x in ret_list], dtype=np.float64)
@@ -423,12 +470,21 @@ def build_candidate_artifacts(
                 [turnover_from_trade_payload_fn(r.get("trade_payload"), initial_cash) for r in srows],
                 dtype=np.float64,
             )
+            tc = np.asarray(
+                [trade_count_from_payload_fn(r.get("trade_payload")) for r in srows],
+                dtype=np.float64,
+            )
+            explicit_cost = np.asarray([_explicit_cost_total(r) for r in srows], dtype=np.float64)
+            fill_failure = np.asarray([_fill_failure_rate(r) for r in srows], dtype=np.float64)
             per_stress[sid] = {
                 "n_tasks": int(len(ret_list)),
                 "cum_return_median": float(np.median(cum)),
                 "cum_return_mean": float(np.mean(cum)),
                 "max_drawdown_median": float(np.median(dd)),
                 "turnover_median": float(np.median(to)),
+                "trade_count_median": float(np.median(tc)) if tc.size > 0 else 0.0,
+                "explicit_cost_total_median": float(np.median(explicit_cost)) if explicit_cost.size > 0 else 0.0,
+                "fill_failure_rate_median": float(np.median(fill_failure)) if fill_failure.size > 0 else 0.0,
             }
 
         base_stress = per_stress.get("baseline", {"cum_return_median": 0.0, "max_drawdown_median": 0.0, "turnover_median": 0.0})
@@ -438,6 +494,69 @@ def build_candidate_artifacts(
                 "dd": float(per_stress[sid]["max_drawdown_median"] - base_stress["max_drawdown_median"]),
                 "turnover": float(per_stress[sid]["turnover_median"] - base_stress["turnover_median"]),
             }
+
+        degradation_details: list[dict[str, Any]] = []
+        for sid in scenario_ids:
+            scenario_group = str(getattr(scenario_by_id.get(sid), "scenario_group", "stress"))
+            if scenario_group != "degradation":
+                continue
+            baseline_cum = float(base_stress["cum_return_median"])
+            baseline_trade_count = float(base_stress.get("trade_count_median", 0.0))
+            scenario_trade_count = float(per_stress[sid].get("trade_count_median", 0.0))
+            return_penalty = max(baseline_cum - float(per_stress[sid]["cum_return_median"]), 0.0) / max(abs(baseline_cum), 1.0e-6)
+            trade_retention = scenario_trade_count / max(baseline_trade_count, 1.0)
+            scenario_score = 0.7 * (1.0 - clip01_fn(return_penalty)) + 0.3 * clip01_fn(trade_retention)
+            degradation_details.append(
+                {
+                    "scenario_id": sid,
+                    "return_penalty": float(return_penalty),
+                    "trade_retention": float(trade_retention),
+                    "scenario_score": float(scenario_score),
+                    "fragile": bool(return_penalty > 0.50 or trade_retention < 0.50),
+                }
+            )
+        if degradation_details:
+            degradation_score = float(
+                np.mean(np.asarray([row["scenario_score"] for row in degradation_details], dtype=np.float64))
+            )
+            degradation_fragile = bool(any(bool(row["fragile"]) for row in degradation_details))
+        else:
+            degradation_score = float("nan")
+            degradation_fragile = False
+
+        capacity_details: list[dict[str, Any]] = []
+        for sid in scenario_ids:
+            scenario_group = str(getattr(scenario_by_id.get(sid), "scenario_group", "stress"))
+            if scenario_group != "capacity":
+                continue
+            scale_mult = float(getattr(scenario_by_id.get(sid), "target_scale_mult", 1.0))
+            turnover_expansion = float(per_stress[sid]["turnover_median"]) / max(float(base_stress["turnover_median"]), 1.0e-12)
+            cost_expansion = float(per_stress[sid]["explicit_cost_total_median"]) / max(float(base_stress["explicit_cost_total_median"]), 1.0e-12)
+            scenario_cum_return = float(per_stress[sid]["cum_return_median"])
+            expectancy_ratio = scenario_cum_return / max(abs(float(base_stress["cum_return_median"])), 1.0e-12)
+            fill_failure_rate = float(per_stress[sid]["fill_failure_rate_median"])
+            # Capacity redline is kept narrow and execution-grounded.
+            # Small negative expectancy drifts stay amber unless fill realism itself breaks.
+            redline = bool(fill_failure_rate > 0.25)
+            amber = bool((not redline) and (expectancy_ratio < 0.75 or scenario_cum_return < 0.0 or fill_failure_rate > 0.10))
+            capacity_details.append(
+                {
+                    "scenario_id": sid,
+                    "scale_mult": float(scale_mult),
+                    "turnover_expansion": float(turnover_expansion),
+                    "cost_expansion": float(cost_expansion),
+                    "expectancy_ratio": float(expectancy_ratio),
+                    "fill_failure_rate": float(fill_failure_rate),
+                    "redline": bool(redline),
+                    "amber": bool(amber),
+                }
+            )
+        redline_scales = sorted(float(row["scale_mult"]) for row in capacity_details if bool(row["redline"]))
+        capacity_redline_scale = float(redline_scales[0]) if redline_scales else float("nan")
+        scale_to_detail = {float(row["scale_mult"]): row for row in capacity_details}
+        detail_10x = scale_to_detail.get(10.0, {})
+        capacity_fill_failure_rate_10x = float(detail_10x.get("fill_failure_rate", np.nan))
+        capacity_expectancy_ratio_10x = float(detail_10x.get("expectancy_ratio", np.nan))
 
         rows_for_base_stats = rows_base if rows_base else rows
         trade_payloads = [r.get("trade_payload") for r in rows_for_base_stats if r.get("trade_payload") is not None]
@@ -491,6 +610,10 @@ def build_candidate_artifacts(
             m3_idx=int(cand.m3_idx),
             m4_idx=int(cand.m4_idx),
         )
+        strategy_why = _resolve_strategy_why(
+            stage_a_meta=stage_a_meta,
+            strategy_registry=strategy_registry,
+        )
         overnight_score = _overnight_suitability_score(rows_all)
         compliance_flags = _zimtra_compliance_flags(
             rows_all=rows_all,
@@ -540,6 +663,8 @@ def build_candidate_artifacts(
             "enabled_assets_mask": np.asarray(cand.enabled_assets_mask, dtype=bool).tolist(),
             "tags": list(cand.tags),
             "stage_a_metadata": stage_a_meta,
+            "strategy_why": strategy_why,
+            "strategy_registry_hash": str(strategy_registry_hash),
             "engine_config": asdict(engine_cfg),
             "module2_config": asdict(m2_configs[int(cand.m2_idx)]),
             "module3_config": asdict(m3cfg),
@@ -611,6 +736,19 @@ def build_candidate_artifacts(
                 "overnight_suitability_score": float(overnight_score) if np.isfinite(overnight_score) else None,
                 "zimtra_compliance_flags": compliance_flags,
             },
+            "strategy_why": strategy_why,
+            "strategy_registry_hash": str(strategy_registry_hash),
+            "degradation": {
+                "score": degradation_score if np.isfinite(degradation_score) else None,
+                "fragile": bool(degradation_fragile),
+                "scenarios": degradation_details,
+            },
+            "capacity": {
+                "redline_scale": capacity_redline_scale if np.isfinite(capacity_redline_scale) else None,
+                "scenarios": capacity_details,
+                "fill_failure_rate_10x": capacity_fill_failure_rate_10x if np.isfinite(capacity_fill_failure_rate_10x) else None,
+                "expectancy_ratio_10x": capacity_expectancy_ratio_10x if np.isfinite(capacity_expectancy_ratio_10x) else None,
+            },
         }
         write_json_fn(cdir / "candidate_metrics.json", candidate_metrics)
 
@@ -675,6 +813,18 @@ def build_candidate_artifacts(
                 "window_set_size": int(stage_a_meta["window_set_size"]),
                 "parameter_hash": str(stage_a_meta["parameter_hash"]),
                 "tags_serialized": str(stage_a_meta["tags_serialized"]),
+                "economic_mechanism": str((strategy_why or {}).get("economic_mechanism", "")),
+                "expected_edge_source": str((strategy_why or {}).get("expected_edge_source", "")),
+                "expected_market_conditions": str((strategy_why or {}).get("expected_market_conditions", "")),
+                "expected_kill_conditions": str((strategy_why or {}).get("expected_kill_conditions", "")),
+                "liquidity_sensitivity": str((strategy_why or {}).get("liquidity_sensitivity", "")),
+                "cost_sensitivity": str((strategy_why or {}).get("cost_sensitivity", "")),
+                "confidence_prior": float((strategy_why or {}).get("confidence_prior", np.nan)),
+                "degradation_score": float(degradation_score) if np.isfinite(degradation_score) else np.nan,
+                "degradation_fragile": bool(degradation_fragile),
+                "capacity_redline_scale": float(capacity_redline_scale) if np.isfinite(capacity_redline_scale) else np.nan,
+                "capacity_fill_failure_rate_10x": float(capacity_fill_failure_rate_10x) if np.isfinite(capacity_fill_failure_rate_10x) else np.nan,
+                "capacity_expectancy_ratio_10x": float(capacity_expectancy_ratio_10x) if np.isfinite(capacity_expectancy_ratio_10x) else np.nan,
                 **feat,
             }
         )

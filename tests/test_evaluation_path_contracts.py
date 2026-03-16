@@ -294,8 +294,20 @@ def test_compact_artifact_builders_enforce_declared_dependencies_only() -> None:
     )
 
     assert eq["daily_loss"].shape == (view.cfg.T,)
+    assert "session_start_equity" in eq
+    assert "borrow_cost" in eq
+    assert "debit_cost" in eq
     assert trade["filled_qty"].shape[0] == 2
+    assert "desired_qty" in trade
+    assert "unfilled_qty" in trade
+    assert "fill_cap_qty" in trade
+    assert "trade_cost_slippage" in trade
+    assert "trade_cost_commission" in trade
+    assert "trade_cost_regulatory" in trade
+    assert "trade_cost_locate" in trade
     assert micro is not None and micro["position_qty"].shape[0] > 0
+    assert micro is not None and "desired_qty" in micro
+    assert micro is not None and "session_start_equity" in micro
     assert profile is not None and profile["vp_block_blob"].shape[0] == 4
     assert funnel is not None and funnel["is_winner"].shape[0] == 2
 

@@ -391,6 +391,8 @@ def build_synthetic_module5_run(tmp_path: Path, *, n_sessions: int = 64) -> Path
         candidate_rows=candidate_rows,
         all_results=all_results,
         engine_cfg=DummyEngineConfig(),
+        keep_symbols=["SYM0", "SYM1"],
+        dataset_hash="dataset_synth_hash",
         require_pandas_fn=lambda: pd,
     )
     _write_json(

@@ -80,6 +80,7 @@ from weightiz.shared.io.data_resolution import (
 )
 from weightiz.cli.run_module6 import build_module6_config
 from weightiz.module5.stage_a_discovery import parse_stage_a_window_set
+from weightiz.module5.strategy_registry import load_strategy_registry, strategy_registry_hash, validate_strategy_registry
 from weightiz.module6 import Module6Config, run_module6_portfolio_research
 from weightiz.module5.harness.artifact_writers import write_json as _artifact_write_json
 
@@ -694,11 +695,17 @@ def run_from_namespace(
     m2_cfgs = _build_module2_configs(cfg)
     m3_cfgs = _build_module3_configs(cfg)
     m4_cfgs = _build_module4_configs(cfg)
+    if bool(enable_module6):
+        cfg.harness.export_micro_diagnostics = True
     harness_cfg = _build_harness_config(cfg, project_root)
 
     data_loader = in_memory_date_filter_loader(cfg.data)
     stress_scenarios = _build_stress_scenarios(cfg)
     candidate_specs = _build_candidates(cfg)
+    registry_path = project_root / "configs" / "strategy_registry.yaml"
+    strategy_registry = load_strategy_registry(registry_path)
+    validate_strategy_registry(strategy_registry)
+    registry_hash = strategy_registry_hash(strategy_registry)
 
     with warnings.catch_warnings(record=True) as captured_warnings:
         warnings.simplefilter("always", RuntimeWarning)
@@ -714,6 +721,8 @@ def run_from_namespace(
             data_loader_func=data_loader,
             stress_scenarios=stress_scenarios,
             self_audit_report=self_audit_report,
+            strategy_registry=strategy_registry,
+            strategy_registry_hash=registry_hash,
         )
     runtime_warnings = [w for w in captured_warnings if issubclass(w.category, RuntimeWarning)]
     runtime_warning_count = int(len(runtime_warnings))

@@ -175,6 +175,8 @@ def finalize_run_outputs(
     write_json_fn: Callable[[Path, Any], None],
     write_frozen_json_fn: Callable[[Path, Any], None],
     build_candidate_artifacts_fn: Callable[..., tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]],
+    strategy_registry: dict[str, Any] | None,
+    strategy_registry_hash: str,
     collect_ledger_rows_fn: Callable[[list[dict[str, Any]], str], list[dict[str, Any]]],
     ledger_write_fn: Callable[[list[dict[str, Any]], Path], None],
     git_hash_fn: Callable[[], str],
@@ -274,6 +276,8 @@ def finalize_run_outputs(
         m3_configs=m3_configs,
         m4_configs=m4_configs,
         harness_cfg=harness_cfg,
+        strategy_registry=strategy_registry,
+        strategy_registry_hash=str(strategy_registry_hash),
     )
     canonical_reference_split_id, canonical_reference_scenario_id, canonical_reference_policy = _resolve_module6_canonical_reference(
         splits=splits,
@@ -294,6 +298,8 @@ def finalize_run_outputs(
         candidate_rows=sorted(candidate_rows, key=lambda x: str(x["candidate_id"])),
         all_results=all_results,
         engine_cfg=engine_cfg,
+        keep_symbols=keep_symbols,
+        dataset_hash=str(dataset_hash),
         require_pandas_fn=require_pandas_fn,
     )
     diagnostic_artifact_paths, diagnostic_summary = write_trade_blocker_artifacts(
@@ -308,8 +314,11 @@ def finalize_run_outputs(
     robustness_csv_path = report_root / "robustness_leaderboard.csv"
     plateaus_path = report_root / "plateaus.json"
     strategy_ledger_path = report_root / "strategy_results.parquet"
+    degradation_report_path = report_root / "degradation_report.parquet"
+    capacity_envelope_path = report_root / "capacity_envelope.parquet"
 
-    pdx.DataFrame(sorted(candidate_rows, key=lambda x: str(x["candidate_id"]))).to_csv(leaderboard_csv_path, index=False)
+    candidate_df = pdx.DataFrame(sorted(candidate_rows, key=lambda x: str(x["candidate_id"])))
+    candidate_df.to_csv(leaderboard_csv_path, index=False)
     write_json_fn(leaderboard_json_path, sorted(candidate_rows, key=lambda x: str(x["candidate_id"])))
     pdx.DataFrame(robustness_rows).to_csv(robustness_csv_path, index=False)
     write_json_fn(plateaus_path, plateaus_doc)
@@ -362,6 +371,31 @@ def finalize_run_outputs(
         ),
         strategy_ledger_path,
     )
+    enabled_degradation = any(
+        bool(getattr(s, "enabled", True)) and str(getattr(s, "scenario_group", "stress")) == "degradation"
+        for s in scenarios
+    )
+    if enabled_degradation and {"candidate_id", "degradation_score", "degradation_fragile"}.issubset(candidate_df.columns):
+        cols = ["candidate_id", "degradation_score", "degradation_fragile"]
+        for optional_col in ("family_id", "hypothesis_id"):
+            if optional_col in candidate_df.columns:
+                cols.append(optional_col)
+        candidate_df.loc[:, cols].to_parquet(degradation_report_path, index=False)
+    enabled_capacity = any(
+        bool(getattr(s, "enabled", True)) and str(getattr(s, "scenario_group", "stress")) == "capacity"
+        for s in scenarios
+    )
+    if enabled_capacity and {"candidate_id", "capacity_redline_scale", "capacity_fill_failure_rate_10x", "capacity_expectancy_ratio_10x"}.issubset(candidate_df.columns):
+        cols = [
+            "candidate_id",
+            "capacity_redline_scale",
+            "capacity_fill_failure_rate_10x",
+            "capacity_expectancy_ratio_10x",
+        ]
+        for optional_col in ("family_id", "hypothesis_id"):
+            if optional_col in candidate_df.columns:
+                cols.append(optional_col)
+        candidate_df.loc[:, cols].to_parquet(capacity_envelope_path, index=False)
     monitor.check_and_emit(
         strategies_completed=int(tasks_completed),
         tensor=feature_handles_master.array,
@@ -522,6 +556,7 @@ def finalize_run_outputs(
         },
         "module6_bridge": dict(module6_bridge_summary),
         "trade_blocker_diagnostics": dict(diagnostic_summary),
+        "strategy_registry_hash": str(strategy_registry_hash),
     }
     final_artifact_generation_sec = float(time.perf_counter() - artifact_t0)
     run_status["final_artifact_generation_sec"] = float(final_artifact_generation_sec)
@@ -550,6 +585,10 @@ def finalize_run_outputs(
         "validation_report_latest": str(canonical_validation_report_path),
         "self_audit_report": str(self_audit_report_path),
     }
+    if enabled_degradation:
+        artifact_paths["degradation_report"] = str(degradation_report_path)
+    if enabled_capacity:
+        artifact_paths["capacity_envelope"] = str(capacity_envelope_path)
     if bool(harness_cfg.export_micro_diagnostics):
         artifact_paths["micro_diagnostics"] = str(micro_diag_path)
         if bool(harness_cfg.micro_diag_export_block_profiles):

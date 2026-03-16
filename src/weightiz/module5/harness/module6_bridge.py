@@ -32,6 +32,12 @@ def _calendar_version(common_sessions: np.ndarray) -> str:
     return hashlib.sha256(blob).hexdigest()[:16]
 
 
+def _symbol_set_hash(symbols: list[str]) -> str:
+    vals = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
+    blob = "|".join(sorted(vals)).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
 def _series_map(
     session_ids: np.ndarray | list[int] | None,
     values: np.ndarray | list[float] | None,
@@ -68,6 +74,15 @@ def _state_code_map(
             raise RuntimeError(f"invalid base availability_state_code in module6 bridge; session_id={int(s)} code={cc}")
         out[int(s)] = cc
     return out
+
+
+def _session_payload_map(
+    payload: dict[str, np.ndarray] | None,
+    field: str,
+) -> dict[int, float]:
+    if not isinstance(payload, dict):
+        return {}
+    return _series_map(payload.get("session_id"), payload.get(field))
 
 
 def _turnover_by_session(trade_payload: dict[str, np.ndarray] | None, ts_to_session: dict[int, int], initial_cash: float) -> dict[int, float]:
@@ -112,20 +127,75 @@ def _trade_count_by_session(trade_payload: dict[str, np.ndarray] | None, ts_to_s
     return out
 
 
-def _equity_stats_by_session(equity_payload: dict[str, np.ndarray] | None) -> tuple[dict[int, float], dict[int, float], dict[int, float], dict[int, float]]:
+def _sum_trade_field_by_session(
+    trade_payload: dict[str, np.ndarray] | None,
+    ts_to_session: dict[int, int],
+    field: str,
+    *,
+    absolute: bool = False,
+) -> dict[int, float]:
+    if not trade_payload:
+        return {}
+    session_ids = np.asarray(trade_payload.get("session_id", np.zeros(0, dtype=np.int64)), dtype=np.int64)
+    ts = np.asarray(trade_payload.get("ts_ns", np.zeros(0, dtype=np.int64)), dtype=np.int64)
+    values = np.asarray(trade_payload.get(field, np.zeros(0, dtype=np.float64)), dtype=np.float64)
+    if values.size == 0:
+        return {}
+    n = min(max(session_ids.size, ts.size), values.size)
+    out: dict[int, float] = {}
+    for i in range(n):
+        session_id = int(session_ids[i]) if i < session_ids.size else ts_to_session.get(int(ts[i]))
+        if session_id is None:
+            continue
+        value = float(values[i])
+        if not np.isfinite(value):
+            continue
+        if absolute:
+            value = abs(value)
+        out[int(session_id)] = out.get(int(session_id), 0.0) + value
+    return out
+
+
+def _equity_stats_by_session(
+    equity_payload: dict[str, np.ndarray] | None,
+) -> tuple[dict[int, float], dict[int, float], dict[int, float], dict[int, float], dict[int, float], dict[int, float], dict[int, float]]:
     if not equity_payload:
-        return {}, {}, {}, {}
+        return {}, {}, {}, {}, {}, {}, {}
     session_id = np.asarray(equity_payload.get("session_id", np.zeros(0, dtype=np.int64)), dtype=np.int64)
     equity = np.asarray(equity_payload.get("equity", np.zeros(0, dtype=np.float64)), dtype=np.float64)
     margin_used = np.asarray(equity_payload.get("margin_used", np.zeros(0, dtype=np.float64)), dtype=np.float64)
     buying_power = np.asarray(equity_payload.get("buying_power", np.zeros(0, dtype=np.float64)), dtype=np.float64)
     daily_loss = np.asarray(equity_payload.get("daily_loss", np.zeros(0, dtype=np.float64)), dtype=np.float64)
-    n = min(session_id.size, equity.size, margin_used.size, buying_power.size, daily_loss.size)
+    session_start_equity = np.asarray(
+        equity_payload.get("session_start_equity", np.full(session_id.shape[0], np.nan, dtype=np.float64)),
+        dtype=np.float64,
+    )
+    borrow_cost = np.asarray(
+        equity_payload.get("borrow_cost", np.zeros(session_id.shape[0], dtype=np.float64)),
+        dtype=np.float64,
+    )
+    debit_cost = np.asarray(
+        equity_payload.get("debit_cost", np.zeros(session_id.shape[0], dtype=np.float64)),
+        dtype=np.float64,
+    )
+    n = min(
+        session_id.size,
+        equity.size,
+        margin_used.size,
+        buying_power.size,
+        daily_loss.size,
+        session_start_equity.size,
+        borrow_cost.size,
+        debit_cost.size,
+    )
     if n <= 0:
-        return {}, {}, {}, {}
+        return {}, {}, {}, {}, {}, {}, {}
     gross_frac: dict[int, list[float]] = {}
     buying_power_min: dict[int, float] = {}
     daily_loss_max: dict[int, float] = {}
+    session_start_equity_first: dict[int, float] = {}
+    borrow_cost_sum: dict[int, float] = {}
+    debit_cost_sum: dict[int, float] = {}
     for i in range(n):
         s = int(session_id[i])
         eq = max(abs(float(equity[i])), 1.0e-12)
@@ -133,11 +203,20 @@ def _equity_stats_by_session(equity_payload: dict[str, np.ndarray] | None) -> tu
         gross_frac.setdefault(s, []).append(gm)
         bp = float(buying_power[i])
         dl = float(daily_loss[i])
+        sse = float(session_start_equity[i])
+        bc = float(borrow_cost[i])
+        dc = float(debit_cost[i])
         buying_power_min[s] = bp if s not in buying_power_min else min(buying_power_min[s], bp)
         daily_loss_max[s] = dl if s not in daily_loss_max else max(daily_loss_max[s], dl)
+        if s not in session_start_equity_first and np.isfinite(sse):
+            session_start_equity_first[s] = sse
+        if np.isfinite(bc):
+            borrow_cost_sum[s] = borrow_cost_sum.get(s, 0.0) + bc
+        if np.isfinite(dc):
+            debit_cost_sum[s] = debit_cost_sum.get(s, 0.0) + dc
     gross_mean = {k: float(np.mean(np.asarray(v, dtype=np.float64))) for k, v in gross_frac.items()}
     gross_peak = {k: float(np.max(np.asarray(v, dtype=np.float64))) for k, v in gross_frac.items()}
-    return gross_mean, gross_peak, buying_power_min, daily_loss_max
+    return gross_mean, gross_peak, buying_power_min, daily_loss_max, session_start_equity_first, borrow_cost_sum, debit_cost_sum
 
 
 def _overnight_by_session(micro_payload: dict[str, np.ndarray] | None) -> dict[int, int]:
@@ -174,6 +253,8 @@ def build_module6_bridge_artifacts(
     candidate_rows: list[dict[str, Any]],
     all_results: list[dict[str, Any]],
     engine_cfg: Any,
+    keep_symbols: list[str],
+    dataset_hash: str,
     require_pandas_fn: Callable[[], Any],
 ) -> tuple[dict[str, str], dict[str, Any]]:
     pdx = require_pandas_fn()
@@ -190,6 +271,9 @@ def build_module6_bridge_artifacts(
     _ = candidate_daily_mat
     candidate_meta = {str(row["candidate_id"]): row for row in candidate_rows}
     calendar_version = _calendar_version(common)
+    symbol_set_hash = _symbol_set_hash(keep_symbols)
+    universe_id = str(symbol_set_hash)
+    support_space_id = hashlib.sha256(f"{str(dataset_hash)}|{calendar_version}|{universe_id}".encode("utf-8")).hexdigest()[:16]
     selection_rows: list[dict[str, Any]] = []
     session_rows: list[dict[str, Any]] = []
     initial_cash = float(getattr(engine_cfg, "initial_cash", 1_000_000.0))
@@ -245,6 +329,7 @@ def build_module6_bridge_artifacts(
             equity_payload = row.get("equity_payload")
             trade_payload = row.get("trade_payload")
             micro_payload = row.get("micro_payload")
+            session_fill_payload = row.get("session_fill_payload")
             eq_ts = np.asarray(
                 equity_payload.get("ts_ns", np.zeros(0, dtype=np.int64)) if isinstance(equity_payload, dict) else np.zeros(0, dtype=np.int64),
                 dtype=np.int64,
@@ -256,10 +341,72 @@ def build_module6_bridge_artifacts(
             ts_to_session = {int(ts): int(sess) for ts, sess in zip(eq_ts.tolist(), eq_session.tolist())}
             session_turnover = _turnover_by_session(trade_payload if isinstance(trade_payload, dict) else None, ts_to_session, initial_cash)
             session_trade_count = _trade_count_by_session(trade_payload if isinstance(trade_payload, dict) else None, ts_to_session)
-            gross_mean, gross_peak, buying_power_min, daily_loss_max = _equity_stats_by_session(
+            gross_mean, gross_peak, buying_power_min, daily_loss_max, session_start_equity, borrow_cost, debit_cost = _equity_stats_by_session(
                 equity_payload if isinstance(equity_payload, dict) else None
             )
             overnight_flag = _overnight_by_session(micro_payload if isinstance(micro_payload, dict) else None)
+            session_slippage_cost = _sum_trade_field_by_session(
+                trade_payload if isinstance(trade_payload, dict) else None,
+                ts_to_session,
+                "trade_cost_slippage",
+            )
+            session_commission_cost = _sum_trade_field_by_session(
+                trade_payload if isinstance(trade_payload, dict) else None,
+                ts_to_session,
+                "trade_cost_commission",
+            )
+            session_regulatory_cost = _sum_trade_field_by_session(
+                trade_payload if isinstance(trade_payload, dict) else None,
+                ts_to_session,
+                "trade_cost_regulatory",
+            )
+            session_locate_cost = _sum_trade_field_by_session(
+                trade_payload if isinstance(trade_payload, dict) else None,
+                ts_to_session,
+                "trade_cost_locate",
+            )
+            session_fill_cap_hit_count = _session_payload_map(
+                session_fill_payload if isinstance(session_fill_payload, dict) else None,
+                "fill_cap_hit_count",
+            )
+            if not session_fill_cap_hit_count:
+                session_fill_cap_hit_count = _sum_trade_field_by_session(
+                    trade_payload if isinstance(trade_payload, dict) else None,
+                    ts_to_session,
+                    "fill_capped_flag",
+                )
+            session_fill_reject_count = _session_payload_map(
+                session_fill_payload if isinstance(session_fill_payload, dict) else None,
+                "fill_reject_count",
+            )
+            if not session_fill_reject_count:
+                session_fill_reject_count = _sum_trade_field_by_session(
+                    trade_payload if isinstance(trade_payload, dict) else None,
+                    ts_to_session,
+                    "fill_rejected_flag",
+                )
+            session_desired_qty_abs_sum = _session_payload_map(
+                session_fill_payload if isinstance(session_fill_payload, dict) else None,
+                "desired_qty_abs_sum",
+            )
+            if not session_desired_qty_abs_sum:
+                session_desired_qty_abs_sum = _sum_trade_field_by_session(
+                    trade_payload if isinstance(trade_payload, dict) else None,
+                    ts_to_session,
+                    "desired_qty",
+                    absolute=True,
+                )
+            session_unfilled_qty_abs_sum = _session_payload_map(
+                session_fill_payload if isinstance(session_fill_payload, dict) else None,
+                "unfilled_qty_abs_sum",
+            )
+            if not session_unfilled_qty_abs_sum:
+                session_unfilled_qty_abs_sum = _sum_trade_field_by_session(
+                    trade_payload if isinstance(trade_payload, dict) else None,
+                    ts_to_session,
+                    "unfilled_qty",
+                    absolute=True,
+                )
 
             selection_rows.append(
                 {
@@ -274,6 +421,9 @@ def build_module6_bridge_artifacts(
                     "canonical_reference_split_id": str(canonical_reference_split_id),
                     "canonical_reference_scenario_id": str(canonical_reference_scenario_id),
                     "canonical_reference_policy": str(canonical_reference_policy),
+                    "symbol_set_hash": str(symbol_set_hash),
+                    "universe_id": str(universe_id),
+                    "support_space_id": str(support_space_id),
                     "status": status,
                     "n_sessions_exec": int(len(exec_map)),
                     "n_sessions_raw": int(len(raw_map)),
@@ -310,6 +460,9 @@ def build_module6_bridge_artifacts(
                         "execution_mode": str(execution_mode),
                         "selection_stage": _SELECTION_STAGE,
                         "calendar_version": calendar_version,
+                        "symbol_set_hash": str(symbol_set_hash),
+                        "universe_id": str(universe_id),
+                        "support_space_id": str(support_space_id),
                         "session_id": s,
                         "return_exec": float(exec_map.get(s, 0.0)),
                         "return_raw": float(raw_map.get(s, 0.0)),
@@ -324,6 +477,27 @@ def build_module6_bridge_artifacts(
                         "buying_power_min": float(buying_power_min.get(s, 0.0)),
                         "buying_power_min_frac": float(buying_power_min.get(s, 0.0) / max(initial_cash, 1.0e-12)),
                         "daily_loss_max": float(daily_loss_max.get(s, 0.0)),
+                        "session_start_equity": float(session_start_equity.get(s, initial_cash)),
+                        "session_slippage_cost_total": float(session_slippage_cost.get(s, 0.0)),
+                        "session_commission_cost_total": float(session_commission_cost.get(s, 0.0)),
+                        "session_regulatory_cost_total": float(session_regulatory_cost.get(s, 0.0)),
+                        "session_locate_cost_total": float(session_locate_cost.get(s, 0.0)),
+                        "session_borrow_cost_total": float(borrow_cost.get(s, 0.0)),
+                        "session_debit_cost_total": float(debit_cost.get(s, 0.0)),
+                        "session_trade_cost_total": float(
+                            session_slippage_cost.get(s, 0.0)
+                            + session_commission_cost.get(s, 0.0)
+                            + session_regulatory_cost.get(s, 0.0)
+                            + session_locate_cost.get(s, 0.0)
+                            + borrow_cost.get(s, 0.0)
+                            + debit_cost.get(s, 0.0)
+                        ),
+                        "session_fill_cap_hit_count": int(round(session_fill_cap_hit_count.get(s, 0.0))),
+                        "session_fill_reject_count": int(round(session_fill_reject_count.get(s, 0.0))),
+                        "session_fill_failure_rate": float(
+                            abs(session_unfilled_qty_abs_sum.get(s, 0.0))
+                            / max(abs(session_desired_qty_abs_sum.get(s, 0.0)), 1.0e-12)
+                        ),
                         "overnight_flag": int(overnight_flag.get(s, 0)),
                     }
                 )
@@ -370,6 +544,9 @@ def build_module6_bridge_artifacts(
         "canonical_reference_split_id": str(canonical_reference_split_id),
         "canonical_reference_scenario_id": str(canonical_reference_scenario_id),
         "canonical_reference_policy": str(canonical_reference_policy),
+        "symbol_set_hash": str(symbol_set_hash),
+        "universe_id": str(universe_id),
+        "support_space_id": str(support_space_id),
         "n_strategy_instances": int(selection_df.shape[0]),
         "n_session_rows": int(session_df.shape[0]),
         "n_canonical_instances": int((selection_df["portfolio_instance_role"] == "canonical_portfolio").sum()),

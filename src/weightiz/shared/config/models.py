@@ -280,8 +280,20 @@ class HarnessConfigModel(BaseModel):
     cluster_distance_block_size: int = 256
     cluster_distance_in_memory_max_n: int = 2500
     execution_transaction_cost_per_trade: float = 0.0
+    execution_cost_model: Literal["static_mid_rvol_legacy", "dynamic_bucketed_v1"] = "static_mid_rvol_legacy"
     execution_slippage_mult: float = 1.0
     execution_extra_slippage_bps: float = 0.0
+    execution_max_volume_participation: float = 1.0
+    execution_short_borrow_apr: float = 0.0
+    execution_short_locate_fee_per_share: float = 0.0
+    execution_debit_apr: float = 0.0
+    execution_open_bucket_minutes: int = 30
+    execution_close_bucket_minutes: int = 30
+    execution_open_slippage_mult: float = 1.25
+    execution_mid_slippage_mult: float = 1.0
+    execution_close_slippage_mult: float = 1.15
+    execution_participation_slippage_coeff: float = 1.0
+    execution_dynamic_slippage_bps_cap: float = 50.0
     execution_latency_bars: int = 1
     regime_vol_window: int = 60
     regime_slope_window: int = 60
@@ -321,6 +333,28 @@ class HarnessConfigModel(BaseModel):
             raise ValueError("harness.execution_slippage_mult must be >=0")
         if float(self.execution_extra_slippage_bps) < 0.0:
             raise ValueError("harness.execution_extra_slippage_bps must be >=0")
+        if not (0.0 < float(self.execution_max_volume_participation) <= 1.0):
+            raise ValueError("harness.execution_max_volume_participation must be in (0,1]")
+        if float(self.execution_short_borrow_apr) < 0.0:
+            raise ValueError("harness.execution_short_borrow_apr must be >=0")
+        if float(self.execution_short_locate_fee_per_share) < 0.0:
+            raise ValueError("harness.execution_short_locate_fee_per_share must be >=0")
+        if float(self.execution_debit_apr) < 0.0:
+            raise ValueError("harness.execution_debit_apr must be >=0")
+        if int(self.execution_open_bucket_minutes) < 0:
+            raise ValueError("harness.execution_open_bucket_minutes must be >=0")
+        if int(self.execution_close_bucket_minutes) < 0:
+            raise ValueError("harness.execution_close_bucket_minutes must be >=0")
+        if float(self.execution_open_slippage_mult) < 0.0:
+            raise ValueError("harness.execution_open_slippage_mult must be >=0")
+        if float(self.execution_mid_slippage_mult) < 0.0:
+            raise ValueError("harness.execution_mid_slippage_mult must be >=0")
+        if float(self.execution_close_slippage_mult) < 0.0:
+            raise ValueError("harness.execution_close_slippage_mult must be >=0")
+        if float(self.execution_participation_slippage_coeff) < 0.0:
+            raise ValueError("harness.execution_participation_slippage_coeff must be >=0")
+        if float(self.execution_dynamic_slippage_bps_cap) < 0.0:
+            raise ValueError("harness.execution_dynamic_slippage_bps_cap must be >=0")
         if int(self.execution_latency_bars) < 0:
             raise ValueError("harness.execution_latency_bars must be >=0")
         if int(self.process_pool_candidate_chunk_size) < 1:
@@ -414,12 +448,25 @@ class StressScenarioModel(BaseModel):
 
     scenario_id: str
     name: str
+    scenario_group: Literal["stress", "degradation", "capacity"] = "stress"
     missing_burst_prob: float
     missing_burst_min: int
     missing_burst_max: int
     jitter_sigma_bps: float
     slippage_mult: float
+    signal_lag_bars: int = 0
+    entry_threshold_shift: float = 0.0
+    exit_threshold_shift: float = 0.0
+    target_scale_mult: float = 1.0
     enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_shadow_controls(self) -> "StressScenarioModel":
+        if int(self.signal_lag_bars) < 0:
+            raise ValueError("stress_scenarios.signal_lag_bars must be >=0")
+        if float(self.target_scale_mult) <= 0.0:
+            raise ValueError("stress_scenarios.target_scale_mult must be >0")
+        return self
 
 
 class CandidateSpecModel(BaseModel):

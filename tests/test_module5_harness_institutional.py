@@ -21,6 +21,7 @@ from weightiz.module1.core import EngineConfig, deterministic_digest_sha256, pre
 from weightiz.module2.core import Module2Config
 from weightiz.module3.bridge import ContextIdx, Module3Config, Module3Output, Struct30mIdx
 from weightiz.module4.strategy_funnel import Module4Config, Module4SignalOutput
+from weightiz.module5.strategy_registry import load_strategy_registry
 from weightiz.cli.run_research import HarnessConfigModel
 import weightiz.module5.orchestrator as h
 
@@ -102,7 +103,15 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
             target_qty_ta=np.zeros((T, A), dtype=np.float64),
         )
 
-    def _run_minimal_harness(self, report_dir: Path, harness_overrides: dict[str, object] | None = None) -> h.HarnessOutput:
+    def _run_minimal_harness(
+        self,
+        report_dir: Path,
+        harness_overrides: dict[str, object] | None = None,
+        *,
+        candidate_tags: tuple[str, ...] = (),
+        strategy_registry: dict[str, object] | None = None,
+        strategy_registry_hash: str = "",
+    ) -> h.HarnessOutput:
         frames = self._small_market_frames(sessions=24, bars_per_session=24)
 
         def loader(path: str, _tz_name: str) -> "pd.DataFrame":
@@ -119,7 +128,7 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
                 m3_idx=0,
                 m4_idx=0,
                 enabled_assets_mask=np.ones(2, dtype=bool),
-                tags=(),
+                tags=candidate_tags,
             )
         ]
         stress_scenarios = [
@@ -166,6 +175,8 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
             candidate_specs=candidate_specs,
             data_loader_func=loader,
             stress_scenarios=stress_scenarios,
+            strategy_registry=strategy_registry,
+            strategy_registry_hash=str(strategy_registry_hash),
         )
 
     def test_clock_override_first_row_invariants(self) -> None:
@@ -588,13 +599,14 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
             self.assertTrue(np.all(np.asarray(state.scores, dtype=np.float64) == 11.0))
             return self._dummy_m4_signal(state)
 
-        def fake_risk(close_px_ta, target_qty_ta, initial_cash, cost_cfg, risk_cfg, session_id_t=None, volume_ta=None):
+        def fake_risk(close_px_ta, target_qty_ta, initial_cash, cost_cfg, risk_cfg, session_id_t=None, volume_ta=None, execution_realism=None):
             close_px_ta = np.asarray(close_px_ta, dtype=np.float64)
             T_local, A_local = close_px_ta.shape
             self.assertIsNotNone(session_id_t)
             self.assertEqual(np.asarray(session_id_t, dtype=np.int64).shape, (T_local,))
             self.assertIsNotNone(volume_ta)
             self.assertEqual(np.asarray(volume_ta, dtype=np.float64).shape, (T_local, A_local))
+            self.assertIsNotNone(execution_realism)
 
             class _Res:
                 equity_curve = np.full(T_local, float(initial_cash), dtype=np.float64)
@@ -878,13 +890,14 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
         def wrap_m4(state: h.TensorState, _m3: Module3Output, _cfg: Module4Config) -> Module4SignalOutput:
             return self._dummy_m4_signal(state)
 
-        def fake_risk(close_px_ta, target_qty_ta, initial_cash, cost_cfg, risk_cfg, session_id_t=None, volume_ta=None):
+        def fake_risk(close_px_ta, target_qty_ta, initial_cash, cost_cfg, risk_cfg, session_id_t=None, volume_ta=None, execution_realism=None):
             close_px_ta = np.asarray(close_px_ta, dtype=np.float64)
             T_local, A_local = close_px_ta.shape
             self.assertIsNotNone(session_id_t)
             self.assertEqual(np.asarray(session_id_t, dtype=np.int64).shape, (T_local,))
             self.assertIsNotNone(volume_ta)
             self.assertEqual(np.asarray(volume_ta, dtype=np.float64).shape, (T_local, A_local))
+            self.assertIsNotNone(execution_realism)
 
             class _Res:
                 equity_curve = np.full(T_local, float(initial_cash), dtype=np.float64)
@@ -1431,8 +1444,20 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
             ({"cluster_distance_block_size": 0}, "cluster_distance_block_size"),
             ({"cluster_distance_in_memory_max_n": 0}, "cluster_distance_in_memory_max_n"),
             ({"execution_transaction_cost_per_trade": -0.1}, "execution_transaction_cost_per_trade"),
+            ({"execution_cost_model": "broken"}, "execution_cost_model"),
             ({"execution_slippage_mult": -1.0}, "execution_slippage_mult"),
             ({"execution_extra_slippage_bps": -0.1}, "execution_extra_slippage_bps"),
+            ({"execution_max_volume_participation": 0.0}, "execution_max_volume_participation"),
+            ({"execution_short_borrow_apr": -0.1}, "execution_short_borrow_apr"),
+            ({"execution_short_locate_fee_per_share": -0.1}, "execution_short_locate_fee_per_share"),
+            ({"execution_debit_apr": -0.1}, "execution_debit_apr"),
+            ({"execution_open_bucket_minutes": -1}, "execution_open_bucket_minutes"),
+            ({"execution_close_bucket_minutes": -1}, "execution_close_bucket_minutes"),
+            ({"execution_open_slippage_mult": -0.1}, "execution_open_slippage_mult"),
+            ({"execution_mid_slippage_mult": -0.1}, "execution_mid_slippage_mult"),
+            ({"execution_close_slippage_mult": -0.1}, "execution_close_slippage_mult"),
+            ({"execution_participation_slippage_coeff": -0.1}, "execution_participation_slippage_coeff"),
+            ({"execution_dynamic_slippage_bps_cap": -0.1}, "execution_dynamic_slippage_bps_cap"),
             ({"execution_latency_bars": -1}, "execution_latency_bars"),
             ({"regime_vol_window": 1}, "regime_vol_window"),
             ({"regime_slope_window": 1}, "regime_slope_window"),
@@ -1455,6 +1480,84 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
             with self.subTest(payload=payload):
                 with self.assertRaisesRegex(Exception, needle):
                     HarnessConfigModel.model_validate(payload)
+
+    def test_bridge_artifacts_include_execution_cost_and_fill_diagnostics_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="m5_exec_realism_bridge_") as td:
+            report_dir = Path(td) / "artifacts"
+            out = self._run_minimal_harness(
+                report_dir=report_dir,
+                harness_overrides={
+                    "daily_return_min_days": 3,
+                    "execution_latency_bars": 0,
+                    "execution_cost_model": "dynamic_bucketed_v1",
+                    "execution_max_volume_participation": 0.25,
+                    "execution_short_borrow_apr": 0.10,
+                    "execution_short_locate_fee_per_share": 0.01,
+                    "execution_debit_apr": 0.08,
+                },
+            )
+            trade = pd.read_parquet(Path(str(out.artifact_paths["trade_log"])))
+            equity = pd.read_parquet(Path(str(out.artifact_paths["equity_curves"])))
+            sessions = pd.read_parquet(Path(str(out.artifact_paths["strategy_instance_session_returns"])))
+
+            for col in (
+                "desired_qty",
+                "unfilled_qty",
+                "fill_cap_qty",
+                "participation_rate",
+                "fill_capped_flag",
+                "fill_rejected_flag",
+                "trade_cost_slippage",
+                "trade_cost_commission",
+                "trade_cost_regulatory",
+                "trade_cost_locate",
+                "execution_cost_model",
+            ):
+                self.assertIn(col, trade.columns)
+            for col in ("session_start_equity", "borrow_cost", "debit_cost"):
+                self.assertIn(col, equity.columns)
+            for col in (
+                "session_start_equity",
+                "session_slippage_cost_total",
+                "session_commission_cost_total",
+                "session_regulatory_cost_total",
+                "session_locate_cost_total",
+                "session_borrow_cost_total",
+                "session_debit_cost_total",
+                "session_trade_cost_total",
+                "session_fill_cap_hit_count",
+                "session_fill_reject_count",
+                "session_fill_failure_rate",
+            ):
+                self.assertIn(col, sessions.columns)
+
+    def test_strategy_registry_enriches_candidate_artifacts_for_active_family_ids(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="m5_strategy_registry_") as td:
+            report_dir = Path(td) / "artifacts"
+            registry_path = Path(__file__).resolve().parents[1] / "configs" / "strategy_registry.yaml"
+            registry = load_strategy_registry(registry_path)
+            out = self._run_minimal_harness(
+                report_dir=report_dir,
+                harness_overrides={"daily_return_min_days": 3, "execution_latency_bars": 0},
+                candidate_tags=(
+                    "family_id=F1",
+                    "family_name=acceptance_rejection_geometry",
+                    "hypothesis_id=hypo_f1",
+                    "evaluation_role=window_probe",
+                    "parameter_hash=param_f1",
+                ),
+                strategy_registry=registry,
+                strategy_registry_hash="registry_hash_test",
+            )
+            candidate_dir = Path(str(out.artifact_paths["run_manifest"])).resolve().parent / "candidates" / "cand_single"
+            candidate_config = json.loads((candidate_dir / "candidate_config.json").read_text(encoding="utf-8"))
+            leaderboard = pd.read_csv(Path(str(out.artifact_paths["leaderboard_csv"])))
+
+            self.assertEqual(candidate_config["strategy_why"]["strategy_family_id"], "F1")
+            self.assertEqual(candidate_config["strategy_registry_hash"], "registry_hash_test")
+            self.assertIn("economic_mechanism", leaderboard.columns)
+            self.assertEqual(str(leaderboard.loc[0, "family_id"]), "F1")
+            self.assertTrue(bool(str(leaderboard.loc[0, "economic_mechanism"]).strip()))
 
     def test_clean_fixture_emits_no_runtime_warnings(self) -> None:
         with tempfile.TemporaryDirectory(prefix="m5_warning_regression_") as td:

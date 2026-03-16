@@ -14,6 +14,10 @@ def test_load_module5_run_reads_bridge_artifacts(tmp_path):
     assert loaded.strategy_instance_selection.shape[0] > 0
     assert loaded.strategy_instance_session_returns.shape[0] > 0
     assert "canonical_reference_policy" in loaded.strategy_instance_selection.columns
+    assert "universe_id" in loaded.strategy_instance_selection.columns
+    assert "support_space_id" in loaded.strategy_instance_selection.columns
+    assert "universe_id" in loaded.strategy_instance_session_returns.columns
+    assert "support_space_id" in loaded.strategy_instance_session_returns.columns
     assert "session_id" in loaded.trade_log.columns
     counts = loaded.strategy_instance_selection.loc[
         loaded.strategy_instance_selection["portfolio_instance_role"] == "canonical_portfolio"

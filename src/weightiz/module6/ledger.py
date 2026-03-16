@@ -118,6 +118,7 @@ def build_strategy_instance_master(run: LoadedModule5Run, config: Module6Config)
         metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
         stats = json.loads(stats_path.read_text(encoding="utf-8"))
         stage_meta = dict(cfg.get("stage_a_metadata", {}))
+        strategy_why = dict(cfg.get("strategy_why") or {})
         base_metrics = dict(metrics.get("base_metrics", {}))
         robustness = dict(metrics.get("robustness", {}))
         dq_summary = dict(metrics.get("dq_summary", {}))
@@ -148,6 +149,13 @@ def build_strategy_instance_master(run: LoadedModule5Run, config: Module6Config)
                 "stats_dsr": _metric_scalar(stats.get("dsr", {}), "dsr", float("nan")),
                 "stats_pbo": _metric_scalar(stats.get("pbo", {}), "pbo", float("nan")),
                 "engine_config_json": json.dumps(cfg.get("engine_config", {}), sort_keys=True),
+                "economic_mechanism_cfg": str(strategy_why.get("economic_mechanism", "")),
+                "expected_edge_source_cfg": str(strategy_why.get("expected_edge_source", "")),
+                "expected_market_conditions_cfg": str(strategy_why.get("expected_market_conditions", "")),
+                "expected_kill_conditions_cfg": str(strategy_why.get("expected_kill_conditions", "")),
+                "liquidity_sensitivity_cfg": str(strategy_why.get("liquidity_sensitivity", "")),
+                "cost_sensitivity_cfg": str(strategy_why.get("cost_sensitivity", "")),
+                "confidence_prior_cfg": float(strategy_why.get("confidence_prior", np.nan)),
             }
         )
     cfg_df = pd.DataFrame(candidate_cfg_rows)
@@ -177,6 +185,22 @@ def build_strategy_instance_master(run: LoadedModule5Run, config: Module6Config)
     merged["tags_serialized"] = merged["tags_serialized"].where(
         merged["tags_serialized"].notna(), merged["tags_serialized_cfg"]
     )
+    for col in (
+        "economic_mechanism",
+        "expected_edge_source",
+        "expected_market_conditions",
+        "expected_kill_conditions",
+        "liquidity_sensitivity",
+        "cost_sensitivity",
+        "confidence_prior",
+    ):
+        cfg_col = f"{col}_cfg"
+        if cfg_col not in merged.columns:
+            continue
+        if col not in merged.columns:
+            merged[col] = merged[cfg_col]
+            continue
+        merged[col] = merged[col].where(merged[col].notna(), merged[cfg_col])
     merged["enabled_assets_hash"] = merged["enabled_assets_hash"].fillna("")
     required = ["candidate_id", "parameter_hash", "enabled_assets_hash", "calendar_version", "selection_stage", "execution_mode"]
     for col in required:

@@ -145,6 +145,11 @@ from weightiz.module5.harness.module6_bridge import (
     AVAIL_OBSERVED_ACTIVE as _MODULE6_AVAIL_OBSERVED_ACTIVE,
     AVAIL_OBSERVED_FLAT as _MODULE6_AVAIL_OBSERVED_FLAT,
 )
+from weightiz.module5.harness.scenario_semantics import (
+    apply_signal_lag as _scenario_apply_signal_lag,
+    apply_target_scale as _scenario_apply_target_scale,
+    apply_threshold_perturbation as _scenario_apply_threshold_perturbation,
+)
 from weightiz.module5.harness.runtime_truth import (
     build_compute_authority as _truth_build_compute_authority,
     build_execution_topology as _truth_build_execution_topology,
@@ -280,7 +285,7 @@ from weightiz.shared.io.shared_feature_store import (
     enforce_memory_safety,
     estimate_tensor_bytes,
 )
-from weightiz.module4.risk_engine import CostConfig, RiskConfig, simulate_portfolio_from_signals
+from weightiz.module4.risk_engine import CostConfig, ExecutionRealismConfig, RiskConfig, simulate_portfolio_from_signals
 from weightiz.shared.logging.runtime_monitor import RuntimeMonitor
 from weightiz.shared.logging.system_logger import configure_worker_logging, get_logger, init_runtime_logger, log_event
 
@@ -370,8 +375,20 @@ class Module5HarnessConfig:
     cluster_distance_block_size: int = 256
     cluster_distance_in_memory_max_n: int = 2500
     execution_transaction_cost_per_trade: float = 0.0
+    execution_cost_model: str = "static_mid_rvol_legacy"
     execution_slippage_mult: float = 1.0
     execution_extra_slippage_bps: float = 0.0
+    execution_max_volume_participation: float = 1.0
+    execution_short_borrow_apr: float = 0.0
+    execution_short_locate_fee_per_share: float = 0.0
+    execution_debit_apr: float = 0.0
+    execution_open_bucket_minutes: int = 30
+    execution_close_bucket_minutes: int = 30
+    execution_open_slippage_mult: float = 1.25
+    execution_mid_slippage_mult: float = 1.0
+    execution_close_slippage_mult: float = 1.15
+    execution_participation_slippage_coeff: float = 1.0
+    execution_dynamic_slippage_bps_cap: float = 50.0
     execution_latency_bars: int = 1
     regime_vol_window: int = 60
     regime_slope_window: int = 60
@@ -422,6 +439,11 @@ class StressScenario:
     missing_burst_max: int
     jitter_sigma_bps: float
     slippage_mult: float
+    scenario_group: str = "stress"
+    signal_lag_bars: int = 0
+    entry_threshold_shift: float = 0.0
+    exit_threshold_shift: float = 0.0
+    target_scale_mult: float = 1.0
     enabled: bool = True
 
 
@@ -448,6 +470,20 @@ class _ExecutionView:
     filled_qty_ta: np.ndarray
     exec_price_ta: np.ndarray
     trade_cost_ta: np.ndarray
+    desired_qty_ta: np.ndarray
+    unfilled_qty_ta: np.ndarray
+    fill_cap_qty_ta: np.ndarray
+    participation_rate_ta: np.ndarray
+    fill_capped_flag_ta: np.ndarray
+    fill_rejected_flag_ta: np.ndarray
+    slippage_cost_ta: np.ndarray
+    commission_cost_ta: np.ndarray
+    regulatory_cost_ta: np.ndarray
+    locate_cost_ta: np.ndarray
+    borrow_cost_t: np.ndarray
+    debit_cost_t: np.ndarray
+    session_start_equity_t: np.ndarray
+    execution_cost_model: str
     overnight_score_ta: np.ndarray
     overnight_winner_t: np.ndarray
     kill_switch_t: np.ndarray
@@ -1383,6 +1419,46 @@ def _session_gross_peak_by_equity_payload(equity_payload: dict[str, np.ndarray] 
     return out
 
 
+def _session_fill_attempt_payload(
+    *,
+    session_id_t: np.ndarray,
+    desired_qty_ta: np.ndarray | None,
+    unfilled_qty_ta: np.ndarray | None,
+    fill_capped_flag_ta: np.ndarray | None,
+    fill_rejected_flag_ta: np.ndarray | None,
+) -> dict[str, np.ndarray] | None:
+    if desired_qty_ta is None or unfilled_qty_ta is None or fill_capped_flag_ta is None or fill_rejected_flag_ta is None:
+        return None
+    sess = np.asarray(session_id_t, dtype=np.int64).reshape(-1)
+    desired = np.asarray(desired_qty_ta, dtype=np.float64)
+    unfilled = np.asarray(unfilled_qty_ta, dtype=np.float64)
+    fill_capped = np.asarray(fill_capped_flag_ta, dtype=np.int8)
+    fill_rejected = np.asarray(fill_rejected_flag_ta, dtype=np.int8)
+    if desired.ndim != 2 or unfilled.ndim != 2 or fill_capped.ndim != 2 or fill_rejected.ndim != 2:
+        raise RuntimeError("session fill attempt payload requires [T,A] arrays")
+    t_count = int(sess.shape[0])
+    if desired.shape[0] != t_count or unfilled.shape[0] != t_count or fill_capped.shape[0] != t_count or fill_rejected.shape[0] != t_count:
+        raise RuntimeError("session fill attempt payload time dimension mismatch")
+    unique_sessions = np.unique(sess).astype(np.int64)
+    desired_sum = np.zeros(unique_sessions.shape[0], dtype=np.float64)
+    unfilled_sum = np.zeros(unique_sessions.shape[0], dtype=np.float64)
+    fill_cap_hits = np.zeros(unique_sessions.shape[0], dtype=np.float64)
+    fill_rejects = np.zeros(unique_sessions.shape[0], dtype=np.float64)
+    for i, sid in enumerate(unique_sessions.tolist()):
+        mask = sess == int(sid)
+        desired_sum[i] = float(np.sum(np.abs(desired[mask, :])))
+        unfilled_sum[i] = float(np.sum(np.abs(unfilled[mask, :])))
+        fill_cap_hits[i] = float(np.sum(fill_capped[mask, :] > 0))
+        fill_rejects[i] = float(np.sum(fill_rejected[mask, :] > 0))
+    return {
+        "session_id": unique_sessions,
+        "desired_qty_abs_sum": desired_sum,
+        "unfilled_qty_abs_sum": unfilled_sum,
+        "fill_cap_hit_count": fill_cap_hits,
+        "fill_reject_count": fill_rejects,
+    }
+
+
 def _availability_state_codes_from_worker_truth(
     *,
     session_ids_exec: np.ndarray,
@@ -1640,6 +1716,7 @@ def _run_group_task(
                 stress_slippage_mult=float(m4_configs[c.m4_idx].stress_slippage_mult)
                 * float(scenario.slippage_mult),
             )
+            m4_cfg = _scenario_apply_threshold_perturbation(m4_cfg, scenario)
 
             m4_sig: Module4SignalOutput = run_module4_signal_funnel(
                 st,
@@ -1660,10 +1737,21 @@ def _run_group_task(
                 for t_i in range(first + 1, int(st.cfg.T)):
                     if not np.isfinite(col[t_i]):
                         col[t_i] = col[t_i - 1]
-            target_qty_raw = np.asarray(m4_sig.target_qty_ta, dtype=np.float64)
+            target_qty_raw = _scenario_apply_signal_lag(
+                np.asarray(m4_sig.target_qty_ta, dtype=np.float64),
+                int(getattr(scenario, "signal_lag_bars", 0)),
+            )
             target_qty_exec = _apply_latency_to_target_qty(
                 target_qty_raw,
                 latency_bars=int(harness_cfg.execution_latency_bars),
+            )
+            target_qty_exec = _scenario_apply_target_scale(
+                target_qty_exec,
+                float(getattr(scenario, "target_scale_mult", 1.0)),
+            )
+            raw_execution_realism = ExecutionRealismConfig(
+                cost_model="static_mid_rvol_legacy",
+                max_volume_participation=float(harness_cfg.execution_max_volume_participation),
             )
             risk_res_raw = simulate_portfolio_from_signals(
                 close_px_ta=close_px_safe,
@@ -1680,12 +1768,45 @@ def _run_group_task(
                 risk_cfg=RiskConfig(),
                 session_id_t=st.session_id,
                 volume_ta=st.volume,
+                execution_realism=raw_execution_realism,
+            )
+            low_slippage_bps = (
+                float(m4_cfg.slippage_bps_low_rvol)
+                * float(scenario.slippage_mult)
+                * float(harness_cfg.execution_slippage_mult)
+                + float(harness_cfg.execution_extra_slippage_bps)
             )
             exec_slippage_bps = (
                 float(m4_cfg.slippage_bps_mid_rvol)
                 * float(scenario.slippage_mult)
                 * float(harness_cfg.execution_slippage_mult)
                 + float(harness_cfg.execution_extra_slippage_bps)
+            )
+            high_slippage_bps = (
+                float(m4_cfg.slippage_bps_high_rvol)
+                * float(scenario.slippage_mult)
+                * float(harness_cfg.execution_slippage_mult)
+                + float(harness_cfg.execution_extra_slippage_bps)
+            )
+            exec_execution_realism = ExecutionRealismConfig(
+                cost_model=str(harness_cfg.execution_cost_model),
+                max_volume_participation=float(harness_cfg.execution_max_volume_participation),
+                low_rvol_slippage_bps=max(0.0, float(low_slippage_bps)),
+                mid_rvol_slippage_bps=max(0.0, float(exec_slippage_bps)),
+                high_rvol_slippage_bps=max(0.0, float(high_slippage_bps)),
+                spread_tick_mult=float(m4_cfg.spread_tick_mult),
+                open_bucket_minutes=int(harness_cfg.execution_open_bucket_minutes),
+                close_bucket_minutes=int(harness_cfg.execution_close_bucket_minutes),
+                open_slippage_mult=float(harness_cfg.execution_open_slippage_mult),
+                mid_slippage_mult=float(harness_cfg.execution_mid_slippage_mult),
+                close_slippage_mult=float(harness_cfg.execution_close_slippage_mult),
+                participation_slippage_coeff=float(harness_cfg.execution_participation_slippage_coeff),
+                dynamic_slippage_bps_cap=float(harness_cfg.execution_dynamic_slippage_bps_cap),
+                rth_open_minute=int(st.cfg.rth_open_minute),
+                flat_time_minute=int(st.cfg.flat_time_minute),
+                rvol_ta=np.asarray(st.rvol, dtype=np.float64),
+                tick_size_a=np.asarray(st.eps.eps_div, dtype=np.float64),
+                minute_of_day_t=np.asarray(st.minute_of_day, dtype=np.int16),
             )
             risk_res_exec = simulate_portfolio_from_signals(
                 close_px_ta=close_px_safe,
@@ -1695,13 +1816,15 @@ def _run_group_task(
                     commission_per_share=float(harness_cfg.execution_transaction_cost_per_trade),
                     finra_taf_per_share_sell=0.0,
                     sec_fee_per_dollar_sell=0.0,
-                    short_borrow_apr=0.0,
-                    locate_fee_per_share_short_entry=0.0,
+                    short_borrow_apr=float(harness_cfg.execution_short_borrow_apr),
+                    locate_fee_per_share_short_entry=float(harness_cfg.execution_short_locate_fee_per_share),
                     slippage_bps=max(0.0, float(exec_slippage_bps)),
+                    debit_apr=float(harness_cfg.execution_debit_apr),
                 ),
                 risk_cfg=RiskConfig(),
                 session_id_t=st.session_id,
                 volume_ta=st.volume,
+                execution_realism=exec_execution_realism,
             )
             m4_out = _materialize_risk_outputs_into_state(st, m4_sig, risk_res_exec)
             if _resolve_candidate_scratch_mode(harness_cfg) == "full":
@@ -1729,6 +1852,13 @@ def _run_group_task(
                 )
             equity_payload = _equity_curve_payload(st, c.candidate_id, split.split_id, scenario.scenario_id)
             trade_payload = _trade_log_payload(st, m4_out, c.candidate_id, split.split_id, scenario.scenario_id)
+            session_fill_payload = _session_fill_attempt_payload(
+                session_id_t=st.session_id,
+                desired_qty_ta=getattr(risk_res_exec, "desired_qty_ta", None),
+                unfilled_qty_ta=getattr(risk_res_exec, "unfilled_qty_ta", None),
+                fill_capped_flag_ta=getattr(risk_res_exec, "fill_capped_flag_ta", None),
+                fill_rejected_flag_ta=getattr(risk_res_exec, "fill_rejected_flag_ta", None),
+            )
             dq_invalidated = bool("DQ_REJECTED_INPUT" in quality_reason_codes)
             availability_state_session_ids, availability_state_codes = _availability_state_codes_from_worker_truth(
                 session_ids_exec=sess_ids,
@@ -1777,6 +1907,7 @@ def _run_group_task(
                 + _tensor_nbytes_total(risk_res_exec.trade_cost_ta)
             )
             total_payload_bytes += int(payload_bytes)
+            exec_diags = getattr(risk_res_exec, "execution_diagnostics", {}) or {}
 
             row = {
                 "task_id": task_id,
@@ -1796,6 +1927,7 @@ def _run_group_task(
                 "daily_returns_raw": daily_ret_raw,
                 "equity_payload": equity_payload,
                 "trade_payload": trade_payload,
+                "session_fill_payload": session_fill_payload,
                 "asset_pnl_by_symbol": _asset_pnl_by_symbol_from_state(st, split),
                 "micro_payload": micro_payload,
                 "profile_payload": profile_payload,
@@ -1823,6 +1955,18 @@ def _run_group_task(
                     "sharpe_exec": float(risk_res_exec.sharpe),
                     "sortino_exec": float(risk_res_exec.sortino),
                     "trades_exec": int(risk_res_exec.trades),
+                    "execution_cost_model": str(getattr(risk_res_exec, "execution_cost_model", "static_mid_rvol_legacy")),
+                    "desired_fill_qty_abs_sum_exec": float(exec_diags.get("desired_fill_qty_abs_sum", 0.0)),
+                    "filled_qty_abs_sum_exec": float(exec_diags.get("filled_qty_abs_sum", 0.0)),
+                    "volume_cap_hit_count_exec": int(exec_diags.get("volume_cap_hit_count", 0)),
+                    "fill_rejected_count_exec": int(exec_diags.get("fill_rejected_count", 0)),
+                    "volume_cap_clipped_qty_abs_sum_exec": float(exec_diags.get("volume_cap_clipped_qty_abs_sum", 0.0)),
+                    "slippage_cost_total_exec": float(exec_diags.get("slippage_cost_total", 0.0)),
+                    "commission_cost_total_exec": float(exec_diags.get("commission_cost_total", 0.0)),
+                    "regulatory_cost_total_exec": float(exec_diags.get("regulatory_cost_total", 0.0)),
+                    "locate_cost_total_exec": float(exec_diags.get("locate_cost_total", 0.0)),
+                    "borrow_cost_total_exec": float(exec_diags.get("borrow_cost_total", 0.0)),
+                    "debit_cost_total_exec": float(exec_diags.get("debit_cost_total", 0.0)),
                 },
                 "group_runtime_stats": {
                     "split_stress_sec": float(split_stress_sec),
@@ -2114,10 +2258,34 @@ def _validate_institutional_harness_config(harness_cfg: Module5HarnessConfig) ->
         )
     if float(harness_cfg.execution_transaction_cost_per_trade) < 0.0:
         raise RuntimeError("execution_transaction_cost_per_trade must be >=0")
+    if str(harness_cfg.execution_cost_model).strip() not in {"static_mid_rvol_legacy", "dynamic_bucketed_v1"}:
+        raise RuntimeError("execution_cost_model must be 'static_mid_rvol_legacy' or 'dynamic_bucketed_v1'")
     if float(harness_cfg.execution_slippage_mult) < 0.0:
         raise RuntimeError("execution_slippage_mult must be >=0")
     if float(harness_cfg.execution_extra_slippage_bps) < 0.0:
         raise RuntimeError("execution_extra_slippage_bps must be >=0")
+    if not (0.0 < float(harness_cfg.execution_max_volume_participation) <= 1.0):
+        raise RuntimeError("execution_max_volume_participation must be in (0,1]")
+    if float(harness_cfg.execution_short_borrow_apr) < 0.0:
+        raise RuntimeError("execution_short_borrow_apr must be >=0")
+    if float(harness_cfg.execution_short_locate_fee_per_share) < 0.0:
+        raise RuntimeError("execution_short_locate_fee_per_share must be >=0")
+    if float(harness_cfg.execution_debit_apr) < 0.0:
+        raise RuntimeError("execution_debit_apr must be >=0")
+    if int(harness_cfg.execution_open_bucket_minutes) < 0:
+        raise RuntimeError("execution_open_bucket_minutes must be >=0")
+    if int(harness_cfg.execution_close_bucket_minutes) < 0:
+        raise RuntimeError("execution_close_bucket_minutes must be >=0")
+    if float(harness_cfg.execution_open_slippage_mult) < 0.0:
+        raise RuntimeError("execution_open_slippage_mult must be >=0")
+    if float(harness_cfg.execution_mid_slippage_mult) < 0.0:
+        raise RuntimeError("execution_mid_slippage_mult must be >=0")
+    if float(harness_cfg.execution_close_slippage_mult) < 0.0:
+        raise RuntimeError("execution_close_slippage_mult must be >=0")
+    if float(harness_cfg.execution_participation_slippage_coeff) < 0.0:
+        raise RuntimeError("execution_participation_slippage_coeff must be >=0")
+    if float(harness_cfg.execution_dynamic_slippage_bps_cap) < 0.0:
+        raise RuntimeError("execution_dynamic_slippage_bps_cap must be >=0")
     if int(harness_cfg.execution_latency_bars) < 0:
         raise RuntimeError("execution_latency_bars must be >=0")
     if int(harness_cfg.regime_vol_window) < 2:
@@ -2201,6 +2369,8 @@ def _build_candidate_artifacts(
     m3_configs: list[Module3Config],
     m4_configs: list[Module4Config],
     harness_cfg: Module5HarnessConfig,
+    strategy_registry: dict[str, Any] | None = None,
+    strategy_registry_hash: str = "",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     return _candidate_build_candidate_artifacts(
         report_root=report_root,
@@ -2235,6 +2405,8 @@ def _build_candidate_artifacts(
         asset_pnl_concentration_from_result_rows_fn=_asset_pnl_concentration_from_result_rows,
         asset_notional_concentration_from_trade_payloads_fn=_asset_notional_concentration_from_trade_payloads,
         robustness_caps=ROBUSTNESS_CAPS,
+        strategy_registry=strategy_registry,
+        strategy_registry_hash=str(strategy_registry_hash),
     )
 
 
@@ -2256,6 +2428,8 @@ def run_weightiz_harness(
     data_loader_func: Callable[[str, str], Any] | None = None,
     stress_scenarios: list[StressScenario] | None = None,
     self_audit_report: dict[str, Any] | None = None,
+    strategy_registry: dict[str, Any] | None = None,
+    strategy_registry_hash: str = "",
 ) -> HarnessOutput:
     if not m2_configs or not m3_configs or not m4_configs:
         raise RuntimeError("m2_configs/m3_configs/m4_configs must be non-empty")
@@ -3235,6 +3409,8 @@ def run_weightiz_harness(
         write_json_fn=_write_json,
         write_frozen_json_fn=_write_frozen_module5_json,
         build_candidate_artifacts_fn=_build_candidate_artifacts,
+        strategy_registry=strategy_registry,
+        strategy_registry_hash=str(strategy_registry_hash),
         collect_ledger_rows_fn=_collect_ledger_rows_from_results,
         ledger_write_fn=_ledger_write,
         git_hash_fn=_git_hash,

@@ -215,6 +215,32 @@ def canonical_artifact_dependency_matrix() -> dict[str, dict[str, object]]:
     }
 
 
+def _optional_m4_array(
+    m4_out: Any,
+    name: str,
+    default: np.ndarray,
+    dtype: Any,
+) -> np.ndarray:
+    raw = getattr(m4_out, name, None)
+    if raw is None:
+        return np.asarray(default, dtype=dtype)
+    return np.asarray(raw, dtype=dtype)
+
+
+def _optional_risk_res_series(
+    state: Any,
+    name: str,
+    default: np.ndarray,
+    dtype: Any,
+) -> np.ndarray:
+    scratch = getattr(state, "candidate_scratch", None)
+    risk_res = getattr(scratch, "risk_res", None) if scratch is not None else None
+    raw = getattr(risk_res, name, None) if risk_res is not None else None
+    if raw is None:
+        return np.asarray(default, dtype=dtype)
+    return np.asarray(raw, dtype=dtype)
+
+
 def _resolve_artifact_dependency_accessor(
     accessor: str,
     *,
@@ -398,6 +424,59 @@ def materialize_risk_outputs_into_state(
         filled_qty_ta=filled,
         exec_price_ta=exec_px,
         trade_cost_ta=tcost,
+        desired_qty_ta=np.asarray(
+            risk_res.desired_qty_ta if getattr(risk_res, "desired_qty_ta", None) is not None else m4_sig.target_qty_ta,
+            dtype=np.float64,
+        ),
+        unfilled_qty_ta=np.asarray(
+            risk_res.unfilled_qty_ta if getattr(risk_res, "unfilled_qty_ta", None) is not None else np.zeros((t_count, a_count), dtype=np.float64),
+            dtype=np.float64,
+        ),
+        fill_cap_qty_ta=np.asarray(
+            risk_res.fill_cap_qty_ta if getattr(risk_res, "fill_cap_qty_ta", None) is not None else np.full((t_count, a_count), np.nan, dtype=np.float64),
+            dtype=np.float64,
+        ),
+        participation_rate_ta=np.asarray(
+            risk_res.participation_rate_ta if getattr(risk_res, "participation_rate_ta", None) is not None else np.zeros((t_count, a_count), dtype=np.float64),
+            dtype=np.float64,
+        ),
+        fill_capped_flag_ta=np.asarray(
+            risk_res.fill_capped_flag_ta if getattr(risk_res, "fill_capped_flag_ta", None) is not None else np.zeros((t_count, a_count), dtype=np.int8),
+            dtype=np.int8,
+        ),
+        fill_rejected_flag_ta=np.asarray(
+            risk_res.fill_rejected_flag_ta if getattr(risk_res, "fill_rejected_flag_ta", None) is not None else np.zeros((t_count, a_count), dtype=np.int8),
+            dtype=np.int8,
+        ),
+        slippage_cost_ta=np.asarray(
+            risk_res.slippage_cost_ta if getattr(risk_res, "slippage_cost_ta", None) is not None else np.zeros((t_count, a_count), dtype=np.float64),
+            dtype=np.float64,
+        ),
+        commission_cost_ta=np.asarray(
+            risk_res.commission_cost_ta if getattr(risk_res, "commission_cost_ta", None) is not None else np.zeros((t_count, a_count), dtype=np.float64),
+            dtype=np.float64,
+        ),
+        regulatory_cost_ta=np.asarray(
+            risk_res.regulatory_cost_ta if getattr(risk_res, "regulatory_cost_ta", None) is not None else np.zeros((t_count, a_count), dtype=np.float64),
+            dtype=np.float64,
+        ),
+        locate_cost_ta=np.asarray(
+            risk_res.locate_cost_ta if getattr(risk_res, "locate_cost_ta", None) is not None else np.zeros((t_count, a_count), dtype=np.float64),
+            dtype=np.float64,
+        ),
+        borrow_cost_t=np.asarray(
+            risk_res.borrow_cost_t if getattr(risk_res, "borrow_cost_t", None) is not None else np.zeros(t_count, dtype=np.float64),
+            dtype=np.float64,
+        ),
+        debit_cost_t=np.asarray(
+            risk_res.debit_cost_t if getattr(risk_res, "debit_cost_t", None) is not None else np.zeros(t_count, dtype=np.float64),
+            dtype=np.float64,
+        ),
+        session_start_equity_t=np.asarray(
+            risk_res.session_start_equity_t if getattr(risk_res, "session_start_equity_t", None) is not None else np.full(t_count, float(state.cfg.initial_cash), dtype=np.float64),
+            dtype=np.float64,
+        ),
+        execution_cost_model=str(getattr(risk_res, "execution_cost_model", "static_mid_rvol_legacy")),
         overnight_score_ta=np.zeros((t_count, a_count), dtype=np.float64),
         overnight_winner_t=np.full(t_count, -1, dtype=np.int16),
         kill_switch_t=np.zeros(t_count, dtype=bool),
@@ -573,6 +652,14 @@ def equity_curve_payload(
     np.divide(eq, peak, out=dd, where=peak_pos)
     dd[peak_pos] -= 1.0
     t_count = state.cfg.T
+    borrow_cost = _optional_risk_res_series(state, "borrow_cost_t", np.zeros(t_count, dtype=np.float64), np.float64)
+    debit_cost = _optional_risk_res_series(state, "debit_cost_t", np.zeros(t_count, dtype=np.float64), np.float64)
+    session_start_equity = _optional_risk_res_series(
+        state,
+        "session_start_equity_t",
+        np.full(t_count, float(state.cfg.initial_cash), dtype=np.float64),
+        np.float64,
+    )
 
     return {
         "ts_ns": state.ts_ns.copy(),
@@ -585,6 +672,9 @@ def equity_curve_payload(
         "margin_used": state.margin_used.copy(),
         "buying_power": state.buying_power.copy(),
         "daily_loss": state.daily_loss.copy(),
+        "session_start_equity": session_start_equity.astype(np.float64),
+        "borrow_cost": borrow_cost.astype(np.float64),
+        "debit_cost": debit_cost.astype(np.float64),
     }
 
 
@@ -607,9 +697,20 @@ def trade_log_payload(
             "split_id": np.zeros(0, dtype=object),
             "scenario_id": np.zeros(0, dtype=object),
             "symbol": np.zeros(0, dtype=object),
+            "execution_cost_model": np.zeros(0, dtype=object),
+            "desired_qty": np.zeros(0, dtype=np.float64),
+            "unfilled_qty": np.zeros(0, dtype=np.float64),
+            "fill_cap_qty": np.zeros(0, dtype=np.float64),
+            "participation_rate": np.zeros(0, dtype=np.float64),
+            "fill_capped_flag": np.zeros(0, dtype=np.int8),
+            "fill_rejected_flag": np.zeros(0, dtype=np.int8),
             "filled_qty": np.zeros(0, dtype=np.float64),
             "exec_price": np.zeros(0, dtype=np.float64),
             "trade_cost": np.zeros(0, dtype=np.float64),
+            "trade_cost_slippage": np.zeros(0, dtype=np.float64),
+            "trade_cost_commission": np.zeros(0, dtype=np.float64),
+            "trade_cost_regulatory": np.zeros(0, dtype=np.float64),
+            "trade_cost_locate": np.zeros(0, dtype=np.float64),
             "order_side": np.zeros(0, dtype=np.int8),
             "order_flags": np.zeros(0, dtype=np.uint16),
         }
@@ -624,9 +725,24 @@ def trade_log_payload(
         "split_id": np.full(t_idx.shape[0], split_id, dtype=object),
         "scenario_id": np.full(t_idx.shape[0], scenario_id, dtype=object),
         "symbol": np.asarray([state.symbols[int(a)] for a in a_idx.tolist()], dtype=object),
+        "execution_cost_model": np.full(
+            t_idx.shape[0],
+            str(getattr(m4_out, "execution_cost_model", "static_mid_rvol_legacy")),
+            dtype=object,
+        ),
+        "desired_qty": _optional_m4_array(m4_out, "desired_qty_ta", m4_out.filled_qty_ta, np.float64)[t_idx, a_idx].astype(np.float64),
+        "unfilled_qty": _optional_m4_array(m4_out, "unfilled_qty_ta", np.zeros_like(m4_out.filled_qty_ta), np.float64)[t_idx, a_idx].astype(np.float64),
+        "fill_cap_qty": _optional_m4_array(m4_out, "fill_cap_qty_ta", np.full(m4_out.filled_qty_ta.shape, np.nan), np.float64)[t_idx, a_idx].astype(np.float64),
+        "participation_rate": _optional_m4_array(m4_out, "participation_rate_ta", np.zeros_like(m4_out.filled_qty_ta), np.float64)[t_idx, a_idx].astype(np.float64),
+        "fill_capped_flag": _optional_m4_array(m4_out, "fill_capped_flag_ta", np.zeros_like(m4_out.filled_qty_ta, dtype=np.int8), np.int8)[t_idx, a_idx].astype(np.int8),
+        "fill_rejected_flag": _optional_m4_array(m4_out, "fill_rejected_flag_ta", np.zeros_like(m4_out.filled_qty_ta, dtype=np.int8), np.int8)[t_idx, a_idx].astype(np.int8),
         "filled_qty": m4_out.filled_qty_ta[t_idx, a_idx].astype(np.float64),
         "exec_price": m4_out.exec_price_ta[t_idx, a_idx].astype(np.float64),
         "trade_cost": m4_out.trade_cost_ta[t_idx, a_idx].astype(np.float64),
+        "trade_cost_slippage": _optional_m4_array(m4_out, "slippage_cost_ta", np.zeros_like(m4_out.trade_cost_ta), np.float64)[t_idx, a_idx].astype(np.float64),
+        "trade_cost_commission": _optional_m4_array(m4_out, "commission_cost_ta", np.zeros_like(m4_out.trade_cost_ta), np.float64)[t_idx, a_idx].astype(np.float64),
+        "trade_cost_regulatory": _optional_m4_array(m4_out, "regulatory_cost_ta", np.zeros_like(m4_out.trade_cost_ta), np.float64)[t_idx, a_idx].astype(np.float64),
+        "trade_cost_locate": _optional_m4_array(m4_out, "locate_cost_ta", np.zeros_like(m4_out.trade_cost_ta), np.float64)[t_idx, a_idx].astype(np.float64),
         "order_side": state.order_side[t_idx, a_idx].astype(np.int8),
         "order_flags": state.order_flags[t_idx, a_idx].astype(np.uint16),
     }
@@ -801,10 +917,28 @@ def collect_micro_diagnostics_payload(
         "intent_long": m4_out.intent_long_ta[t_idx, a_idx].astype(np.int8),
         "intent_short": m4_out.intent_short_ta[t_idx, a_idx].astype(np.int8),
         "target_qty": m4_out.target_qty_ta[t_idx, a_idx].astype(np.float64),
+        "desired_qty": _optional_m4_array(m4_out, "desired_qty_ta", m4_out.target_qty_ta, np.float64)[t_idx, a_idx].astype(np.float64),
+        "unfilled_qty": _optional_m4_array(m4_out, "unfilled_qty_ta", np.zeros_like(m4_out.target_qty_ta), np.float64)[t_idx, a_idx].astype(np.float64),
+        "fill_cap_qty": _optional_m4_array(m4_out, "fill_cap_qty_ta", np.full(m4_out.target_qty_ta.shape, np.nan), np.float64)[t_idx, a_idx].astype(np.float64),
+        "participation_rate": _optional_m4_array(m4_out, "participation_rate_ta", np.zeros_like(m4_out.target_qty_ta), np.float64)[t_idx, a_idx].astype(np.float64),
+        "fill_capped_flag": _optional_m4_array(m4_out, "fill_capped_flag_ta", np.zeros_like(m4_out.target_qty_ta, dtype=np.int8), np.int8)[t_idx, a_idx].astype(np.int8),
+        "fill_rejected_flag": _optional_m4_array(m4_out, "fill_rejected_flag_ta", np.zeros_like(m4_out.target_qty_ta, dtype=np.int8), np.int8)[t_idx, a_idx].astype(np.int8),
         "filled_qty": m4_out.filled_qty_ta[t_idx, a_idx].astype(np.float64),
         "exec_price": m4_out.exec_price_ta[t_idx, a_idx].astype(np.float64),
         "trade_cost": m4_out.trade_cost_ta[t_idx, a_idx].astype(np.float64),
+        "trade_cost_slippage": _optional_m4_array(m4_out, "slippage_cost_ta", np.zeros_like(m4_out.trade_cost_ta), np.float64)[t_idx, a_idx].astype(np.float64),
+        "trade_cost_commission": _optional_m4_array(m4_out, "commission_cost_ta", np.zeros_like(m4_out.trade_cost_ta), np.float64)[t_idx, a_idx].astype(np.float64),
+        "trade_cost_regulatory": _optional_m4_array(m4_out, "regulatory_cost_ta", np.zeros_like(m4_out.trade_cost_ta), np.float64)[t_idx, a_idx].astype(np.float64),
+        "trade_cost_locate": _optional_m4_array(m4_out, "locate_cost_ta", np.zeros_like(m4_out.trade_cost_ta), np.float64)[t_idx, a_idx].astype(np.float64),
         "position_qty": state.position_qty[t_idx, a_idx].astype(np.float64),
+        "session_start_equity": _optional_m4_array(
+            m4_out,
+            "session_start_equity_t",
+            np.full(state.cfg.T, float(state.cfg.initial_cash), dtype=np.float64),
+            np.float64,
+        )[t_idx].astype(np.float64),
+        "borrow_cost": _optional_m4_array(m4_out, "borrow_cost_t", np.zeros(state.cfg.T, dtype=np.float64), np.float64)[t_idx].astype(np.float64),
+        "debit_cost": _optional_m4_array(m4_out, "debit_cost_t", np.zeros(state.cfg.T, dtype=np.float64), np.float64)[t_idx].astype(np.float64),
         "overnight_score": m4_out.overnight_score_ta[t_idx, a_idx].astype(np.float64),
         "overnight_winner_flag": winner_flag,
         "atr_eff": state.atr_floor[t_idx, a_idx].astype(np.float64),

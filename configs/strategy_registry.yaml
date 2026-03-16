@@ -1,0 +1,53 @@
+registry_contract:
+  confidence_prior_semantics: expert_metadata_prior_not_empirical
+  kill_conditions_semantics: metadata_only_not_runtime_bound
+
+strategies:
+  - strategy_family_id: F1
+    economic_mechanism: "Auction acceptance and rejection around value pivots can create repeatable intraday continuation or fade opportunities."
+    expected_edge_source: "Order flow and positioning react asymmetrically when price accepts above or rejects below profile value areas."
+    expected_market_conditions: "Sessions with clean value structure, visible rotation, and orderly liquidity around POC and value boundaries."
+    expected_kill_conditions: "Broken profile structure, unstable gap regimes, or persistent chop with no meaningful acceptance signal."
+    liquidity_sensitivity: medium
+    cost_sensitivity: medium
+    confidence_prior: 0.62
+  - strategy_family_id: F2
+    economic_mechanism: "Price deviation carries more signal when delta and aggression confirm the move rather than fade it."
+    expected_edge_source: "Confirmation from participation and directional pressure filters false geometric deviations."
+    expected_market_conditions: "Trend or transition sessions where aggressive flow is informative and not purely noise."
+    expected_kill_conditions: "Low-conviction tape, mechanically mean-reverting chop, or spoof-prone thin periods."
+    liquidity_sensitivity: medium
+    cost_sensitivity: medium
+    confidence_prior: 0.60
+  - strategy_family_id: F3
+    economic_mechanism: "The same profile geometry means different things under different participation and RVOL states."
+    expected_edge_source: "Liquidity and participation regimes change the probability that a structural pattern resolves cleanly."
+    expected_market_conditions: "Distinct low- versus high-participation sessions with stable intraday liquidity."
+    expected_kill_conditions: "Participation metrics are unstable, stale, or disconnected from actual tradability."
+    liquidity_sensitivity: high
+    cost_sensitivity: high
+    confidence_prior: 0.58
+  - strategy_family_id: F4
+    economic_mechanism: "Intraday state changes around warmup, initial balance, and late-session timing alter the value of the same signal."
+    expected_edge_source: "Time-of-day structure changes who is active and how profile information should be interpreted."
+    expected_market_conditions: "Sessions with coherent opening discovery, usable IB formation, and stable late-day behavior."
+    expected_kill_conditions: "Calendar distortions, news shocks, or fragmented sessions that break normal intraday state progression."
+    liquidity_sensitivity: medium
+    cost_sensitivity: low
+    confidence_prior: 0.57
+  - strategy_family_id: F5
+    economic_mechanism: "Alignment or conflict across multiple profile horizons reveals whether short-term moves are supported by broader structure."
+    expected_edge_source: "Cross-scale agreement improves conviction while disagreement can identify failed continuation setups."
+    expected_market_conditions: "Markets with persistent structure across short, medium, and longer profile windows."
+    expected_kill_conditions: "Cross-scale readings become unstable or mutually contradictory because the market is purely event-driven."
+    liquidity_sensitivity: medium
+    cost_sensitivity: medium
+    confidence_prior: 0.64
+  - strategy_family_id: F6
+    economic_mechanism: "Profile shape regimes behave like state machines, and shape transitions alter expected path and tradeability."
+    expected_edge_source: "Distinct shape fingerprints imply different follow-through, reversal, and inventory-release dynamics."
+    expected_market_conditions: "Medium- to long-window sessions where shape classification is stable enough to be economically meaningful."
+    expected_kill_conditions: "Shapes are noisy, unstable, or collapse under small data perturbations."
+    liquidity_sensitivity: medium
+    cost_sensitivity: medium
+    confidence_prior: 0.56

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from weightiz.module4.risk_engine import CostConfig, RiskConfig, simulate_portfolio_from_signals
+from weightiz.module4.risk_engine import CostConfig, ExecutionRealismConfig, RiskConfig, simulate_portfolio_from_signals
 
 
 def test_simulate_portfolio_truncates_target_quantities_to_integer_shares() -> None:
@@ -95,6 +95,8 @@ def test_simulate_portfolio_accrues_short_borrow_on_session_change_only() -> Non
 
     expected_borrow = 1_000.0 * 0.252 / 252.0
     np.testing.assert_allclose(out.equity_curve, np.array([1_000.0, 1_000.0, 1_000.0 - expected_borrow], dtype=np.float64))
+    np.testing.assert_allclose(out.borrow_cost_t, np.array([0.0, 0.0, expected_borrow], dtype=np.float64))
+    np.testing.assert_allclose(out.debit_cost_t, np.zeros(3, dtype=np.float64))
 
     out_long = simulate_portfolio_from_signals(
         px,
@@ -131,6 +133,8 @@ def test_simulate_portfolio_accrues_debit_interest_only_when_cash_is_negative() 
 
     expected_debit = 500.0 * 0.252 / 252.0
     np.testing.assert_allclose(out.equity_curve, np.array([1_000.0, 1_000.0, 1_000.0 - expected_debit], dtype=np.float64))
+    np.testing.assert_allclose(out.debit_cost_t, np.array([0.0, 0.0, expected_debit], dtype=np.float64))
+    np.testing.assert_allclose(out.borrow_cost_t, np.zeros(3, dtype=np.float64))
 
     out_flat_cash = simulate_portfolio_from_signals(
         px,
@@ -146,6 +150,35 @@ def test_simulate_portfolio_accrues_debit_interest_only_when_cash_is_negative() 
         session_id_t=np.array([0, 0, 1], dtype=np.int64),
     )
     np.testing.assert_allclose(out_flat_cash.equity_curve, np.array([1_000.0, 1_000.0, 1_000.0], dtype=np.float64))
+
+
+def test_simulate_portfolio_charges_combined_financing_once_per_session_boundary() -> None:
+    px = np.full((3, 2), 100.0, dtype=np.float64)
+    tgt = np.array([[-10.0, 25.0], [-10.0, 25.0], [-10.0, 25.0]], dtype=np.float64)
+    out = simulate_portfolio_from_signals(
+        px,
+        tgt,
+        1_000.0,
+        CostConfig(short_borrow_apr=0.252, debit_apr=0.252),
+        RiskConfig(
+            max_position_buying_power_frac=10.0,
+            overnight_exposure_equity_mult=100.0,
+            daily_loss_limit_frac=1.0,
+            account_disable_equity=0.0,
+        ),
+        session_id_t=np.array([0, 0, 1], dtype=np.int64),
+    )
+
+    expected_borrow = 1_000.0 * 0.252 / 252.0
+    expected_debit = 500.0 * 0.252 / 252.0
+    np.testing.assert_allclose(out.borrow_cost_t, np.array([0.0, 0.0, expected_borrow], dtype=np.float64))
+    np.testing.assert_allclose(out.debit_cost_t, np.array([0.0, 0.0, expected_debit], dtype=np.float64))
+    np.testing.assert_allclose(
+        out.equity_curve,
+        np.array([1_000.0, 1_000.0, 1_000.0 - expected_borrow - expected_debit], dtype=np.float64),
+        rtol=0.0,
+        atol=1e-12,
+    )
 
 
 def test_simulate_portfolio_caps_fills_to_reported_bar_volume() -> None:
@@ -173,6 +206,47 @@ def test_simulate_portfolio_caps_fills_to_reported_bar_volume() -> None:
     assert int(out.execution_diagnostics["desired_fill_attempt_count"]) == 4
     assert int(out.execution_diagnostics["volume_cap_hit_count"]) == 2
     np.testing.assert_allclose(float(out.execution_diagnostics["volume_cap_clipped_qty_abs_sum"]), 10.0, rtol=0.0, atol=1e-12)
+
+
+def test_simulate_portfolio_supports_opt_in_volume_participation_caps_without_changing_default() -> None:
+    px = np.full((4, 1), 100.0, dtype=np.float64)
+    volume = np.full((4, 1), 100.0, dtype=np.float64)
+    tgt = np.array([[20.0], [20.0], [0.0], [0.0]], dtype=np.float64)
+
+    default_out = simulate_portfolio_from_signals(
+        px,
+        tgt,
+        10_000.0,
+        CostConfig(),
+        RiskConfig(
+            max_position_buying_power_frac=10.0,
+            overnight_exposure_equity_mult=100.0,
+            daily_loss_limit_frac=1.0,
+            account_disable_equity=0.0,
+        ),
+        volume_ta=volume,
+    )
+    capped_out = simulate_portfolio_from_signals(
+        px,
+        tgt,
+        10_000.0,
+        CostConfig(),
+        RiskConfig(
+            max_position_buying_power_frac=10.0,
+            overnight_exposure_equity_mult=100.0,
+            daily_loss_limit_frac=1.0,
+            account_disable_equity=0.0,
+        ),
+        volume_ta=volume,
+        execution_realism=ExecutionRealismConfig(max_volume_participation=0.10),
+    )
+
+    np.testing.assert_allclose(default_out.filled_qty_ta[:, 0], np.array([20.0, 0.0, -20.0, 0.0], dtype=np.float64))
+    np.testing.assert_allclose(capped_out.filled_qty_ta[:, 0], np.array([10.0, 10.0, -10.0, -10.0], dtype=np.float64))
+    np.testing.assert_allclose(capped_out.fill_cap_qty_ta[:, 0], np.array([10.0, 10.0, 10.0, 10.0], dtype=np.float64))
+    np.testing.assert_allclose(capped_out.unfilled_qty_ta[:, 0], np.array([10.0, 0.0, -10.0, 0.0], dtype=np.float64))
+    assert capped_out.execution_diagnostics is not None
+    assert int(capped_out.execution_diagnostics["volume_cap_hit_count"]) == 2
 
 
 def test_simulate_portfolio_records_buying_power_cap_reduction() -> None:
@@ -239,5 +313,35 @@ def test_simulate_portfolio_slippage_scales_with_participation_and_zero_trade_is
 
     np.testing.assert_allclose(small.trade_cost_ta[0, 0], 1.1, rtol=0.0, atol=1e-12)
     np.testing.assert_allclose(large.trade_cost_ta[0, 0], 7.5, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(large.desired_qty_ta[0, 0], 50.0, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(large.unfilled_qty_ta[0, 0], 0.0, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(large.fill_cap_qty_ta[0, 0], 100.0, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(large.participation_rate_ta[0, 0], 0.5, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(large.slippage_cost_ta[0, 0], 7.5, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(large.commission_cost_ta[0, 0], 0.0, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(large.regulatory_cost_ta[0, 0], 0.0, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(large.locate_cost_ta[0, 0], 0.0, rtol=0.0, atol=1e-12)
     assert float(large.trade_cost_ta[0, 0]) > float(small.trade_cost_ta[0, 0])
     np.testing.assert_allclose(idle.trade_cost_ta, np.zeros((2, 1), dtype=np.float64))
+
+
+def test_simulate_portfolio_initializes_execution_diagnostics_on_uncapped_trade_path() -> None:
+    px = np.full((2, 1), 100.0, dtype=np.float64)
+    tgt = np.array([[5.0], [0.0]], dtype=np.float64)
+
+    out = simulate_portfolio_from_signals(
+        px,
+        tgt,
+        10_000.0,
+        CostConfig(),
+        RiskConfig(
+            max_position_buying_power_frac=10.0,
+            overnight_exposure_equity_mult=100.0,
+            daily_loss_limit_frac=1.0,
+            account_disable_equity=0.0,
+        ),
+    )
+
+    assert out.execution_diagnostics is not None
+    assert int(out.execution_diagnostics["desired_fill_attempt_count"]) == 2
+    assert int(out.execution_diagnostics["filled_trade_count"]) == 2
