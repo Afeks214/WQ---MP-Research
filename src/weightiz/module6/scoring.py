@@ -8,6 +8,8 @@ import pandas as pd
 from weightiz.module6.config import Module6Config
 from weightiz.module6.utils import Module6ValidationError, normalized_rank
 
+REJECT_SCORE_FLOOR = -1.0
+
 
 @dataclass(frozen=True)
 class ScoredPortfolios:
@@ -103,7 +105,7 @@ def score_session_paths(
         + 0.05 * scored["concentration_rank"]
         + 0.05 * scored["overlap_rank"]
     )
-    scored.loc[scored["hard_reject"], "first_pass_score"] = -np.inf
+    scored.loc[scored["hard_reject"], "first_pass_score"] = float(REJECT_SCORE_FLOOR)
     return scored.sort_values(["first_pass_score", "portfolio_pk"], ascending=[False, True], kind="mergesort").reset_index(drop=True)
 
 
@@ -147,6 +149,7 @@ def build_cross_universe_comparable_scores(
     comparable["required_comparison_support"] = float(required_support)
     comparable["cross_universe_reject"] = comparable["support_coverage"].fillna(0.0) < float(required_support)
     comparable.loc[comparable["cross_universe_reject"], "cross_universe_reject_reason"] = "CROSS_UNIVERSE_SUPPORT_TOO_SHORT"
+    comparable["cross_universe_reject_reason"] = comparable["cross_universe_reject_reason"].fillna("").astype(str)
     comparable["return_rank_truth"] = normalized_rank(comparable["minute_annualized_return"].fillna(0.0).to_numpy(dtype=np.float64), ascending=False)
     comparable["drawdown_rank_truth"] = normalized_rank(comparable["minute_max_drawdown"].fillna(0.0).to_numpy(dtype=np.float64), ascending=True)
     comparable["turnover_rank_truth"] = normalized_rank(comparable["minute_turnover"].fillna(0.0).to_numpy(dtype=np.float64), ascending=True)
@@ -157,7 +160,7 @@ def build_cross_universe_comparable_scores(
         + 0.20 * comparable["turnover_rank_truth"]
         + 0.20 * comparable["availability_rank_truth"]
     )
-    comparable.loc[comparable["cross_universe_reject"], "comparable_truth_score"] = -np.inf
+    comparable.loc[comparable["cross_universe_reject"], "comparable_truth_score"] = float(REJECT_SCORE_FLOOR)
     return comparable.sort_values(["comparable_truth_score", "portfolio_pk"], ascending=[False, True], kind="mergesort").reset_index(drop=True)
 
 
@@ -195,7 +198,8 @@ def score_finalists(
         .merge(concentrations, on="portfolio_pk", how="left")
         .merge(internal_overlap, on="portfolio_pk", how="left")
     )
-    finalists["rejected"] = finalists["reject_reason"].fillna("").astype(str).str.len() > 0
+    finalists["reject_reason"] = finalists["reject_reason"].fillna("").astype(str)
+    finalists["rejected"] = finalists["reject_reason"].str.len() > 0
     finalists["truth_calmar"] = finalists["minute_annualized_return"].fillna(0.0) / np.maximum(finalists["minute_max_drawdown"].fillna(0.0), 1.0e-6)
     finalists["truth_return_rank"] = normalized_rank(finalists["minute_annualized_return"].fillna(0.0).to_numpy(dtype=np.float64), ascending=False)
     finalists["truth_calmar_rank"] = normalized_rank(finalists["truth_calmar"].to_numpy(dtype=np.float64), ascending=False)
@@ -205,11 +209,11 @@ def score_finalists(
     finalists["final_score"] = (
         0.25 * finalists["truth_calmar_rank"]
         + 0.20 * finalists["truth_return_rank"]
-        + 0.15 * finalists["first_pass_score"].replace([-np.inf], 0.0)
+        + 0.15 * finalists["first_pass_score"].where(np.isfinite(finalists["first_pass_score"]), 0.0)
         + 0.15 * finalists["truth_availability_rank"]
         + 0.10 * finalists["truth_overlap_rank"]
         + 0.10 * finalists["truth_turnover_rank"]
         + 0.05 * normalized_rank((1.0 - finalists["cluster_concentration"].fillna(1.0)).to_numpy(dtype=np.float64), ascending=False)
     )
-    finalists.loc[finalists["rejected"], "final_score"] = -np.inf
+    finalists.loc[finalists["rejected"], "final_score"] = float(REJECT_SCORE_FLOOR)
     return finalists.sort_values(["final_score", "portfolio_pk"], ascending=[False, True], kind="mergesort").reset_index(drop=True)

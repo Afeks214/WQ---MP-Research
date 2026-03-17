@@ -26,6 +26,13 @@ class SessionSimulationArtifacts:
     weight_history: pd.DataFrame
 
 
+def _resolve_starting_equity(config: Module6Config) -> float:
+    floor = float(config.simulator.account_disable_equity)
+    if not np.isfinite(floor):
+        raise Module6ValidationError("module6.simulator.account_disable_equity must be finite")
+    return float(max(floor, 1.0))
+
+
 def _policy_rebalance_due(
     policy: str,
     session_idx: int,
@@ -84,6 +91,7 @@ def simulate_session_batch(
     summary_rows: list[dict[str, Any]] = []
     weight_rows: list[dict[str, Any]] = []
 
+    start_equity = _resolve_starting_equity(config)
     for candidate in portfolio_candidates.itertuples(index=False):
         weights_df = portfolio_weights.loc[portfolio_weights["portfolio_pk"] == candidate.portfolio_pk].copy()
         weights_df = weights_df.sort_values(["strategy_instance_pk"], kind="mergesort")
@@ -100,7 +108,7 @@ def simulate_session_batch(
             raise Module6ValidationError(f"non-simplex target weights for portfolio {candidate.portfolio_pk}")
         weights = target.copy()
         cash_weight = target_cash
-        equity = 1.0
+        equity = float(start_equity)
         day_start_equity = float(equity)
         peak_equity = float(equity)
         breach_count = 0

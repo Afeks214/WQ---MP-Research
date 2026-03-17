@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -41,7 +42,7 @@ def test_screening_truth_rank_instability_gate_blocks_export(tmp_path):
         config=cfg,
         calendar_version=str(strategy_frame["calendar_version"].iloc[0]),
     )
-    finalists = candidates.head(3).copy()
+    finalists = candidates.head(5).copy()
     session_art = simulate_session_batch(
         portfolio_candidates=finalists,
         portfolio_weights=weights,
@@ -59,7 +60,9 @@ def test_screening_truth_rank_instability_gate_blocks_export(tmp_path):
         config=cfg,
     ).assign(calendar_version=str(strategy_frame["calendar_version"].iloc[0]), support_policy_version=cfg.simulator.support_policy_version)
     session_scores = session_scores.loc[session_scores["portfolio_pk"].isin(finalists["portfolio_pk"])].copy()
-    session_scores["first_pass_score"] = -session_scores["annualized_return"].to_numpy()
+    session_scores = session_scores.sort_values(["portfolio_pk"], kind="mergesort").reset_index(drop=True)
+    session_scores["annualized_return"] = np.asarray(session_scores["annualized_return"], dtype=np.float64)[::-1]
+    session_scores["max_drawdown"] = 0.0
     with pytest.raises(Module6ValidationError):
         replay_finalists_minute(
             finalist_candidates=finalists,

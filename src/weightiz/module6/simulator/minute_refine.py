@@ -19,6 +19,13 @@ class MinuteReplayArtifacts:
     minute_summary: pd.DataFrame
 
 
+def _resolve_starting_equity(config: Module6Config) -> float:
+    floor = float(config.simulator.account_disable_equity)
+    if not np.isfinite(floor):
+        raise Module6ValidationError("module6.simulator.account_disable_equity must be finite")
+    return float(max(floor, 1.0))
+
+
 def replay_finalists_minute(
     *,
     finalist_candidates: pd.DataFrame,
@@ -81,6 +88,7 @@ def replay_finalists_minute(
     summary_rows: list[dict[str, Any]] = []
     divergence_rows: list[dict[str, Any]] = []
 
+    start_equity = _resolve_starting_equity(config)
     for candidate in finalist_candidates.itertuples(index=False):
         detail = weight_history.loc[weight_history["portfolio_pk"] == candidate.portfolio_pk].copy()
         if detail.shape[0] <= 0:
@@ -88,8 +96,8 @@ def replay_finalists_minute(
         path_df = session_paths.loc[session_paths["portfolio_pk"] == candidate.portfolio_pk].copy()
         if path_df.shape[0] <= 0:
             raise Module6ValidationError(f"missing session path for finalist {candidate.portfolio_pk}")
-        equity = 1.0
-        peak = 1.0
+        equity = float(start_equity)
+        peak = float(start_equity)
         gross_peak_seen = 0.0
         breach_count = 0
         disable = False
@@ -167,7 +175,9 @@ def replay_finalists_minute(
                 component_trade_cost_abs = 0.0
                 if loc_trade.shape[0] > 0:
                     scale = float(comp.start_weight) * session_start_equity / max(base_eq, 1.0e-12)
-                    trade_notional = np.abs(np.asarray(loc_trade["filled_qty"], dtype=np.float64) * np.asarray(loc_trade["exec_price"], dtype=np.float64))
+                    trade_qty = np.nan_to_num(np.asarray(loc_trade["filled_qty"], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+                    trade_px = np.nan_to_num(np.asarray(loc_trade["exec_price"], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+                    trade_notional = np.abs(trade_qty * trade_px)
                     component_trade_notional = float(np.sum(trade_notional) * scale)
                     component_trade_cost_abs = float(np.sum(np.asarray(loc_trade["trade_cost"], dtype=np.float64)) * scale)
                     embedded_trade_notional += component_trade_notional
@@ -182,11 +192,12 @@ def replay_finalists_minute(
                 if loc_micro.shape[0] > 0:
                     scale = float(comp.start_weight) * session_start_equity / max(base_eq, 1.0e-12)
                     component_micro_trade_cost_abs = float(np.sum(np.asarray(loc_micro["trade_cost"], dtype=np.float64)) * scale)
+                    micro_qty = np.nan_to_num(np.asarray(loc_micro["filled_qty"], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+                    micro_px = np.nan_to_num(np.asarray(loc_micro["exec_price"], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
                     component_micro_trade_notional = float(
                         np.sum(
                             np.abs(
-                                np.asarray(loc_micro["filled_qty"], dtype=np.float64)
-                                * np.asarray(loc_micro["exec_price"], dtype=np.float64)
+                                micro_qty * micro_px
                             )
                         )
                         * scale
@@ -290,21 +301,23 @@ def replay_finalists_minute(
         )
 
     minute_summary = pd.DataFrame(summary_rows).sort_values(["portfolio_pk"], kind="mergesort").reset_index(drop=True)
-    session_score_map = dict(
-        session_summary[["portfolio_pk", "first_pass_score"]].itertuples(index=False, name=None)
-    ) if "first_pass_score" in session_summary.columns else {str(row.portfolio_pk): 0.0 for row in session_summary.itertuples(index=False)}
+    session_score_map = dict(session_summary[["portfolio_pk", "first_pass_score"]].itertuples(index=False, name=None))
     session_return_map = dict(session_summary[["portfolio_pk", "annualized_return"]].itertuples(index=False, name=None))
     session_dd_map = dict(session_summary[["portfolio_pk", "max_drawdown"]].itertuples(index=False, name=None))
     session_to_map = dict(session_summary[["portfolio_pk", "turnover"]].itertuples(index=False, name=None))
     session_gross_map = dict(session_summary[["portfolio_pk", "gross_exposure_peak"]].itertuples(index=False, name=None)) if "gross_exposure_peak" in session_summary.columns else {str(row.portfolio_pk): 0.0 for row in session_summary.itertuples(index=False)}
     session_breach_map = dict(session_summary[["portfolio_pk", "breach_count"]].itertuples(index=False, name=None))
 
-    minute_summary["session_score"] = minute_summary["portfolio_pk"].map(lambda x: float(session_score_map.get(str(x), 0.0)))
+    minute_summary["session_first_pass_score"] = minute_summary["portfolio_pk"].map(lambda x: float(session_score_map.get(str(x), 0.0)))
     minute_summary["session_annualized_return"] = minute_summary["portfolio_pk"].map(lambda x: float(session_return_map.get(str(x), 0.0)))
     minute_summary["session_max_drawdown"] = minute_summary["portfolio_pk"].map(lambda x: float(session_dd_map.get(str(x), 0.0)))
     minute_summary["session_turnover"] = minute_summary["portfolio_pk"].map(lambda x: float(session_to_map.get(str(x), 0.0)))
     minute_summary["session_gross_exposure_peak"] = minute_summary["portfolio_pk"].map(lambda x: float(session_gross_map.get(str(x), 0.0)))
     minute_summary["session_breach_count"] = minute_summary["portfolio_pk"].map(lambda x: int(session_breach_map.get(str(x), 0)))
+    minute_summary["session_score"] = minute_summary["session_annualized_return"] - np.maximum(
+        minute_summary["session_max_drawdown"],
+        0.0,
+    )
     minute_summary["return_drift"] = minute_summary["minute_annualized_return"] - minute_summary["session_annualized_return"]
     minute_summary["drawdown_drift"] = minute_summary["minute_max_drawdown"] - minute_summary["session_max_drawdown"]
     minute_summary["turnover_drift"] = minute_summary["minute_turnover"] - minute_summary["session_turnover"]
@@ -316,7 +329,12 @@ def replay_finalists_minute(
     minute_summary["rejected"] = False
     for row in minute_summary.itertuples(index=False):
         reason = None
-        if float(row.minute_score) < float(config.scoring.min_truth_score_ratio) * float(row.session_score):
+        session_score_ref = float(row.session_score)
+        score_drop_tolerance = (1.0 - float(config.scoring.min_truth_score_ratio)) * max(
+            abs(session_score_ref),
+            float(config.scoring.return_scale_floor),
+        )
+        if float(row.minute_score) < (session_score_ref - score_drop_tolerance):
             reason = "MINUTE_REPLAY_SCORE_COLLAPSE"
         elif abs(float(row.return_drift)) > max(float(config.scoring.return_drift_floor), float(config.scoring.max_allowed_return_drift_frac) * max(abs(float(row.session_annualized_return)), float(config.scoring.return_scale_floor))):
             reason = "MINUTE_REPLAY_RETURN_DRIFT"
@@ -346,7 +364,7 @@ def replay_finalists_minute(
         )
     divergence = pd.DataFrame(divergence_rows).sort_values(["portfolio_pk"], kind="mergesort").reset_index(drop=True)
     corr = 1.0
-    if divergence.shape[0] > 1:
+    if divergence.shape[0] > 3:
         session_scores_arr = np.asarray(divergence["session_score"], dtype=np.float64)
         minute_scores_arr = np.asarray(divergence["minute_score"], dtype=np.float64)
         if np.allclose(session_scores_arr, session_scores_arr[0]) or np.allclose(minute_scores_arr, minute_scores_arr[0]):
