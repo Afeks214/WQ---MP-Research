@@ -1,0 +1,576 @@
+run_name: minimal_e2e_mac_m4_f1f2_h1_2025
+symbols: [SPY, QQQ]
+
+data:
+  root: /Users/afekshusterman/Downloads/MarketData
+  format: parquet
+  path_by_symbol:
+    SPY: SPY/part-2025-1Min.parquet
+    QQQ: QQQ/part-2025-1Min.parquet
+  start: "2025-01-02T14:31:00Z"
+  end: "2025-06-30T20:00:00Z"
+
+engine:
+  initial_cash: 10000.0
+  tick_size_default: 0.01
+
+module2_configs:
+  - profile_window_bars: 60
+    profile_warmup_bars: 60
+    atr_span: 10
+    rvol_lookback_sessions: 12
+    va_threshold: 0.68
+    fail_on_non_finite_output: true
+
+module3_configs:
+  - structural_windows: [15, 30, 60]
+    selected_window: 30
+    block_minutes: 30
+    phase_mask: [1, 2]
+    include_partial_last_block: true
+    min_block_valid_bars: 8
+    min_block_valid_ratio: 0.70
+    ib_pop_frac: 0.010
+    fail_on_non_finite_output: false
+
+module4_configs:
+  - window_selection_mode: multi_window
+    fixed_window_index: 1
+    anchor_window_index: 1
+    regime_confidence_min: 0.55
+    entry_threshold: 0.55
+    exit_threshold: 0.25
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 1.0
+    top_k_intraday: 1
+    max_asset_cap_frac: 0.25
+    max_turnover_frac_per_bar: 0.35
+    overnight_min_conviction: 0.80
+    allow_cash_overnight: false
+    trend_spread_min: 0.05
+    trend_poc_drift_min_abs: 0.35
+    neutral_poc_drift_max_abs: 0.15
+    shape_skew_min_abs: 0.35
+    double_dist_sep_x: 1.0
+    double_dist_valley_frac: 0.35
+  - window_selection_mode: multi_window
+    fixed_window_index: 1
+    anchor_window_index: 1
+    regime_confidence_min: 0.55
+    entry_threshold: 0.55
+    exit_threshold: 0.35
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 1.0
+    top_k_intraday: 1
+    max_asset_cap_frac: 0.25
+    max_turnover_frac_per_bar: 0.35
+    overnight_min_conviction: 0.80
+    allow_cash_overnight: false
+    trend_spread_min: 0.05
+    trend_poc_drift_min_abs: 0.35
+    neutral_poc_drift_max_abs: 0.15
+    shape_skew_min_abs: 0.35
+    double_dist_sep_x: 1.0
+    double_dist_valley_frac: 0.35
+  - window_selection_mode: multi_window
+    fixed_window_index: 1
+    anchor_window_index: 1
+    regime_confidence_min: 0.55
+    entry_threshold: 0.65
+    exit_threshold: 0.25
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 1.0
+    top_k_intraday: 1
+    max_asset_cap_frac: 0.25
+    max_turnover_frac_per_bar: 0.35
+    overnight_min_conviction: 0.80
+    allow_cash_overnight: false
+    trend_spread_min: 0.05
+    trend_poc_drift_min_abs: 0.35
+    neutral_poc_drift_max_abs: 0.15
+    shape_skew_min_abs: 0.35
+    double_dist_sep_x: 1.0
+    double_dist_valley_frac: 0.35
+  - window_selection_mode: multi_window
+    fixed_window_index: 1
+    anchor_window_index: 1
+    regime_confidence_min: 0.55
+    entry_threshold: 0.65
+    exit_threshold: 0.35
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 1.0
+    top_k_intraday: 1
+    max_asset_cap_frac: 0.25
+    max_turnover_frac_per_bar: 0.35
+    overnight_min_conviction: 0.80
+    allow_cash_overnight: false
+    trend_spread_min: 0.05
+    trend_poc_drift_min_abs: 0.35
+    neutral_poc_drift_max_abs: 0.15
+    shape_skew_min_abs: 0.35
+    double_dist_sep_x: 1.0
+    double_dist_valley_frac: 0.35
+  - window_selection_mode: multi_window
+    fixed_window_index: 1
+    anchor_window_index: 1
+    regime_confidence_min: 0.55
+    entry_threshold: 0.75
+    exit_threshold: 0.25
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 1.0
+    top_k_intraday: 1
+    max_asset_cap_frac: 0.25
+    max_turnover_frac_per_bar: 0.35
+    overnight_min_conviction: 0.80
+    allow_cash_overnight: false
+    trend_spread_min: 0.05
+    trend_poc_drift_min_abs: 0.35
+    neutral_poc_drift_max_abs: 0.15
+    shape_skew_min_abs: 0.35
+    double_dist_sep_x: 1.0
+    double_dist_valley_frac: 0.35
+  - window_selection_mode: multi_window
+    fixed_window_index: 1
+    anchor_window_index: 1
+    regime_confidence_min: 0.55
+    entry_threshold: 0.75
+    exit_threshold: 0.35
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 1.0
+    top_k_intraday: 1
+    max_asset_cap_frac: 0.25
+    max_turnover_frac_per_bar: 0.35
+    overnight_min_conviction: 0.80
+    allow_cash_overnight: false
+    trend_spread_min: 0.05
+    trend_poc_drift_min_abs: 0.35
+    neutral_poc_drift_max_abs: 0.15
+    shape_skew_min_abs: 0.35
+    double_dist_sep_x: 1.0
+    double_dist_valley_frac: 0.35
+  - window_selection_mode: multi_window
+    fixed_window_index: 1
+    anchor_window_index: 1
+    regime_confidence_min: 0.55
+    entry_threshold: 0.60
+    exit_threshold: 0.30
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 1.0
+    top_k_intraday: 1
+    max_asset_cap_frac: 0.25
+    max_turnover_frac_per_bar: 0.35
+    overnight_min_conviction: 0.80
+    allow_cash_overnight: false
+    trend_spread_min: 0.05
+    trend_poc_drift_min_abs: 0.35
+    neutral_poc_drift_max_abs: 0.15
+    shape_skew_min_abs: 0.35
+    double_dist_sep_x: 1.0
+    double_dist_valley_frac: 0.35
+  - window_selection_mode: multi_window
+    fixed_window_index: 1
+    anchor_window_index: 1
+    regime_confidence_min: 0.55
+    entry_threshold: 0.60
+    exit_threshold: 0.30
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 1.0
+    top_k_intraday: 2
+    max_asset_cap_frac: 0.25
+    max_turnover_frac_per_bar: 0.35
+    overnight_min_conviction: 0.80
+    allow_cash_overnight: false
+    trend_spread_min: 0.05
+    trend_poc_drift_min_abs: 0.35
+    neutral_poc_drift_max_abs: 0.15
+    shape_skew_min_abs: 0.35
+    double_dist_sep_x: 1.0
+    double_dist_valley_frac: 0.35
+  - window_selection_mode: multi_window
+    fixed_window_index: 1
+    anchor_window_index: 1
+    regime_confidence_min: 0.55
+    entry_threshold: 0.60
+    exit_threshold: 0.40
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 1.0
+    top_k_intraday: 1
+    max_asset_cap_frac: 0.25
+    max_turnover_frac_per_bar: 0.35
+    overnight_min_conviction: 0.80
+    allow_cash_overnight: false
+    trend_spread_min: 0.05
+    trend_poc_drift_min_abs: 0.35
+    neutral_poc_drift_max_abs: 0.15
+    shape_skew_min_abs: 0.35
+    double_dist_sep_x: 1.0
+    double_dist_valley_frac: 0.35
+  - window_selection_mode: multi_window
+    fixed_window_index: 1
+    anchor_window_index: 1
+    regime_confidence_min: 0.55
+    entry_threshold: 0.60
+    exit_threshold: 0.40
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 1.0
+    top_k_intraday: 2
+    max_asset_cap_frac: 0.25
+    max_turnover_frac_per_bar: 0.35
+    overnight_min_conviction: 0.80
+    allow_cash_overnight: false
+    trend_spread_min: 0.05
+    trend_poc_drift_min_abs: 0.35
+    neutral_poc_drift_max_abs: 0.15
+    shape_skew_min_abs: 0.35
+    double_dist_sep_x: 1.0
+    double_dist_valley_frac: 0.35
+  - window_selection_mode: multi_window
+    fixed_window_index: 1
+    anchor_window_index: 1
+    regime_confidence_min: 0.55
+    entry_threshold: 0.70
+    exit_threshold: 0.30
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 1.0
+    top_k_intraday: 1
+    max_asset_cap_frac: 0.25
+    max_turnover_frac_per_bar: 0.35
+    overnight_min_conviction: 0.80
+    allow_cash_overnight: false
+    trend_spread_min: 0.05
+    trend_poc_drift_min_abs: 0.35
+    neutral_poc_drift_max_abs: 0.15
+    shape_skew_min_abs: 0.35
+    double_dist_sep_x: 1.0
+    double_dist_valley_frac: 0.35
+  - window_selection_mode: multi_window
+    fixed_window_index: 1
+    anchor_window_index: 1
+    regime_confidence_min: 0.55
+    entry_threshold: 0.70
+    exit_threshold: 0.30
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 1.0
+    top_k_intraday: 2
+    max_asset_cap_frac: 0.25
+    max_turnover_frac_per_bar: 0.35
+    overnight_min_conviction: 0.80
+    allow_cash_overnight: false
+    trend_spread_min: 0.05
+    trend_poc_drift_min_abs: 0.35
+    neutral_poc_drift_max_abs: 0.15
+    shape_skew_min_abs: 0.35
+    double_dist_sep_x: 1.0
+    double_dist_valley_frac: 0.35
+  - window_selection_mode: multi_window
+    fixed_window_index: 1
+    anchor_window_index: 1
+    regime_confidence_min: 0.55
+    entry_threshold: 0.70
+    exit_threshold: 0.40
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 1.0
+    top_k_intraday: 1
+    max_asset_cap_frac: 0.25
+    max_turnover_frac_per_bar: 0.35
+    overnight_min_conviction: 0.80
+    allow_cash_overnight: false
+    trend_spread_min: 0.05
+    trend_poc_drift_min_abs: 0.35
+    neutral_poc_drift_max_abs: 0.15
+    shape_skew_min_abs: 0.35
+    double_dist_sep_x: 1.0
+    double_dist_valley_frac: 0.35
+  - window_selection_mode: multi_window
+    fixed_window_index: 1
+    anchor_window_index: 1
+    regime_confidence_min: 0.55
+    entry_threshold: 0.70
+    exit_threshold: 0.40
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 1.0
+    top_k_intraday: 2
+    max_asset_cap_frac: 0.25
+    max_turnover_frac_per_bar: 0.35
+    overnight_min_conviction: 0.80
+    allow_cash_overnight: false
+    trend_spread_min: 0.05
+    trend_poc_drift_min_abs: 0.35
+    neutral_poc_drift_max_abs: 0.15
+    shape_skew_min_abs: 0.35
+    double_dist_sep_x: 1.0
+    double_dist_valley_frac: 0.35
+
+harness:
+  seed: 97
+  research_mode: discovery
+  timezone: America/New_York
+  freq: 1min
+  min_asset_coverage: 0.80
+  purge_bars: 30
+  embargo_bars: 15
+  wf_train_sessions: 30
+  wf_test_sessions: 30
+  wf_step_sessions: 30
+  cpcv_slices: 10
+  cpcv_k_test: 5
+  disable_cpcv_splits: true
+  parallel_backend: process_pool
+  parallel_workers: 3
+  stress_profile: baseline_mild_severe
+  report_dir: ./artifacts
+  export_micro_diagnostics: true
+  cluster_corr_threshold: 0.85
+  group_bound_execution_enabled: true
+  group_dispatch_policy: largest_first_stable
+  group_max_in_flight_factor: 1
+  group_target_wall_time_sec: 180.0
+  group_min_candidates_per_chunk: 4
+  group_max_candidates_per_chunk_hard: 8
+  process_pool_candidate_chunk_size: 4
+  scratch_mode: compact
+  daily_return_min_days: 30
+  benchmark_symbol: SPY
+  horizon_minutes: [15, 30, 60]
+  robustness_weight_dsr: 0.20
+  robustness_weight_pbo: 0.15
+  robustness_weight_spa: 0.10
+  robustness_weight_regime: 0.20
+  robustness_weight_execution: 0.20
+  robustness_weight_horizon: 0.15
+  robustness_reject_threshold: 0.40
+  execution_cost_model: dynamic_bucketed_v1
+  execution_transaction_cost_per_trade: 0.0015
+  execution_finra_taf_per_share_sell: 0.000195
+  execution_sec31_rate_per_million: 0.0
+  execution_short_borrow_apr: 0.003
+  execution_short_locate_fee_per_share: 0.0
+  execution_debit_apr: 0.0
+  execution_max_volume_participation: 0.10
+  execution_open_bucket_minutes: 30
+  execution_close_bucket_minutes: 30
+  execution_open_slippage_mult: 1.25
+  execution_mid_slippage_mult: 1.00
+  execution_close_slippage_mult: 1.15
+  execution_participation_slippage_coeff: 1.0
+  execution_dynamic_slippage_bps_cap: 15.0
+
+stress_scenarios:
+  - scenario_id: baseline
+    name: baseline
+    scenario_group: stress
+    missing_burst_prob: 0.0
+    missing_burst_min: 0
+    missing_burst_max: 0
+    jitter_sigma_bps: 0.0
+    slippage_mult: 1.0
+    enabled: true
+
+candidates:
+  mode: manual
+  specs:
+    - candidate_id: cand_F1_00
+      m2_idx: 0
+      m3_idx: 0
+      m4_idx: 0
+      enabled_assets: all
+      tags:
+        - campaign_id=minimal_local_f1f2_mac_m4
+        - family_id=F1
+        - family_name=acceptance_rejection_geometry
+        - hypothesis_id=F1_cand_F1_00
+        - evaluation_role=window_probe
+        - window_set=15,30,60
+    - candidate_id: cand_F1_01
+      m2_idx: 0
+      m3_idx: 0
+      m4_idx: 1
+      enabled_assets: all
+      tags:
+        - campaign_id=minimal_local_f1f2_mac_m4
+        - family_id=F1
+        - family_name=acceptance_rejection_geometry
+        - hypothesis_id=F1_cand_F1_01
+        - evaluation_role=window_probe
+        - window_set=15,30,60
+    - candidate_id: cand_F1_02
+      m2_idx: 0
+      m3_idx: 0
+      m4_idx: 2
+      enabled_assets: all
+      tags:
+        - campaign_id=minimal_local_f1f2_mac_m4
+        - family_id=F1
+        - family_name=acceptance_rejection_geometry
+        - hypothesis_id=F1_cand_F1_02
+        - evaluation_role=window_probe
+        - window_set=15,30,60
+    - candidate_id: cand_F1_03
+      m2_idx: 0
+      m3_idx: 0
+      m4_idx: 3
+      enabled_assets: all
+      tags:
+        - campaign_id=minimal_local_f1f2_mac_m4
+        - family_id=F1
+        - family_name=acceptance_rejection_geometry
+        - hypothesis_id=F1_cand_F1_03
+        - evaluation_role=window_probe
+        - window_set=15,30,60
+    - candidate_id: cand_F1_04
+      m2_idx: 0
+      m3_idx: 0
+      m4_idx: 4
+      enabled_assets: all
+      tags:
+        - campaign_id=minimal_local_f1f2_mac_m4
+        - family_id=F1
+        - family_name=acceptance_rejection_geometry
+        - hypothesis_id=F1_cand_F1_04
+        - evaluation_role=window_probe
+        - window_set=15,30,60
+    - candidate_id: cand_F1_05
+      m2_idx: 0
+      m3_idx: 0
+      m4_idx: 5
+      enabled_assets: all
+      tags:
+        - campaign_id=minimal_local_f1f2_mac_m4
+        - family_id=F1
+        - family_name=acceptance_rejection_geometry
+        - hypothesis_id=F1_cand_F1_05
+        - evaluation_role=window_probe
+        - window_set=15,30,60
+    - candidate_id: cand_F2_00
+      m2_idx: 0
+      m3_idx: 0
+      m4_idx: 6
+      enabled_assets: all
+      tags:
+        - campaign_id=minimal_local_f1f2_mac_m4
+        - family_id=F2
+        - family_name=delta_confirmation_aggression
+        - hypothesis_id=F2_cand_F2_00
+        - evaluation_role=window_probe
+        - window_set=15,30,60
+    - candidate_id: cand_F2_01
+      m2_idx: 0
+      m3_idx: 0
+      m4_idx: 7
+      enabled_assets: all
+      tags:
+        - campaign_id=minimal_local_f1f2_mac_m4
+        - family_id=F2
+        - family_name=delta_confirmation_aggression
+        - hypothesis_id=F2_cand_F2_01
+        - evaluation_role=window_probe
+        - window_set=15,30,60
+    - candidate_id: cand_F2_02
+      m2_idx: 0
+      m3_idx: 0
+      m4_idx: 8
+      enabled_assets: all
+      tags:
+        - campaign_id=minimal_local_f1f2_mac_m4
+        - family_id=F2
+        - family_name=delta_confirmation_aggression
+        - hypothesis_id=F2_cand_F2_02
+        - evaluation_role=window_probe
+        - window_set=15,30,60
+    - candidate_id: cand_F2_03
+      m2_idx: 0
+      m3_idx: 0
+      m4_idx: 9
+      enabled_assets: all
+      tags:
+        - campaign_id=minimal_local_f1f2_mac_m4
+        - family_id=F2
+        - family_name=delta_confirmation_aggression
+        - hypothesis_id=F2_cand_F2_03
+        - evaluation_role=window_probe
+        - window_set=15,30,60
+    - candidate_id: cand_F2_04
+      m2_idx: 0
+      m3_idx: 0
+      m4_idx: 10
+      enabled_assets: all
+      tags:
+        - campaign_id=minimal_local_f1f2_mac_m4
+        - family_id=F2
+        - family_name=delta_confirmation_aggression
+        - hypothesis_id=F2_cand_F2_04
+        - evaluation_role=window_probe
+        - window_set=15,30,60
+    - candidate_id: cand_F2_05
+      m2_idx: 0
+      m3_idx: 0
+      m4_idx: 11
+      enabled_assets: all
+      tags:
+        - campaign_id=minimal_local_f1f2_mac_m4
+        - family_id=F2
+        - family_name=delta_confirmation_aggression
+        - hypothesis_id=F2_cand_F2_05
+        - evaluation_role=window_probe
+        - window_set=15,30,60
+    - candidate_id: cand_F2_06
+      m2_idx: 0
+      m3_idx: 0
+      m4_idx: 12
+      enabled_assets: all
+      tags:
+        - campaign_id=minimal_local_f1f2_mac_m4
+        - family_id=F2
+        - family_name=delta_confirmation_aggression
+        - hypothesis_id=F2_cand_F2_06
+        - evaluation_role=window_probe
+        - window_set=15,30,60
+    - candidate_id: cand_F2_07
+      m2_idx: 0
+      m3_idx: 0
+      m4_idx: 13
+      enabled_assets: all
+      tags:
+        - campaign_id=minimal_local_f1f2_mac_m4
+        - family_id=F2
+        - family_name=delta_confirmation_aggression
+        - hypothesis_id=F2_cand_F2_07
+        - evaluation_role=window_probe
+        - window_set=15,30,60
+
+module6:
+  intake:
+    run_policy_class: representative_discovery
+    min_availability_ratio: 0.20
+    min_observed_sessions: 30
+    required_comparison_support: 0.80
+  reduction:
+    duplicate_corr_threshold: 0.85
+  scoring:
+    min_cross_universe_support: 0.80
+    shortlist_session_keep: 32
+    shortlist_minute_keep: 12
+    final_scalar_keep: 8
+    final_primary_count: 2
+    final_alternate_count: 2
+  generator:
+    random_sparse_quota: 64
+    cluster_balanced_quota: 16
+    hrp_variant_quota: 12
+    mv_variant_quota: 2
+    random_sparse_batch_size: 16
+    active_cardinality_choices: [1, 2, 3, 4]

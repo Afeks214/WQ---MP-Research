@@ -604,12 +604,22 @@ def build_candidate_artifacts(
         verdict_row = candidate_verdict.get(cid, {})
         verdict_score = float(verdict_row.get("robustness_score", np.nan)) if isinstance(verdict_row, dict) else float("nan")
         has_verdict_score = bool(np.isfinite(verdict_score))
+        m3cfg = m3_configs[int(cand.m3_idx)]
+        m4cfg = m4_configs[int(cand.m4_idx)]
         stage_a_meta = _stage_a_metadata(
             tags=list(cand.tags),
             m2_idx=int(cand.m2_idx),
             m3_idx=int(cand.m3_idx),
             m4_idx=int(cand.m4_idx),
         )
+        if str(stage_a_meta.get("family_id", "")).strip() == "":
+            stage_a_meta["family_id"] = str(getattr(m4cfg, "family_id", "")).strip()
+        if str(stage_a_meta.get("family_name", "")).strip() == "":
+            stage_a_meta["family_name"] = str(getattr(m4cfg, "family_id", "")).strip()
+        if str(stage_a_meta.get("hypothesis_id", "")).strip() == "":
+            fam = str(stage_a_meta.get("family_id", "")).strip()
+            if fam:
+                stage_a_meta["hypothesis_id"] = f"{fam}H000"
         strategy_why = _resolve_strategy_why(
             stage_a_meta=stage_a_meta,
             strategy_registry=strategy_registry,
@@ -640,8 +650,6 @@ def build_candidate_artifacts(
                 - 0.2 * clip01_fn(conc / robustness_caps["conc_cap"])
             )
 
-        m3cfg = m3_configs[int(cand.m3_idx)]
-        m4cfg = m4_configs[int(cand.m4_idx)]
         feat = {
             "entry_threshold": float(m4cfg.entry_threshold),
             "exit_threshold": float(m4cfg.exit_threshold),

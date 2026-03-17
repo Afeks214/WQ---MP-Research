@@ -1531,6 +1531,59 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
             ):
                 self.assertIn(col, sessions.columns)
 
+    def test_disable_cpcv_splits_skips_cpcv_generation_only(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="m5_disable_cpcv_") as td:
+            report_dir = Path(td) / "artifacts"
+            out = self._run_minimal_harness(
+                report_dir=report_dir,
+                harness_overrides={
+                    "disable_cpcv_splits": True,
+                    "daily_return_min_days": 3,
+                    "execution_latency_bars": 0,
+                },
+            )
+            selection = pd.read_parquet(Path(str(out.artifact_paths["strategy_instance_selection"])))
+
+            split_ids = sorted(selection["split_id"].astype(str).unique().tolist())
+            self.assertTrue(split_ids)
+            self.assertTrue(all(split_id.startswith("wf_") for split_id in split_ids))
+
+    def test_regulatory_fee_fields_reach_execution_cost_config(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="m5_reg_fee_cfg_") as td:
+            report_dir = Path(td) / "artifacts"
+            captured: list[object] = []
+            original = h.simulate_portfolio_from_signals
+
+            def _capture(*args, **kwargs):
+                captured.append(kwargs["cost_cfg"])
+                return original(*args, **kwargs)
+
+            with mock.patch.object(h, "simulate_portfolio_from_signals", side_effect=_capture):
+                self._run_minimal_harness(
+                    report_dir=report_dir,
+                    harness_overrides={
+                        "daily_return_min_days": 3,
+                        "execution_latency_bars": 0,
+                        "execution_cost_model": "dynamic_bucketed_v1",
+                        "execution_transaction_cost_per_trade": 0.0015,
+                        "execution_finra_taf_per_share_sell": 0.000195,
+                        "execution_sec31_rate_per_million": 15.0,
+                    },
+                )
+
+            exec_cfgs = [
+                cfg
+                for cfg in captured
+                if abs(float(getattr(cfg, "commission_per_share", 0.0)) - 0.0015) < 1.0e-12
+            ]
+            self.assertTrue(exec_cfgs, msg="expected execution-path CostConfig capture")
+            self.assertTrue(
+                any(abs(float(getattr(cfg, "finra_taf_per_share_sell", 0.0)) - 0.000195) < 1.0e-12 for cfg in exec_cfgs)
+            )
+            self.assertTrue(
+                any(abs(float(getattr(cfg, "sec_fee_per_dollar_sell", 0.0)) - (15.0 / 1_000_000.0)) < 1.0e-12 for cfg in exec_cfgs)
+            )
+
     def test_strategy_registry_enriches_candidate_artifacts_for_active_family_ids(self) -> None:
         with tempfile.TemporaryDirectory(prefix="m5_strategy_registry_") as td:
             report_dir = Path(td) / "artifacts"

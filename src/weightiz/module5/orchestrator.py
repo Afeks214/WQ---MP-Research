@@ -315,6 +315,7 @@ class Module5HarnessConfig:
     wf_step_sessions: int = 20
     cpcv_slices: int = 10
     cpcv_k_test: int = 5
+    disable_cpcv_splits: bool = False
     parallel_backend: str = "process_pool"
     parallel_workers: int = max(1, (os.cpu_count() or 2) - 1)
     stress_profile: str = "baseline_mild_severe"
@@ -379,6 +380,8 @@ class Module5HarnessConfig:
     execution_slippage_mult: float = 1.0
     execution_extra_slippage_bps: float = 0.0
     execution_max_volume_participation: float = 1.0
+    execution_finra_taf_per_share_sell: float = 0.0
+    execution_sec31_rate_per_million: float = 0.0
     execution_short_borrow_apr: float = 0.0
     execution_short_locate_fee_per_share: float = 0.0
     execution_debit_apr: float = 0.0
@@ -1814,8 +1817,8 @@ def _run_group_task(
                 initial_cash=float(st.cfg.initial_cash),
                 cost_cfg=CostConfig(
                     commission_per_share=float(harness_cfg.execution_transaction_cost_per_trade),
-                    finra_taf_per_share_sell=0.0,
-                    sec_fee_per_dollar_sell=0.0,
+                    finra_taf_per_share_sell=float(harness_cfg.execution_finra_taf_per_share_sell),
+                    sec_fee_per_dollar_sell=float(harness_cfg.execution_sec31_rate_per_million) / 1_000_000.0,
                     short_borrow_apr=float(harness_cfg.execution_short_borrow_apr),
                     locate_fee_per_share_short_entry=float(harness_cfg.execution_short_locate_fee_per_share),
                     slippage_bps=max(0.0, float(exec_slippage_bps)),
@@ -2546,7 +2549,7 @@ def run_weightiz_harness(
     quick_settings = _quick_run_settings_from_env()
 
     wf_splits = _generate_wf_splits(base_state, harness_cfg)
-    cpcv_splits = [] if quick_settings.disable_cpcv else _generate_cpcv_splits(base_state, harness_cfg)
+    cpcv_splits = [] if (quick_settings.disable_cpcv or bool(harness_cfg.disable_cpcv_splits)) else _generate_cpcv_splits(base_state, harness_cfg)
     splits = wf_splits + cpcv_splits
     if quick_settings.enabled and wf_splits:
         splits = [wf_splits[0]]
