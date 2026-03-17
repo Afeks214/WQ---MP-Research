@@ -186,6 +186,7 @@ class Module4ConfigModel(BaseModel):
     execution_strict_prices: bool = True
 
     strategy_type: str = "legacy"
+    family_id: str = ""
     score_gate: str = ""
     score_gate_rule: str = ""
     deviation_signal: str = ""
@@ -198,6 +199,11 @@ class Module4ConfigModel(BaseModel):
     dev_th: float = 1.0
     tp_mult: float = 1.0
     atr_stop_mult: float = 1.0
+    f6_enabled: bool = True
+    f6_parity_required: bool = False
+    f6_numeric_tolerance: float = 1.0e-4
+    f6_behavioral_mismatch_max: float = 0.02
+    enable_f5_close_overlay: bool = True
 
     @model_validator(mode="after")
     def apply_delta_threshold_mapping(self) -> "Module4ConfigModel":

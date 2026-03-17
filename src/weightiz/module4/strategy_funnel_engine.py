@@ -354,7 +354,7 @@ def run_module4_funnel(
         degraded_mode_mask=np.ascontiguousarray(degraded_mode_mask, dtype=bool),
     )
 
-    return Module4DecisionOutput(
+    out = Module4DecisionOutput(
         intent_long=np.ascontiguousarray(intent_long, dtype=bool),
         intent_short=np.ascontiguousarray(intent_short, dtype=bool),
         intent_flat=np.ascontiguousarray(intent_flat, dtype=bool),
@@ -371,3 +371,12 @@ def run_module4_funnel(
         decision_valid_mask=np.ascontiguousarray(decision_valid_mask, dtype=bool),
         telemetry=telemetry,
     )
+    family_code = np.zeros((A, T), dtype=np.int8)
+    if hasattr(intent, "family_code"):
+        family_code = np.ascontiguousarray(np.asarray(getattr(intent, "family_code"), dtype=np.int8))
+    wave1_regime_code = np.zeros((A, T), dtype=np.int8)
+    if hasattr(intent, "wave1_regime_code"):
+        wave1_regime_code = np.ascontiguousarray(np.asarray(getattr(intent, "wave1_regime_code"), dtype=np.int8))
+    object.__setattr__(out, "family_code", family_code)
+    object.__setattr__(out, "wave1_regime_code", wave1_regime_code)
+    return out

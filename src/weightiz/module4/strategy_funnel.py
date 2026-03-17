@@ -128,6 +128,7 @@ class Module4Config:
     # Compatibility-only schema fields for Cell-6 nomenclature.
     # Core Module4 decision logic ignores these fields.
     strategy_type: str = "legacy"
+    family_id: str = ""
     score_gate: str = ""
     score_gate_rule: str = ""
     deviation_signal: str = ""
@@ -140,6 +141,13 @@ class Module4Config:
     dev_th: float = 1.0
     tp_mult: float = 1.0
     atr_stop_mult: float = 1.0
+
+    # Wave-1 family hardening controls (inactive in legacy mode).
+    f6_enabled: bool = True
+    f6_parity_required: bool = False
+    f6_numeric_tolerance: float = 1.0e-4
+    f6_behavioral_mismatch_max: float = 0.02
+    enable_f5_close_overlay: bool = True
 
 
 @dataclass
@@ -204,6 +212,14 @@ class Module4SignalOutput:
     @property
     def decision_reason_code_ta(self) -> np.ndarray | None:
         return getattr(self, "_decision_reason_code_ta", None)
+
+    @property
+    def family_code_ta(self) -> np.ndarray | None:
+        return getattr(self, "_family_code_ta", None)
+
+    @property
+    def wave1_regime_code_ta(self) -> np.ndarray | None:
+        return getattr(self, "_wave1_regime_code_ta", None)
 
 
 class NonFiniteExecutionPriceError(RuntimeError):
@@ -424,6 +440,20 @@ def _decision_to_signal_output(decision: Any) -> Module4SignalOutput:
         "_decision_reason_code_ta",
         np.ascontiguousarray(np.asarray(decision.telemetry.decision_reason_code).T, dtype=np.int16),
     )
+    family_code = getattr(decision, "family_code", None)
+    if family_code is not None:
+        object.__setattr__(
+            out,
+            "_family_code_ta",
+            np.ascontiguousarray(np.asarray(family_code).T, dtype=np.int8),
+        )
+    wave1_regime_code = getattr(decision, "wave1_regime_code", None)
+    if wave1_regime_code is not None:
+        object.__setattr__(
+            out,
+            "_wave1_regime_code_ta",
+            np.ascontiguousarray(np.asarray(wave1_regime_code).T, dtype=np.int8),
+        )
     return out
 
 
@@ -1401,8 +1431,26 @@ def run_module4_signal_funnel(
         raise RuntimeError("MODULE4_BRIDGE_MISSING_CONTEXT_TENSOR")
 
     degraded_mode_mask_at = np.zeros((A, T), dtype=bool)
-    # Canonical neutral alpha bridge tensor for legacy callers.
-    alpha_signal_tensor = np.zeros((A, T, 1), dtype=np.float64)
+    strategy_type = str(getattr(cfg4, "strategy_type", "legacy")).strip().lower()
+    if strategy_type == "institutional_wave1":
+        # Wave-1 feature channels consumed by strategy_intent_engine.
+        # [0]=rvol, [1]=tod, [2]=x_poc, [3]=x_vah, [4]=x_val, [5]=va_width, [6]=session_id
+        tod_at = np.broadcast_to(np.asarray(state.tod, dtype=np.float64)[None, :], (A, T))
+        sid_at = np.broadcast_to(np.asarray(state.session_id, dtype=np.float64)[None, :], (A, T))
+        rvol_at = np.swapaxes(np.asarray(state.rvol, dtype=np.float64), 0, 1)
+        # Use the anchor window for deterministic x-space references.
+        anchor_w = int(min(max(int(getattr(cfg4, "anchor_window_index", 0)), 0), max(int(context_tensor.shape[3]) - 1, 0)))
+        x_poc_at = np.asarray(context_tensor[:, :, int(ContextIdx.CTX_X_POC), anchor_w], dtype=np.float64)
+        x_vah_at = np.asarray(context_tensor[:, :, int(ContextIdx.CTX_X_VAH), anchor_w], dtype=np.float64)
+        x_val_at = np.asarray(context_tensor[:, :, int(ContextIdx.CTX_X_VAL), anchor_w], dtype=np.float64)
+        va_width_at = np.asarray(context_tensor[:, :, int(ContextIdx.CTX_VA_WIDTH_X), anchor_w], dtype=np.float64)
+        alpha_signal_tensor = np.stack(
+            [rvol_at, tod_at, x_poc_at, x_vah_at, x_val_at, va_width_at, sid_at],
+            axis=2,
+        ).astype(np.float64, copy=False)
+    else:
+        # Canonical neutral alpha bridge tensor for legacy callers.
+        alpha_signal_tensor = np.zeros((A, T, 1), dtype=np.float64)
 
     if getattr(m3, "profile_fingerprint_tensor", None) is not None:
         profile_fingerprint_tensor = np.asarray(m3.profile_fingerprint_tensor, dtype=np.float64)
