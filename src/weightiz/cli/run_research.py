@@ -57,6 +57,10 @@ from weightiz.shared.config.models import (
     StressScenarioModel,
 )
 from weightiz.shared.config.builders import (
+    apply_calibrated_module6_gate_values as _cfg_apply_calibrated_module6_gate_values,
+    build_harness_gate_inputs as _cfg_build_harness_gate_inputs,
+    build_module6_gate_inputs as _cfg_build_module6_gate_inputs,
+    build_run_geometry as _cfg_build_run_geometry,
     build_candidates as _cfg_build_candidates,
     build_engine_config as _cfg_build_engine_config,
     build_harness_config as _cfg_build_harness_config,
@@ -67,6 +71,7 @@ from weightiz.shared.config.builders import (
     resolve_tick_size as _cfg_resolve_tick_size,
 )
 from weightiz.shared.config.paths import ProjectPaths, resolve_repo_path
+from weightiz.shared.gate_calibrator import EmpiricalGateStats, GateCalibrator
 from weightiz.shared.io.runtime_support import (
     append_run_registry as _runtime_append_run_registry,
     ensure_run_artifact_link as _runtime_ensure_run_artifact_link,
@@ -111,6 +116,26 @@ def _build_module4_configs(cfg: RunConfigModel) -> list[Module4Config]:
 
 def _build_harness_config(cfg: RunConfigModel, project_root: Path) -> Module5HarnessConfig:
     return _cfg_build_harness_config(cfg, project_root)
+
+
+def _build_run_geometry(harness_cfg: Any, *, data_sessions: int, common_sessions: int) -> Any:
+    return _cfg_build_run_geometry(
+        harness_cfg,
+        data_sessions=data_sessions,
+        common_sessions=common_sessions,
+    )
+
+
+def _build_harness_gate_inputs(harness_cfg: Any) -> dict[str, Any]:
+    return _cfg_build_harness_gate_inputs(harness_cfg)
+
+
+def _build_module6_gate_inputs(module6_block: dict[str, Any] | None) -> dict[str, Any]:
+    return _cfg_build_module6_gate_inputs(module6_block)
+
+
+def _apply_calibrated_module6_gate_values(module6_block: dict[str, Any] | None, calibration: Any) -> dict[str, Any]:
+    return _cfg_apply_calibrated_module6_gate_values(module6_block, calibration)
 
 
 def _resolve_data_paths(cfg: RunConfigModel, project_root: Path) -> list[str]:
@@ -171,13 +196,38 @@ def build_parser(*, description: str = "Weightiz V3.5 research runner") -> argpa
     return parser
 
 
-def _load_config(path: Path) -> RunConfigModel:
+class _UniqueKeyLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_unique_mapping(loader: yaml.SafeLoader, node: yaml.Node, deep: bool = False) -> dict[str, Any]:
+    mapping: dict[str, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise RuntimeError(f"duplicate YAML key: {key}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
+def _load_unique_yaml_mapping(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
+        raw = yaml.load(f, Loader=_UniqueKeyLoader)
     if raw is None:
-        raw = {}
+        return {}
     if not isinstance(raw, dict):
         raise RuntimeError("YAML config root must be an object/mapping")
+    return raw
+
+
+def _load_config(path: Path) -> RunConfigModel:
+    raw = _load_unique_yaml_mapping(path)
     return RunConfigModel.model_validate(raw)
 
 
@@ -234,8 +284,7 @@ def _distribution_summary(values: Any) -> dict[str, Any]:
 def _load_plan_doc(path: Path) -> Optional[dict[str, Any]]:
     if not path.exists():
         return None
-    with path.open("r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
+    raw = _load_unique_yaml_mapping(path)
     return raw if isinstance(raw, dict) else None
 
 
@@ -732,14 +781,105 @@ def run_from_namespace(
     run_id = str(out.run_manifest.get("run_id", run_dir.name))
     run_status_path = Path(out.artifact_paths.get("run_status", run_dir / "run_status.json")).resolve()
 
-    # Runtime warning telemetry (captured in this process) is attached to both
+    leaderboard = out.stats_verdict.get("leaderboard", [])
+    pass_count = int(sum(1 for row in leaderboard if bool(row.get("pass", False))))
+    daily_matrix_raw = getattr(out, "daily_returns_matrix", None)
+    if daily_matrix_raw is not None:
+        try:
+            common_sessions = int(np.asarray(daily_matrix_raw, dtype=np.float64).shape[0])
+        except Exception:
+            common_sessions = 0
+    else:
+        shape_doc = out.run_manifest.get("daily_matrix_shape", [])
+        common_sessions = int(shape_doc[0]) if isinstance(shape_doc, list) and len(shape_doc) > 0 else 0
+    data_sessions = int(common_sessions)
+    harness_for_geometry = getattr(cfg, "harness", harness_cfg)
+    run_geometry = _build_run_geometry(
+        harness_for_geometry,
+        data_sessions=data_sessions,
+        common_sessions=common_sessions,
+    )
+    calibrator = GateCalibrator()
+    try:
+        harness_gate_inputs = _build_harness_gate_inputs(harness_for_geometry)
+    except Exception:
+        harness_gate_inputs = {
+            "robustness_reject_threshold": {
+                "value": float(getattr(harness_cfg, "robustness_reject_threshold", 0.0)),
+                "force_static": False,
+            },
+            "execution_fragile_threshold": {
+                "value": float(getattr(harness_cfg, "execution_fragile_threshold", 0.0)),
+                "force_static": False,
+            },
+        }
+    raw_module6_block = getattr(cfg, "module6", {})
+    module6_block = raw_module6_block if isinstance(raw_module6_block, dict) else {}
+    module6_gate_inputs = _build_module6_gate_inputs(module6_block)
+    pre_run_module6_calibration = calibrator.calibrate(
+        geometry=run_geometry,
+        gate_inputs=module6_gate_inputs,
+        empirical_stats=None,
+    )
+    module6_block_for_run = _apply_calibrated_module6_gate_values(
+        module6_block,
+        pre_run_module6_calibration,
+    )
+    empirical_stats = EmpiricalGateStats(
+        robustness_scores=np.asarray(
+            [float(row.get("robustness_score", np.nan)) for row in leaderboard],
+            dtype=np.float64,
+        ),
+        execution_robustness_scores=np.asarray(
+            [float(row.get("execution_robustness", np.nan)) for row in leaderboard],
+            dtype=np.float64,
+        ),
+        fill_failure_rates=np.asarray(
+            [float(row.get("fill_failure_rate", np.nan)) for row in leaderboard],
+            dtype=np.float64,
+        ),
+        fold_count=int(out.run_manifest.get("n_splits", 0)) if isinstance(out.run_manifest, dict) else None,
+    )
+    report_only_gate_inputs = dict(harness_gate_inputs)
+    report_only_gate_inputs["fill_failure_control_limit"] = {
+        "value": 0.25,
+        "force_static": False,
+    }
+    post_run_report_only_calibration = calibrator.calibrate(
+        geometry=run_geometry,
+        gate_inputs=report_only_gate_inputs,
+        empirical_stats=empirical_stats,
+    )
+    gate_calibration_doc = {
+        "calibrator": "gate_calibrator_v1",
+        "run_geometry": {
+            "data_sessions": int(run_geometry.data_sessions),
+            "common_sessions": int(run_geometry.common_sessions),
+            "wf_train_sessions": int(run_geometry.wf_train_sessions),
+            "wf_test_sessions": int(run_geometry.wf_test_sessions),
+            "wf_step_sessions": int(run_geometry.wf_step_sessions),
+            "cpcv_slices": int(run_geometry.cpcv_slices),
+            "cpcv_k_test": int(run_geometry.cpcv_k_test),
+            "disable_cpcv_splits": bool(run_geometry.disable_cpcv_splits),
+        },
+        "module6_pre_run": pre_run_module6_calibration.to_dict(),
+        "harness_post_run_report_only": post_run_report_only_calibration.to_dict(),
+        "report_only": {
+            "harness_post_run_report_only": True,
+            "module6_pre_run": False,
+        },
+    }
+
+    # Runtime warning telemetry and calibration metadata are attached to both
     # run_manifest.json and run_status.json without changing strict YAML schemas.
     out.run_manifest["runtime_warning_count"] = int(runtime_warning_count)
+    out.run_manifest["gate_calibration"] = gate_calibration_doc
     if run_manifest_path.exists():
         try:
             manifest_doc = json.loads(run_manifest_path.read_text(encoding="utf-8"))
             if isinstance(manifest_doc, dict):
                 manifest_doc["runtime_warning_count"] = int(runtime_warning_count)
+                manifest_doc["gate_calibration"] = gate_calibration_doc
                 _artifact_write_json(run_manifest_path, manifest_doc)
         except Exception:
             pass
@@ -748,12 +888,10 @@ def run_from_namespace(
             status_doc = json.loads(run_status_path.read_text(encoding="utf-8"))
             if isinstance(status_doc, dict):
                 status_doc["runtime_warning_count"] = int(runtime_warning_count)
+                status_doc["gate_calibration"] = gate_calibration_doc
                 _artifact_write_json(run_status_path, status_doc)
         except Exception:
             pass
-
-    leaderboard = out.stats_verdict.get("leaderboard", [])
-    pass_count = int(sum(1 for row in leaderboard if bool(row.get("pass", False))))
     research_report_path = run_dir / "research_distribution_report.json"
     research_report: Optional[dict[str, Any]] = None
     if str(getattr(harness_cfg, "research_mode", "standard")).strip().lower() == "discovery":
@@ -785,7 +923,7 @@ def run_from_namespace(
             module6_report = run_module6_portfolio_research(
                 run_dir,
                 output_dir=run_dir / "module6",
-                config=build_module6_config(getattr(cfg, "module6", {})),
+                config=build_module6_config(module6_block_for_run),
             )
         except Exception as exc:
             raise RuntimeError(f"MODULE6_SUPPORTED_FLOW_BLOCKED: {type(exc).__name__}: {exc}") from exc
@@ -811,6 +949,7 @@ def run_from_namespace(
         "module6_enabled": bool(enable_module6),
         "module6_output_dir": str(module6_report.output_dir) if module6_report is not None else None,
         "module6_selected_count": int(len(module6_report.selected_portfolio_pks)) if module6_report is not None else 0,
+        "gate_calibration": gate_calibration_doc,
     }
     if research_report is not None:
         summary["research_distribution_report"] = str(research_report_path)

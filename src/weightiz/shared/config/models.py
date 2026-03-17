@@ -206,6 +206,20 @@ class Module4ConfigModel(BaseModel):
         return self
 
 
+class GateOverrideModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    value: float
+    force_static: bool = False
+
+
+class HarnessGateOverridesModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    robustness_reject_threshold: Optional[GateOverrideModel] = None
+    execution_fragile_threshold: Optional[GateOverrideModel] = None
+
+
 class HarnessConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -221,6 +235,7 @@ class HarnessConfigModel(BaseModel):
     wf_step_sessions: int = 20
     cpcv_slices: int = 10
     cpcv_k_test: int = 5
+    disable_cpcv_splits: bool = False
     parallel_backend: str = "process_pool"
     parallel_workers: int = 1
     stress_profile: str = "baseline_mild_severe"
@@ -284,6 +299,8 @@ class HarnessConfigModel(BaseModel):
     execution_slippage_mult: float = 1.0
     execution_extra_slippage_bps: float = 0.0
     execution_max_volume_participation: float = 1.0
+    execution_finra_taf_per_share_sell: float = 0.0
+    execution_sec31_rate_per_million: float = 0.0
     execution_short_borrow_apr: float = 0.0
     execution_short_locate_fee_per_share: float = 0.0
     execution_debit_apr: float = 0.0
@@ -308,6 +325,7 @@ class HarnessConfigModel(BaseModel):
     robustness_weight_horizon: float = 0.15
     robustness_reject_threshold: float = STAGE_A_RESEARCH_THRESHOLD
     execution_fragile_threshold: float = 0.50
+    gate_overrides: HarnessGateOverridesModel = Field(default_factory=HarnessGateOverridesModel)
 
     @field_validator("horizon_minutes", mode="before")
     @classmethod
@@ -335,6 +353,10 @@ class HarnessConfigModel(BaseModel):
             raise ValueError("harness.execution_extra_slippage_bps must be >=0")
         if not (0.0 < float(self.execution_max_volume_participation) <= 1.0):
             raise ValueError("harness.execution_max_volume_participation must be in (0,1]")
+        if float(self.execution_finra_taf_per_share_sell) < 0.0:
+            raise ValueError("harness.execution_finra_taf_per_share_sell must be >=0")
+        if float(self.execution_sec31_rate_per_million) < 0.0:
+            raise ValueError("harness.execution_sec31_rate_per_million must be >=0")
         if float(self.execution_short_borrow_apr) < 0.0:
             raise ValueError("harness.execution_short_borrow_apr must be >=0")
         if float(self.execution_short_locate_fee_per_share) < 0.0:
@@ -432,6 +454,14 @@ class HarnessConfigModel(BaseModel):
             raise ValueError("harness.robustness_reject_threshold must be in [0,1]")
         if not (0.0 <= float(self.execution_fragile_threshold) <= 1.0):
             raise ValueError("harness.execution_fragile_threshold must be in [0,1]")
+        if self.gate_overrides.robustness_reject_threshold is not None:
+            gate_value = float(self.gate_overrides.robustness_reject_threshold.value)
+            if not (0.0 <= gate_value <= 1.0):
+                raise ValueError("harness.gate_overrides.robustness_reject_threshold.value must be in [0,1]")
+        if self.gate_overrides.execution_fragile_threshold is not None:
+            gate_value = float(self.gate_overrides.execution_fragile_threshold.value)
+            if not (0.0 <= gate_value <= 1.0):
+                raise ValueError("harness.gate_overrides.execution_fragile_threshold.value must be in [0,1]")
         return self
 
 
