@@ -12,6 +12,18 @@ from weightiz.module6.types import PortfolioSelectionReport
 from weightiz.module6.utils import ensure_directory
 
 
+def _sanitize_json_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _sanitize_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json_value(v) for v in value]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float):
+        return None if not np.isfinite(value) else float(value)
+    return value
+
+
 def write_module6_outputs(
     *,
     output_dir: Path,
@@ -76,12 +88,15 @@ def write_module6_outputs(
         sparse.save_npz(dep_out / "drawdown_concurrence.npz", bundle.drawdown_concurrence.tocsr())
         (dep_out / "metadata.json").write_text(
             json.dumps(
-                {
+                _sanitize_json_value(
+                    {
                     "shrinkage": float(bundle.shrinkage),
                     "negative_mass": float(bundle.negative_mass),
-                },
+                    }
+                ),
                 indent=2,
                 sort_keys=True,
+                allow_nan=False,
             ),
             encoding="utf-8",
         )
@@ -93,17 +108,20 @@ def write_module6_outputs(
     ].sort_values(["comparable_truth_score", "portfolio_pk"], ascending=[False, True], kind="mergesort")
     (out / "portfolio_selection_report.json").write_text(
         json.dumps(
-            {
-                "run_id": str(selection_report.run_id),
-                "output_dir": str(selection_report.output_dir),
-                "selected_portfolio_pks": list(selection_report.selected_portfolio_pks),
-                "alternate_portfolio_pks": list(selection_report.alternate_portfolio_pks),
-                "summary": dict(selection_report.summary),
-                "selected_details": selected_details.to_dict("records"),
-                "alternate_details": alternate_details.to_dict("records"),
-            },
+            _sanitize_json_value(
+                {
+                    "run_id": str(selection_report.run_id),
+                    "output_dir": str(selection_report.output_dir),
+                    "selected_portfolio_pks": list(selection_report.selected_portfolio_pks),
+                    "alternate_portfolio_pks": list(selection_report.alternate_portfolio_pks),
+                    "summary": dict(selection_report.summary),
+                    "selected_details": selected_details.to_dict("records"),
+                    "alternate_details": alternate_details.to_dict("records"),
+                }
+            ),
             indent=2,
             sort_keys=True,
+            allow_nan=False,
         ),
         encoding="utf-8",
     )
