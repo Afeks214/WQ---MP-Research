@@ -1,0 +1,49 @@
+version: wave1_locked_v1
+family_truth:
+  standalone_families:
+  - F5
+  - F3
+  overlay_only:
+  - F7_as_F5_close_extension
+  deferred:
+  - F8
+  - F9
+  - F10
+  rejected:
+  - F4
+deterministic_ladder:
+- global_disqualifiers
+- breakout_branch_detection
+- F5_vs_F6_trichotomy
+- dead_zone_no_trade
+- responsive_F3_path
+- F3_vs_F5_collision_resolver
+- F3_vs_F6_collision_resolver
+- F5_close_window_overlay_extension
+dead_zone:
+  gbreak_low: 0.4
+  gbreak_high: 0.55
+f6_gate:
+  required: true
+  enabled: false
+  report_path: configs/server/wave1_f6_parity_report.json
+campaign:
+  objective: family-autopsy-first server research run
+  date_window:
+  - '2024-09-10'
+  - '2026-02-28'
+  assets:
+  - SPY
+  - QQQ
+  - GLD
+  - EEM
+  - HYG
+  - IWM
+  - XLU
+  - XLK
+  - XLE
+  - TLT
+  candidate_budgets:
+    F5: 48
+    F3: 36
+    F6: 0

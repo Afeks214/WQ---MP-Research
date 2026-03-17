@@ -1,0 +1,13 @@
+{
+  "candidate_count": 84,
+  "f6_enabled": false,
+  "family_counts": {
+    "F3": 36,
+    "F5": 48,
+    "F6": 0,
+    "F7": 0
+  },
+  "family_policy_path": "configs/families/wave1_family_policy.yaml",
+  "parity_report_path": "configs/server/wave1_f6_parity_report.json",
+  "run_config_path": "configs/server/wave1_server_campaign.yaml"
+}
