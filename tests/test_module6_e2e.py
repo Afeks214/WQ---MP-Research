@@ -87,3 +87,11 @@ def test_run_research_fails_closed_when_module6_blocks(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["run_research.py", "--config", str(config_path)])
     with pytest.raises(RuntimeError, match="MODULE6_SUPPORTED_FLOW_BLOCKED"):
         run_research.main()
+    summary_path = run_dir / "run_summary.json"
+    assert summary_path.exists()
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["module6_enabled"] is True
+    assert summary["module6_status"] == "failed"
+    assert summary["module6_output_dir"] is None
+    assert summary["module6_error_class"] == "RuntimeError"
+    assert summary["module6_error_message"] == "boom"

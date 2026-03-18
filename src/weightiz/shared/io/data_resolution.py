@@ -94,7 +94,8 @@ def in_memory_date_filter_loader(data_cfg: DataConfigModel) -> Callable[[str, st
         l_col = find_col(df, ("low", "l"), "low")
         c_col = find_col(df, ("close", "c"), "close")
         v_col = find_col(df, ("volume", "vol", "v"), "volume")
-        keep = np.asarray(pdx.notna(ts), dtype=bool)
+        # Pandas/pyarrow-backed boolean arrays can be read-only; keep must be writable for in-place masks.
+        keep = np.asarray(pdx.notna(ts), dtype=bool).copy()
 
         if start_utc is not None:
             keep &= np.asarray(ts >= start_utc, dtype=bool)

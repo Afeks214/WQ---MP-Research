@@ -918,6 +918,7 @@ def run_from_namespace(
         resolved_config_sha256=resolved_sha,
     )
     module6_report = None
+    module6_exc: Exception | None = None
     if enable_module6:
         try:
             module6_report = run_module6_portfolio_research(
@@ -926,7 +927,7 @@ def run_from_namespace(
                 config=build_module6_config(module6_block_for_run),
             )
         except Exception as exc:
-            raise RuntimeError(f"MODULE6_SUPPORTED_FLOW_BLOCKED: {type(exc).__name__}: {exc}") from exc
+            module6_exc = exc
 
     summary = {
         "run_id": run_id,
@@ -947,8 +948,15 @@ def run_from_namespace(
         "runtime_warning_count": int(runtime_warning_count),
         "research_mode": str(getattr(harness_cfg, "research_mode", "standard")),
         "module6_enabled": bool(enable_module6),
+        "module6_status": (
+            "failed"
+            if module6_exc is not None
+            else ("completed" if module6_report is not None else "disabled")
+        ),
         "module6_output_dir": str(module6_report.output_dir) if module6_report is not None else None,
         "module6_selected_count": int(len(module6_report.selected_portfolio_pks)) if module6_report is not None else 0,
+        "module6_error_class": type(module6_exc).__name__ if module6_exc is not None else None,
+        "module6_error_message": str(module6_exc) if module6_exc is not None else None,
         "gate_calibration": gate_calibration_doc,
     }
     if research_report is not None:
@@ -969,6 +977,11 @@ def run_from_namespace(
         )
     )
     _artifact_write_json(run_dir / "run_summary.json", summary)
+
+    if module6_exc is not None:
+        raise RuntimeError(
+            f"MODULE6_SUPPORTED_FLOW_BLOCKED: {type(module6_exc).__name__}: {module6_exc}"
+        ) from module6_exc
 
     log_event(logger, "INFO", "run_complete", event_type="run_complete")
     return summary
