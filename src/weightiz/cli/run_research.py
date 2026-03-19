@@ -158,6 +158,34 @@ def _build_candidates(cfg: RunConfigModel) -> Optional[list[CandidateSpec]]:
     return _cfg_build_candidates(cfg)
 
 
+def _classify_module6_failure_stage(exc: Exception | None) -> str | None:
+    if exc is None:
+        return None
+    message = str(exc).strip().lower()
+    if "no admitted canonical portfolio instances available for matrix build" in message:
+        return "matrix_entry"
+    if "no admitted strategies survived pre-reduction intake gates" in message:
+        return "pre_reduction_intake"
+    return "unknown"
+
+
+def _resolve_module6_intake_diagnostics_path(run_dir: Path, failure_stage: str | None) -> str | None:
+    if not failure_stage:
+        return None
+    diagnostics_dir = run_dir / "module6" / "diagnostics"
+    filename_by_stage = {
+        "matrix_entry": "module6_intake_matrix_entry.json",
+        "pre_reduction_intake": "module6_intake_pre_reduction_intake.json",
+    }
+    filename = filename_by_stage.get(str(failure_stage))
+    if filename is None:
+        return None
+    path = diagnostics_dir / filename
+    if not path.exists():
+        return None
+    return str(path.resolve())
+
+
 def _append_run_registry(
     artifacts_root: Path,
     run_id: str,
@@ -928,6 +956,8 @@ def run_from_namespace(
             )
         except Exception as exc:
             module6_exc = exc
+    module6_failure_stage = _classify_module6_failure_stage(module6_exc)
+    module6_intake_diagnostics = _resolve_module6_intake_diagnostics_path(run_dir, module6_failure_stage)
 
     summary = {
         "run_id": run_id,
@@ -957,6 +987,8 @@ def run_from_namespace(
         "module6_selected_count": int(len(module6_report.selected_portfolio_pks)) if module6_report is not None else 0,
         "module6_error_class": type(module6_exc).__name__ if module6_exc is not None else None,
         "module6_error_message": str(module6_exc) if module6_exc is not None else None,
+        "module6_failure_stage": module6_failure_stage,
+        "module6_intake_diagnostics": module6_intake_diagnostics,
         "gate_calibration": gate_calibration_doc,
     }
     if research_report is not None:

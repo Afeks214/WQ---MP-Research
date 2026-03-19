@@ -95,3 +95,22 @@ def test_run_research_fails_closed_when_module6_blocks(tmp_path, monkeypatch):
     assert summary["module6_output_dir"] is None
     assert summary["module6_error_class"] == "RuntimeError"
     assert summary["module6_error_message"] == "boom"
+    assert summary["module6_failure_stage"] == "unknown"
+    assert summary["module6_intake_diagnostics"] is None
+
+
+def test_classify_module6_failure_stage() -> None:
+    assert run_research._classify_module6_failure_stage(None) is None
+    assert (
+        run_research._classify_module6_failure_stage(
+            RuntimeError("no admitted canonical portfolio instances available for matrix build")
+        )
+        == "matrix_entry"
+    )
+    assert (
+        run_research._classify_module6_failure_stage(
+            RuntimeError("no admitted strategies survived pre-reduction intake gates")
+        )
+        == "pre_reduction_intake"
+    )
+    assert run_research._classify_module6_failure_stage(RuntimeError("other")) == "unknown"

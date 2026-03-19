@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,7 @@ from scipy import sparse
 from numpy.lib.format import open_memmap
 
 from weightiz.module6.calendar import build_portfolio_calendar_frame
-from weightiz.module6.config import Module6Config
+from weightiz.module6.config import Module6Config, resolve_intake_gate_thresholds
 from weightiz.module6.constants import BASE_AVAIL_ACTIVE_CODES
 from weightiz.module6.utils import Module6ValidationError, ensure_directory
 
@@ -33,6 +34,30 @@ class MatrixStore:
     regime_exposure_path: Path
 
 
+def _sanitize_json_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _sanitize_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json_value(v) for v in value]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    return value
+
+
+def _write_matrix_entry_diagnostics(*, output_dir: Path, payload: dict[str, Any]) -> Path:
+    diagnostics_dir = ensure_directory(output_dir / "diagnostics")
+    path = diagnostics_dir / "module6_intake_matrix_entry.json"
+    path.write_text(
+        json.dumps(_sanitize_json_value(payload), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return path
+
+
 def _write_dense_matrix(path: Path, shape: tuple[int, int], dtype: Any) -> np.memmap:
     return open_memmap(path, mode="w+", dtype=dtype, shape=shape)
 
@@ -52,11 +77,68 @@ def build_matrix_store(
     canonical_instances = instance_master.loc[
         instance_master["portfolio_instance_role"] == "canonical_portfolio"
     ].copy()
+    canonical_before_admit_count = int(canonical_instances.shape[0])
     canonical_instances = canonical_instances.loc[
         canonical_instances["portfolio_admit_flag"].astype(bool)
     ].copy()
     canonical_instances = canonical_instances.sort_values(["strategy_instance_pk"], kind="mergesort").reset_index(drop=True)
     if canonical_instances.shape[0] <= 0:
+        try:
+            intake_policy_class, min_availability_ratio, min_observed_sessions = resolve_intake_gate_thresholds(config.intake)
+        except ValueError:
+            intake_policy_class = str(config.intake.run_policy_class).strip().lower() or "unknown"
+            min_availability_ratio = None
+            min_observed_sessions = None
+        observed_policy_classes: list[str] = []
+        if "module6_policy_class" in strategy_master.columns:
+            observed_policy_classes = sorted(
+                {
+                    str(value).strip().lower()
+                    for value in pd.unique(strategy_master["module6_policy_class"]).tolist()
+                }
+            )
+        first_zero_gate = (
+            "canonical_portfolio_role_gate"
+            if canonical_before_admit_count <= 0
+            else "portfolio_admit_flag_gate"
+        )
+        _write_matrix_entry_diagnostics(
+            output_dir=Path(output_dir),
+            payload={
+                "diagnostic_schema_version": "module6_intake_gate_ledger_v1",
+                "stage": "matrix_entry",
+                "module6_policy_class": str(intake_policy_class),
+                "observed_policy_classes": observed_policy_classes,
+                "intake_candidate_count": int(strategy_master.shape[0]),
+                "admitted_candidate_count": int(canonical_instances.shape[0]),
+                "first_zero_gate": first_zero_gate,
+                "resolved_thresholds": {
+                    "min_availability_ratio": (
+                        float(min_availability_ratio) if min_availability_ratio is not None else None
+                    ),
+                    "min_observed_sessions": (
+                        int(min_observed_sessions) if min_observed_sessions is not None else None
+                    ),
+                    "reject_gate_active": bool(str(intake_policy_class) == "standard"),
+                },
+                "gates": [
+                    {
+                        "gate": "canonical_portfolio_role_gate",
+                        "gate_active": True,
+                        "input_count": int(instance_master.shape[0]),
+                        "survivor_count": int(canonical_before_admit_count),
+                        "dropped_count": int(max(int(instance_master.shape[0]) - canonical_before_admit_count, 0)),
+                    },
+                    {
+                        "gate": "portfolio_admit_flag_gate",
+                        "gate_active": True,
+                        "input_count": int(canonical_before_admit_count),
+                        "survivor_count": int(canonical_instances.shape[0]),
+                        "dropped_count": int(max(canonical_before_admit_count - int(canonical_instances.shape[0]), 0)),
+                    },
+                ],
+            },
+        )
         raise Module6ValidationError("no admitted canonical portfolio instances available for matrix build")
     calendar_frame = build_portfolio_calendar_frame(strategy_session_returns=session_ledger, equity_curves=run.equity_curves)
     calendar = np.asarray(calendar_frame.sessions, dtype=np.int64)

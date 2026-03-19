@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -12,7 +15,7 @@ from weightiz.module6.config import (
 )
 from weightiz.module6.execution_overlap import build_execution_overlap_proxy
 from weightiz.module6.types import ReducedUniverseSpec
-from weightiz.module6.utils import Module6ValidationError, stable_sha256_parts
+from weightiz.module6.utils import Module6ValidationError, ensure_directory, stable_sha256_parts
 
 
 @dataclass(frozen=True)
@@ -21,6 +24,53 @@ class ReductionArtifacts:
     cluster_membership: pd.DataFrame
     reduced_universes: list[ReducedUniverseSpec]
     overlap_proxy: object
+
+
+def _sanitize_json_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _sanitize_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json_value(v) for v in value]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    return value
+
+
+def _summarize_numeric(values: pd.Series, *, as_int: bool = False) -> dict[str, float | int | None]:
+    arr = pd.to_numeric(values, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    finite = arr[np.isfinite(arr)]
+    if finite.size <= 0:
+        return {
+            "min": None,
+            "p25": None,
+            "p50": None,
+            "p75": None,
+            "max": None,
+        }
+    stats = {
+        "min": float(np.min(finite)),
+        "p25": float(np.quantile(finite, 0.25)),
+        "p50": float(np.quantile(finite, 0.50)),
+        "p75": float(np.quantile(finite, 0.75)),
+        "max": float(np.max(finite)),
+    }
+    if as_int:
+        return {k: int(round(v)) if v is not None else None for k, v in stats.items()}
+    return stats
+
+
+def _write_pre_reduction_intake_diagnostics(*, output_dir: Path, payload: dict[str, Any]) -> Path:
+    diagnostics_dir = ensure_directory(output_dir / "diagnostics")
+    path = diagnostics_dir / "module6_intake_pre_reduction_intake.json"
+    path.write_text(
+        json.dumps(_sanitize_json_value(payload), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return path
 
 
 def _instance_key_series(frame: pd.DataFrame, cols: list[str]) -> pd.Series:
@@ -169,15 +219,60 @@ def reduce_universe(
         if str(intake_policy_class) == "standard"
         else pd.Series(True, index=strategy_master.index, dtype=bool)
     )
-    admitted = strategy_master.loc[
-        strategy_master["portfolio_admit_flag"].astype(bool)
-        & (~strategy_master["failed"].fillna(False).astype(bool))
-        & reject_gate
-        & (pd.to_numeric(strategy_master["availability_ratio"], errors="coerce").fillna(0.0) >= float(min_availability_ratio))
-        & (pd.to_numeric(strategy_master["observed_session_count"], errors="coerce").fillna(0).astype(int) >= int(min_observed_sessions))
-        & (pd.to_numeric(strategy_master["avg_turnover_metrics"], errors="coerce").fillna(0.0) >= 0.0)
-    ].copy()
+    reject_gate_active = str(intake_policy_class) == "standard"
+    availability_ratio = pd.to_numeric(strategy_master["availability_ratio"], errors="coerce").fillna(0.0)
+    observed_session_count = pd.to_numeric(strategy_master["observed_session_count"], errors="coerce").fillna(0).astype(int)
+    avg_turnover_metrics = pd.to_numeric(strategy_master["avg_turnover_metrics"], errors="coerce").fillna(0.0)
+    gate_sequence: list[tuple[str, pd.Series, bool]] = [
+        ("portfolio_admit_flag_gate", strategy_master["portfolio_admit_flag"].astype(bool), True),
+        ("failed_status_gate", ~strategy_master["failed"].fillna(False).astype(bool), True),
+        ("reject_gate", reject_gate, reject_gate_active),
+        ("availability_ratio_gate", availability_ratio >= float(min_availability_ratio), True),
+        ("observed_session_count_gate", observed_session_count >= int(min_observed_sessions), True),
+        ("turnover_sanity_gate", avg_turnover_metrics >= 0.0, True),
+    ]
+    cumulative_gate_mask = pd.Series(True, index=strategy_master.index, dtype=bool)
+    gate_rows: list[dict[str, Any]] = []
+    first_zero_gate: str | None = None
+    for gate_name, gate_mask, gate_active in gate_sequence:
+        before_count = int(cumulative_gate_mask.sum())
+        cumulative_gate_mask = cumulative_gate_mask & gate_mask
+        after_count = int(cumulative_gate_mask.sum())
+        gate_rows.append(
+            {
+                "gate": gate_name,
+                "gate_active": bool(gate_active),
+                "input_count": int(before_count),
+                "survivor_count": int(after_count),
+                "dropped_count": int(max(before_count - after_count, 0)),
+            }
+        )
+        if first_zero_gate is None and after_count <= 0:
+            first_zero_gate = str(gate_name)
+    admitted = strategy_master.loc[cumulative_gate_mask].copy()
     if admitted.shape[0] <= 0:
+        _write_pre_reduction_intake_diagnostics(
+            output_dir=Path(output_dir),
+            payload={
+                "diagnostic_schema_version": "module6_intake_gate_ledger_v1",
+                "stage": "pre_reduction_intake",
+                "module6_policy_class": str(intake_policy_class),
+                "intake_candidate_count": int(strategy_master.shape[0]),
+                "admitted_candidate_count": 0,
+                "first_zero_gate": first_zero_gate,
+                "resolved_thresholds": {
+                    "min_availability_ratio": float(min_availability_ratio),
+                    "min_observed_sessions": int(min_observed_sessions),
+                    "reject_gate_active": bool(reject_gate_active),
+                },
+                "gates": gate_rows,
+                "metric_summary": {
+                    "availability_ratio": _summarize_numeric(availability_ratio),
+                    "observed_session_count": _summarize_numeric(observed_session_count, as_int=True),
+                    "avg_turnover_metrics": _summarize_numeric(avg_turnover_metrics),
+                },
+            },
+        )
         raise Module6ValidationError("no admitted strategies survived pre-reduction intake gates")
     canonical_instances = instance_master.loc[
         instance_master["portfolio_instance_role"] == "canonical_portfolio"
