@@ -203,6 +203,7 @@ class TestBuilderIntegration:
                     "wf_step_sessions": 20,
                     "cpcv_slices": 10,
                     "cpcv_k_test": 5,
+                    "disable_cpcv_splits": True,
                     "robustness_reject_threshold": 0.40,
                     "execution_fragile_threshold": 0.50,
                     "gate_overrides": {
@@ -218,10 +219,12 @@ class TestBuilderIntegration:
             }
         )
         harness_cfg = build_harness_config(cfg, tmp_path)
+        assert bool(harness_cfg.disable_cpcv_splits) is True
         assert float(harness_cfg.robustness_reject_threshold) == pytest.approx(0.44)
         assert float(harness_cfg.execution_fragile_threshold) == pytest.approx(0.50)
 
         geometry = build_run_geometry(harness_cfg, data_sessions=120, common_sessions=60)
+        assert bool(geometry.disable_cpcv_splits) is True
         pre_cal = GateCalibrator().calibrate(
             geometry=geometry,
             gate_inputs=build_module6_gate_inputs(cfg.module6),

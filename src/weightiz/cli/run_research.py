@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import os
@@ -184,6 +185,26 @@ def _resolve_module6_intake_diagnostics_path(run_dir: Path, failure_stage: str |
     if not path.exists():
         return None
     return str(path.resolve())
+
+
+def _resolve_effective_methodology_doc(run_manifest: Any) -> dict[str, Any]:
+    if not isinstance(run_manifest, dict):
+        return {}
+    payload = run_manifest.get("effective_methodology")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _align_run_geometry_to_effective_methodology(run_geometry: Any, run_manifest: Any) -> Any:
+    doc = _resolve_effective_methodology_doc(run_manifest)
+    if not doc:
+        return run_geometry
+    cpcv_effective = doc.get("cpcv_effective_enabled")
+    if isinstance(cpcv_effective, bool):
+        return dataclasses.replace(run_geometry, disable_cpcv_splits=bool(not cpcv_effective))
+    disable_effective = doc.get("disable_cpcv_splits_effective")
+    if isinstance(disable_effective, bool):
+        return dataclasses.replace(run_geometry, disable_cpcv_splits=bool(disable_effective))
+    return run_geometry
 
 
 def _append_run_registry(
@@ -827,6 +848,8 @@ def run_from_namespace(
         data_sessions=data_sessions,
         common_sessions=common_sessions,
     )
+    run_geometry = _align_run_geometry_to_effective_methodology(run_geometry, out.run_manifest)
+    effective_methodology_doc = _resolve_effective_methodology_doc(out.run_manifest)
     calibrator = GateCalibrator()
     try:
         harness_gate_inputs = _build_harness_gate_inputs(harness_for_geometry)
@@ -890,6 +913,7 @@ def run_from_namespace(
             "cpcv_k_test": int(run_geometry.cpcv_k_test),
             "disable_cpcv_splits": bool(run_geometry.disable_cpcv_splits),
         },
+        "effective_methodology": effective_methodology_doc if effective_methodology_doc else None,
         "module6_pre_run": pre_run_module6_calibration.to_dict(),
         "harness_post_run_report_only": post_run_report_only_calibration.to_dict(),
         "report_only": {

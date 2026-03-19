@@ -166,6 +166,7 @@ def finalize_run_outputs(
     feature_tensor_role: dict[str, Any],
     robustness_caps: dict[str, float],
     quick_settings: Any,
+    effective_methodology: dict[str, Any] | None,
     first_exception_class: str,
     first_exception_message: str,
     first_exception_hash: str,
@@ -438,6 +439,11 @@ def finalize_run_outputs(
             "baseline_only": bool(quick_settings.baseline_only),
             "disable_cpcv": bool(quick_settings.disable_cpcv),
         },
+        "effective_methodology": (
+            dict(effective_methodology)
+            if isinstance(effective_methodology, dict)
+            else None
+        ),
         "compute_authority": compute_authority,
         "feature_tensor_role": feature_tensor_role,
         "execution_topology": execution_topology_fn(execution_mode, use_process_pool),
@@ -520,6 +526,11 @@ def finalize_run_outputs(
             "baseline_only": bool(quick_settings.baseline_only),
             "disable_cpcv": bool(quick_settings.disable_cpcv),
         },
+        "effective_methodology": (
+            dict(effective_methodology)
+            if isinstance(effective_methodology, dict)
+            else None
+        ),
         "memory": {
             "available_bytes": int(avail),
             "estimated_state_bytes": int(est_state),

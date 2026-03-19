@@ -214,6 +214,7 @@ def build_harness_config(cfg: RunConfigModel, project_root: Path) -> Module5Harn
         wf_step_sessions=h.wf_step_sessions,
         cpcv_slices=h.cpcv_slices,
         cpcv_k_test=h.cpcv_k_test,
+        disable_cpcv_splits=h.disable_cpcv_splits,
         parallel_backend=h.parallel_backend,
         parallel_workers=h.parallel_workers,
         stress_profile=h.stress_profile,

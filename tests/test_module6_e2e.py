@@ -114,3 +114,38 @@ def test_classify_module6_failure_stage() -> None:
         == "pre_reduction_intake"
     )
     assert run_research._classify_module6_failure_stage(RuntimeError("other")) == "unknown"
+
+
+def test_align_run_geometry_to_effective_methodology_uses_execution_truth() -> None:
+    harness_cfg = SimpleNamespace(
+        wf_train_sessions=30,
+        wf_test_sessions=30,
+        wf_step_sessions=30,
+        cpcv_slices=10,
+        cpcv_k_test=5,
+        disable_cpcv_splits=False,
+    )
+    geometry = run_research._build_run_geometry(harness_cfg, data_sessions=122, common_sessions=122)
+    aligned = run_research._align_run_geometry_to_effective_methodology(
+        geometry,
+        {"effective_methodology": {"cpcv_effective_enabled": False}},
+    )
+    assert bool(geometry.disable_cpcv_splits) is False
+    assert bool(aligned.disable_cpcv_splits) is True
+
+
+def test_align_run_geometry_to_effective_methodology_preserves_cpcv_when_effective() -> None:
+    harness_cfg = SimpleNamespace(
+        wf_train_sessions=30,
+        wf_test_sessions=30,
+        wf_step_sessions=30,
+        cpcv_slices=10,
+        cpcv_k_test=5,
+        disable_cpcv_splits=False,
+    )
+    geometry = run_research._build_run_geometry(harness_cfg, data_sessions=122, common_sessions=122)
+    aligned = run_research._align_run_geometry_to_effective_methodology(
+        geometry,
+        {"effective_methodology": {"cpcv_effective_enabled": True}},
+    )
+    assert bool(aligned.disable_cpcv_splits) is False

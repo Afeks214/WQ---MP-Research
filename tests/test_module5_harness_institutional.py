@@ -1548,6 +1548,26 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
             self.assertTrue(split_ids)
             self.assertTrue(all(split_id.startswith("wf_") for split_id in split_ids))
 
+    def test_cpcv_required_run_fails_closed_when_runtime_disables_cpcv(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="m5_cpcv_required_") as td:
+            report_dir = Path(td) / "artifacts"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "QUICK_RUN_DISABLE_CPCV": "1",
+                },
+                clear=False,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "CPCV_REQUIRED_BUT_DISABLED_EFFECTIVE"):
+                    _ = self._run_minimal_harness(
+                        report_dir=report_dir,
+                        harness_overrides={
+                            "disable_cpcv_splits": False,
+                            "daily_return_min_days": 1,
+                            "execution_latency_bars": 0,
+                        },
+                    )
+
     def test_regulatory_fee_fields_reach_execution_cost_config(self) -> None:
         with tempfile.TemporaryDirectory(prefix="m5_reg_fee_cfg_") as td:
             report_dir = Path(td) / "artifacts"

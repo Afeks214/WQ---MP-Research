@@ -516,6 +516,8 @@ def _quick_run_settings_from_env() -> _QuickRunSettings:
     enabled = _env_flag("QUICK_RUN", default=False)
     timeout_raw = str(os.environ.get("QUICK_RUN_TASK_TIMEOUT_SEC", "120")).strip()
     progress_raw = str(os.environ.get("QUICK_RUN_PROGRESS_EVERY", "1")).strip()
+    baseline_only = _env_flag("QUICK_RUN_BASELINE_ONLY", default=bool(enabled))
+    disable_cpcv = _env_flag("QUICK_RUN_DISABLE_CPCV", default=bool(enabled))
     try:
         timeout_sec = max(1, int(timeout_raw))
     except Exception:
@@ -528,8 +530,62 @@ def _quick_run_settings_from_env() -> _QuickRunSettings:
         enabled=bool(enabled),
         task_timeout_sec=int(timeout_sec),
         progress_every_groups=int(progress_every),
-        baseline_only=True,
-        disable_cpcv=True,
+        baseline_only=bool(baseline_only),
+        disable_cpcv=bool(disable_cpcv),
+    )
+
+
+@dataclass(frozen=True)
+class _EffectiveMethodology:
+    schema_version: str
+    wf_effective_enabled: bool
+    cpcv_config_intent: bool
+    cpcv_required: bool
+    cpcv_effective_enabled: bool
+    disable_cpcv_splits_config: bool
+    disable_cpcv_runtime_override: bool
+    disable_cpcv_splits_effective: bool
+    cpcv_slices: int
+    cpcv_k_test: int
+    quick_run_enabled: bool
+    quick_run_baseline_only: bool
+    blocking_reason: str | None = None
+
+
+def _resolve_effective_methodology(
+    *,
+    harness_cfg: Module5HarnessConfig,
+    quick_settings: _QuickRunSettings,
+) -> _EffectiveMethodology:
+    slices = int(max(1, int(harness_cfg.cpcv_slices)))
+    k_test = int(max(0, int(harness_cfg.cpcv_k_test)))
+    cpcv_params_valid = bool(slices >= 2 and k_test >= 1 and k_test < slices)
+    config_disables_cpcv = bool(harness_cfg.disable_cpcv_splits)
+    runtime_disables_cpcv = bool(quick_settings.disable_cpcv)
+    cpcv_config_intent = bool((not config_disables_cpcv) and cpcv_params_valid)
+    cpcv_required = bool(cpcv_config_intent and (not quick_settings.enabled))
+    disable_effective = bool(config_disables_cpcv or runtime_disables_cpcv)
+    cpcv_effective_enabled = bool(cpcv_config_intent and not disable_effective)
+    blocking_reason: str | None = None
+    if cpcv_required and not cpcv_effective_enabled:
+        if runtime_disables_cpcv:
+            blocking_reason = "runtime_override_disable_cpcv"
+        else:
+            blocking_reason = "effective_cpcv_disabled"
+    return _EffectiveMethodology(
+        schema_version="effective_methodology_v1",
+        wf_effective_enabled=True,
+        cpcv_config_intent=bool(cpcv_config_intent),
+        cpcv_required=bool(cpcv_required),
+        cpcv_effective_enabled=bool(cpcv_effective_enabled),
+        disable_cpcv_splits_config=bool(config_disables_cpcv),
+        disable_cpcv_runtime_override=bool(runtime_disables_cpcv),
+        disable_cpcv_splits_effective=bool(disable_effective),
+        cpcv_slices=int(slices),
+        cpcv_k_test=int(k_test),
+        quick_run_enabled=bool(quick_settings.enabled),
+        quick_run_baseline_only=bool(quick_settings.baseline_only),
+        blocking_reason=blocking_reason,
     )
 
 
@@ -2547,9 +2603,30 @@ def run_weightiz_harness(
 
     candidates = sorted(candidates, key=lambda c: c.candidate_id)
     quick_settings = _quick_run_settings_from_env()
+    effective_methodology = _resolve_effective_methodology(
+        harness_cfg=harness_cfg,
+        quick_settings=quick_settings,
+    )
+    if effective_methodology.cpcv_required and not effective_methodology.cpcv_effective_enabled:
+        raise RuntimeError(
+            "CPCV_REQUIRED_BUT_DISABLED_EFFECTIVE: "
+            f"config_disable_cpcv_splits={effective_methodology.disable_cpcv_splits_config} "
+            f"runtime_disable_cpcv={effective_methodology.disable_cpcv_runtime_override} "
+            f"reason={effective_methodology.blocking_reason or 'unknown'}"
+        )
 
     wf_splits = _generate_wf_splits(base_state, harness_cfg)
-    cpcv_splits = [] if (quick_settings.disable_cpcv or bool(harness_cfg.disable_cpcv_splits)) else _generate_cpcv_splits(base_state, harness_cfg)
+    cpcv_splits = (
+        []
+        if bool(effective_methodology.disable_cpcv_splits_effective)
+        else _generate_cpcv_splits(base_state, harness_cfg)
+    )
+    if effective_methodology.cpcv_required and len(cpcv_splits) <= 0:
+        raise RuntimeError(
+            "CPCV_REQUIRED_BUT_NO_CPCV_SPLITS_GENERATED: "
+            f"cpcv_slices={effective_methodology.cpcv_slices} "
+            f"cpcv_k_test={effective_methodology.cpcv_k_test}"
+        )
     splits = wf_splits + cpcv_splits
     if quick_settings.enabled and wf_splits:
         splits = [wf_splits[0]]
@@ -3403,6 +3480,28 @@ def run_weightiz_harness(
         feature_tensor_role=feature_tensor_role,
         robustness_caps=ROBUSTNESS_CAPS,
         quick_settings=quick_settings,
+        effective_methodology={
+            "schema_version": str(effective_methodology.schema_version),
+            "wf_effective_enabled": bool(effective_methodology.wf_effective_enabled),
+            "cpcv_config_intent": bool(effective_methodology.cpcv_config_intent),
+            "cpcv_required": bool(effective_methodology.cpcv_required),
+            "cpcv_effective_enabled": bool(effective_methodology.cpcv_effective_enabled),
+            "disable_cpcv_splits_config": bool(effective_methodology.disable_cpcv_splits_config),
+            "disable_cpcv_runtime_override": bool(effective_methodology.disable_cpcv_runtime_override),
+            "disable_cpcv_splits_effective": bool(effective_methodology.disable_cpcv_splits_effective),
+            "cpcv_slices": int(effective_methodology.cpcv_slices),
+            "cpcv_k_test": int(effective_methodology.cpcv_k_test),
+            "quick_run_enabled": bool(effective_methodology.quick_run_enabled),
+            "quick_run_baseline_only": bool(effective_methodology.quick_run_baseline_only),
+            "wf_split_count": int(len(wf_splits)),
+            "cpcv_split_count": int(len(cpcv_splits)),
+            "split_count_total": int(len(splits)),
+            "blocking_reason": (
+                str(effective_methodology.blocking_reason)
+                if effective_methodology.blocking_reason is not None
+                else None
+            ),
+        },
         first_exception_class=first_exception_class,
         first_exception_message=first_exception_message,
         first_exception_hash=first_exception_hash,

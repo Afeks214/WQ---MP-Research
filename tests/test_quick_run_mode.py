@@ -188,6 +188,46 @@ class TestQuickRunMode(unittest.TestCase):
         self.assertTrue(opts.disable_cpcv)
         self.assertTrue(opts.baseline_only)
 
+    def test_harness_quick_run_defaults_do_not_disable_cpcv_when_not_enabled(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {},
+            clear=True,
+        ):
+            opts = harness._quick_run_settings_from_env()
+        self.assertFalse(opts.enabled)
+        self.assertFalse(opts.disable_cpcv)
+        self.assertFalse(opts.baseline_only)
+
+    def test_effective_methodology_marks_cpcv_required_only_outside_quick_run(self) -> None:
+        cfg = harness.Module5HarnessConfig(cpcv_slices=10, cpcv_k_test=5, disable_cpcv_splits=False)
+        normal = harness._resolve_effective_methodology(
+            harness_cfg=cfg,
+            quick_settings=harness._QuickRunSettings(
+                enabled=False,
+                task_timeout_sec=120,
+                progress_every_groups=1,
+                baseline_only=False,
+                disable_cpcv=False,
+            ),
+        )
+        quick = harness._resolve_effective_methodology(
+            harness_cfg=cfg,
+            quick_settings=harness._QuickRunSettings(
+                enabled=True,
+                task_timeout_sec=120,
+                progress_every_groups=1,
+                baseline_only=True,
+                disable_cpcv=True,
+            ),
+        )
+        self.assertTrue(normal.cpcv_config_intent)
+        self.assertTrue(normal.cpcv_required)
+        self.assertTrue(normal.cpcv_effective_enabled)
+        self.assertTrue(quick.cpcv_config_intent)
+        self.assertFalse(quick.cpcv_required)
+        self.assertFalse(quick.cpcv_effective_enabled)
+
 
 if __name__ == "__main__":
     unittest.main()
