@@ -9,6 +9,7 @@ import yaml
 
 from weightiz.module5.harness.artifact_writers import write_json as _write_json
 from weightiz.module6 import Module6Config, run_module6_portfolio_research
+from weightiz.module6.config import resolve_availability_ratio_gate_mode
 from weightiz.shared.config.paths import ProjectPaths, resolve_repo_path
 
 
@@ -25,7 +26,7 @@ def build_module6_config(config_block: dict[str, Any] | None) -> Module6Config:
     if not isinstance(config_block, dict):
         raise RuntimeError("module6 config payload must be a mapping")
     cfg = Module6Config()
-    return replace(
+    resolved = replace(
         cfg,
         intake=_apply_dataclass_overrides(cfg.intake, config_block.get("intake")),
         reduction=_apply_dataclass_overrides(cfg.reduction, config_block.get("reduction")),
@@ -36,6 +37,8 @@ def build_module6_config(config_block: dict[str, Any] | None) -> Module6Config:
         export=_apply_dataclass_overrides(cfg.export, config_block.get("export")),
         runtime=_apply_dataclass_overrides(cfg.runtime, config_block.get("runtime")),
     )
+    resolve_availability_ratio_gate_mode(resolved.intake)
+    return resolved
 
 
 def _load_module6_payload(path: Path) -> tuple[dict[str, Any], Module6Config]:

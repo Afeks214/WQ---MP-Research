@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from weightiz.cli.run_research import _load_config
 from weightiz.module5.harness.robustness_support import (
@@ -11,6 +12,7 @@ from weightiz.module5.harness.robustness_support import (
     resolve_module6_policy_class_from_research_mode,
 )
 from weightiz.module6.config import (
+    IntakeConfig,
     MODULE6_RUN_POLICY_REPRESENTATIVE_DISCOVERY,
     MODULE6_RUN_POLICY_STANDARD,
     resolve_intake_gate_thresholds,
@@ -125,6 +127,11 @@ def test_policy_contract_distinguishes_standard_reject_from_representative_disco
     assert standard_basis == "standard_reject_blocked"
     assert discovery_admit is True
     assert discovery_basis == "representative_discovery_mcs_included"
+
+
+def test_availability_ratio_gate_mode_validation_is_strict() -> None:
+    with pytest.raises(ValueError, match="availability_ratio_gate_mode"):
+        resolve_intake_gate_thresholds(IntakeConfig(availability_ratio_gate_mode="invalid"))  # type: ignore[arg-type]
 
 
 def test_ledger_uses_explicit_module6_admission_contract_for_representative_discovery(tmp_path: Path) -> None:

@@ -9,8 +9,12 @@ import numpy as np
 import pandas as pd
 
 from weightiz.module6.config import (
+    MODULE6_AVAILABILITY_RATIO_GATE_MODE_HARD,
+    MODULE6_AVAILABILITY_RATIO_GATE_MODE_OFF,
+    MODULE6_AVAILABILITY_RATIO_GATE_MODE_WARN,
     MODULE6_RUN_POLICY_REPRESENTATIVE_DISCOVERY,
     Module6Config,
+    resolve_availability_ratio_gate_mode,
     resolve_intake_gate_thresholds,
 )
 from weightiz.module6.execution_overlap import build_execution_overlap_proxy
@@ -201,6 +205,7 @@ def reduce_universe(
         intake_policy_class, min_availability_ratio, min_observed_sessions = resolve_intake_gate_thresholds(
             config.intake
         )
+        availability_ratio_gate_mode = resolve_availability_ratio_gate_mode(config.intake)
     except ValueError as exc:
         raise Module6ValidationError(str(exc)) from exc
     if "module6_policy_class" not in strategy_master.columns:
@@ -221,13 +226,34 @@ def reduce_universe(
     )
     reject_gate_active = str(intake_policy_class) == "standard"
     availability_ratio = pd.to_numeric(strategy_master["availability_ratio"], errors="coerce").fillna(0.0)
+    availability_ratio_below_threshold = availability_ratio < float(min_availability_ratio)
+    if str(availability_ratio_gate_mode) == MODULE6_AVAILABILITY_RATIO_GATE_MODE_HARD:
+        availability_ratio_gate_mask = availability_ratio >= float(min_availability_ratio)
+        availability_ratio_warning = False
+    elif str(availability_ratio_gate_mode) == MODULE6_AVAILABILITY_RATIO_GATE_MODE_WARN:
+        availability_ratio_gate_mask = pd.Series(True, index=strategy_master.index, dtype=bool)
+        availability_ratio_warning = bool(availability_ratio_below_threshold.any())
+    elif str(availability_ratio_gate_mode) == MODULE6_AVAILABILITY_RATIO_GATE_MODE_OFF:
+        availability_ratio_gate_mask = pd.Series(True, index=strategy_master.index, dtype=bool)
+        availability_ratio_warning = False
+    else:
+        raise Module6ValidationError(f"unsupported availability ratio gate mode: {availability_ratio_gate_mode}")
+    availability_ratio_warning_count = (
+        int(availability_ratio_below_threshold.astype(bool).sum())
+        if str(availability_ratio_gate_mode) == MODULE6_AVAILABILITY_RATIO_GATE_MODE_WARN
+        else 0
+    )
     observed_session_count = pd.to_numeric(strategy_master["observed_session_count"], errors="coerce").fillna(0).astype(int)
     avg_turnover_metrics = pd.to_numeric(strategy_master["avg_turnover_metrics"], errors="coerce").fillna(0.0)
     gate_sequence: list[tuple[str, pd.Series, bool]] = [
         ("portfolio_admit_flag_gate", strategy_master["portfolio_admit_flag"].astype(bool), True),
         ("failed_status_gate", ~strategy_master["failed"].fillna(False).astype(bool), True),
         ("reject_gate", reject_gate, reject_gate_active),
-        ("availability_ratio_gate", availability_ratio >= float(min_availability_ratio), True),
+        (
+            "availability_ratio_gate",
+            availability_ratio_gate_mask,
+            bool(str(availability_ratio_gate_mode) == MODULE6_AVAILABILITY_RATIO_GATE_MODE_HARD),
+        ),
         ("observed_session_count_gate", observed_session_count >= int(min_observed_sessions), True),
         ("turnover_sanity_gate", avg_turnover_metrics >= 0.0, True),
     ]
@@ -257,17 +283,22 @@ def reduce_universe(
                 "diagnostic_schema_version": "module6_intake_gate_ledger_v1",
                 "stage": "pre_reduction_intake",
                 "module6_policy_class": str(intake_policy_class),
+                "availability_ratio_gate_mode": str(availability_ratio_gate_mode),
+                "availability_ratio_warning": bool(availability_ratio_warning),
                 "intake_candidate_count": int(strategy_master.shape[0]),
                 "admitted_candidate_count": 0,
                 "first_zero_gate": first_zero_gate,
                 "resolved_thresholds": {
                     "min_availability_ratio": float(min_availability_ratio),
                     "min_observed_sessions": int(min_observed_sessions),
+                    "availability_ratio_gate_mode": str(availability_ratio_gate_mode),
+                    "availability_ratio_warning_count": int(availability_ratio_warning_count),
                     "reject_gate_active": bool(reject_gate_active),
                 },
                 "gates": gate_rows,
                 "metric_summary": {
                     "availability_ratio": _summarize_numeric(availability_ratio),
+                    "availability_ratio_warning_count": int(availability_ratio_warning_count),
                     "observed_session_count": _summarize_numeric(observed_session_count, as_int=True),
                     "avg_turnover_metrics": _summarize_numeric(avg_turnover_metrics),
                 },

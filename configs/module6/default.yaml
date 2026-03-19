@@ -2,6 +2,7 @@ run_dir: "./artifacts/server/compute_small/example_run"
 
 module6:
   intake:
+    availability_ratio_gate_mode: warn
     min_availability_ratio: 0.5
     min_observed_sessions: 4
   export:

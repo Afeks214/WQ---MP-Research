@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from weightiz.module6.constants import (
     MODULE6_CONSTRAINT_POLICY_VERSION,
@@ -12,6 +13,9 @@ from weightiz.module6.constants import (
 
 MODULE6_RUN_POLICY_STANDARD = "standard"
 MODULE6_RUN_POLICY_REPRESENTATIVE_DISCOVERY = "representative_discovery"
+MODULE6_AVAILABILITY_RATIO_GATE_MODE_HARD = "hard"
+MODULE6_AVAILABILITY_RATIO_GATE_MODE_WARN = "warn"
+MODULE6_AVAILABILITY_RATIO_GATE_MODE_OFF = "off"
 
 
 def normalize_module6_run_policy_class(raw: str | None) -> str:
@@ -24,19 +28,40 @@ def normalize_module6_run_policy_class(raw: str | None) -> str:
     return policy
 
 
+def normalize_availability_ratio_gate_mode(raw: str | None) -> str:
+    mode = str(raw or MODULE6_AVAILABILITY_RATIO_GATE_MODE_WARN).strip().lower()
+    if mode not in {
+        MODULE6_AVAILABILITY_RATIO_GATE_MODE_HARD,
+        MODULE6_AVAILABILITY_RATIO_GATE_MODE_WARN,
+        MODULE6_AVAILABILITY_RATIO_GATE_MODE_OFF,
+    }:
+        raise ValueError(
+            "module6.intake.availability_ratio_gate_mode must be one of {'hard','warn','off'}"
+        )
+    return mode
+
+
 @dataclass(frozen=True)
 class IntakeConfig:
     run_policy_class: str = MODULE6_RUN_POLICY_STANDARD
     min_availability_ratio: float | None = None
     min_observed_sessions: int | None = None
+    availability_ratio_gate_mode: Literal["hard", "warn", "off"] = MODULE6_AVAILABILITY_RATIO_GATE_MODE_WARN
     require_bridge_artifacts: bool = True
     canonical_selection_stage: str = "module5_bridge_canonical_baseline_v1"
     require_zero_filled_daily_returns_non_authoritative: bool = True
     required_comparison_support: float = 0.85
 
 
+def resolve_availability_ratio_gate_mode(intake: IntakeConfig) -> str:
+    return normalize_availability_ratio_gate_mode(
+        getattr(intake, "availability_ratio_gate_mode", MODULE6_AVAILABILITY_RATIO_GATE_MODE_WARN)
+    )
+
+
 def resolve_intake_gate_thresholds(intake: IntakeConfig) -> tuple[str, float, int]:
     policy = normalize_module6_run_policy_class(intake.run_policy_class)
+    _ = resolve_availability_ratio_gate_mode(intake)
     raw_min_availability = intake.min_availability_ratio
     raw_min_sessions = intake.min_observed_sessions
 
