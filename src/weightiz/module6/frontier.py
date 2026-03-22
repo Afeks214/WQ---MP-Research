@@ -7,6 +7,33 @@ from weightiz.module6.config import Module6Config
 from weightiz.module6.utils import Module6ValidationError
 
 
+def _false_series(df: pd.DataFrame) -> pd.Series:
+    return pd.Series(False, index=df.index, dtype=bool)
+
+
+def _int_flag(df: pd.DataFrame, column: str) -> pd.Series:
+    if column not in df.columns:
+        return _false_series(df)
+    return pd.to_numeric(df[column], errors="coerce").fillna(0).astype(int) > 0
+
+
+def _nonpositive_float(df: pd.DataFrame, column: str) -> pd.Series:
+    if column not in df.columns:
+        return _false_series(df)
+    return pd.to_numeric(df[column], errors="coerce").fillna(0.0) <= 0.0
+
+
+def _strict_live_mask(df: pd.DataFrame) -> pd.Series:
+    dead = _false_series(df)
+    for column in ("session_disable_flag", "minute_disable_flag", "disable_flag"):
+        dead = dead | _int_flag(df, column)
+    for column in ("session_breach_count", "minute_breach_count", "breach_count"):
+        dead = dead | _int_flag(df, column)
+    for column in ("session_gross_exposure_peak", "minute_gross_exposure_peak", "gross_exposure_peak"):
+        dead = dead | _nonpositive_float(df, column)
+    return ~dead
+
+
 def pareto_frontier(df: pd.DataFrame, maximize: list[str], minimize: list[str]) -> pd.DataFrame:
     if df.shape[0] <= 0:
         return df.copy()
@@ -41,7 +68,10 @@ def select_diverse_finalists(
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     if "cross_universe_reject" not in scores.columns:
         raise Module6ValidationError("frontier selection requires cross_universe_reject")
-    eligible_scores = scores.loc[~scores["cross_universe_reject"].fillna(False).astype(bool)].copy()
+    live_mask = _strict_live_mask(scores)
+    eligible_scores = scores.loc[
+        (~scores["cross_universe_reject"].fillna(False).astype(bool)) & live_mask
+    ].copy()
     if eligible_scores.shape[0] <= 0:
         raise Module6ValidationError("NO_COMPARABLE_FINALISTS_SURVIVED")
     risk_return = pareto_frontier(eligible_scores, maximize=["minute_annualized_return"], minimize=["minute_max_drawdown"])

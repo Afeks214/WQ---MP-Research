@@ -106,3 +106,41 @@ def test_frontier_selection_fails_closed_when_all_rows_are_rejected():
             strategy_frame=strategy_frame,
             config=make_test_config(),
         )
+
+
+def test_frontier_selection_excludes_dead_portfolios_even_if_cross_universe_flag_is_false():
+    scores = pd.DataFrame(
+        {
+            "portfolio_pk": ["p0", "p1", "p2"],
+            "final_score": [0.9, 0.95, 0.7],
+            "minute_annualized_return": [0.2, 0.3, 0.1],
+            "minute_max_drawdown": [0.1, 0.01, 0.02],
+            "minute_turnover": [0.1, 0.05, 0.3],
+            "availability_burden": [0.0, 0.0, 0.2],
+            "headroom": [0.8, 0.9, 0.9],
+            "comparable_truth_score": [0.9, 0.95, 0.7],
+            "cross_universe_reject": [False, False, False],
+            "session_disable_flag": [0, 1, 0],
+            "session_breach_count": [0, 1, 0],
+            "session_gross_exposure_peak": [1.0, 1.1, 0.8],
+        }
+    )
+    weights = pd.DataFrame(
+        {
+            "portfolio_pk": ["p0", "p0", "p1", "p1", "p2"],
+            "strategy_instance_pk": ["a", "b", "a", "c", "d"],
+            "target_weight": [0.5, 0.4, 0.6, 0.3, 0.9],
+        }
+    )
+    strategy_frame = pd.DataFrame({"strategy_instance_pk": ["a", "b", "c", "d"], "cluster_id": [0, 1, 2, 3]})
+    global_front, risk_front, operational_front, selected = select_diverse_finalists(
+        scores=scores.sort_values(["comparable_truth_score", "portfolio_pk"], ascending=[False, True], kind="mergesort").reset_index(drop=True),
+        portfolio_weights=weights,
+        strategy_frame=strategy_frame,
+        config=make_test_config(),
+    )
+    rejected = {"p1"}
+    assert rejected.isdisjoint(set(global_front["portfolio_pk"].astype(str)))
+    assert rejected.isdisjoint(set(risk_front["portfolio_pk"].astype(str)))
+    assert rejected.isdisjoint(set(operational_front["portfolio_pk"].astype(str)))
+    assert rejected.isdisjoint(set(selected["portfolio_pk"].astype(str)))
