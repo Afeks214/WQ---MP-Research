@@ -63,6 +63,8 @@ def make_test_config() -> Module6Config:
             final_primary_count=2,
             final_alternate_count=2,
             min_cross_universe_support=0.70,
+            min_average_gross_exposure=1.0e-6,
+            min_realized_volatility=1.0e-6,
         ),
     )
 

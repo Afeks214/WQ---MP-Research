@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pandas as pd
 
@@ -188,6 +190,61 @@ def test_score_session_paths_hard_rejects_zero_gross_and_disable_flag(tmp_path):
     assert float(scored["first_pass_score"].iloc[0]) == -1.0
 
 
+def test_score_session_paths_hard_rejects_low_risk_cash_like_portfolios(tmp_path):
+    run_dir = build_synthetic_module5_run(tmp_path)
+    base_cfg = make_test_config()
+    cfg = replace(
+        base_cfg,
+        scoring=replace(
+            base_cfg.scoring,
+            min_average_gross_exposure=0.15,
+            min_realized_volatility=0.05,
+        ),
+    )
+    loaded = load_module5_run(run_dir, cfg)
+    ledgers = materialize_canonical_ledgers(loaded, run_dir / "ledgers_low_risk", cfg)
+    store = build_matrix_store(ledgers=ledgers, run=loaded, output_dir=run_dir / "matrix_low_risk", config=cfg)
+    matrices = open_matrix_store(store)
+    matrices["column_index"] = store.column_index
+    reduction = reduce_universe(ledgers=ledgers, matrices=matrices, run=loaded, output_dir=run_dir / "reduce_low_risk", config=cfg)
+    strategy_frame = reduction.admitted_instances.loc[
+        reduction.admitted_instances["strategy_instance_pk"].isin(reduction.reduced_universes[0].strategy_instance_pks)
+    ].copy()
+    cols = strategy_frame["column_idx"].to_numpy(dtype="int64")
+    bundle = build_covariance_bundle(matrices["R_exec"], matrices["A"], matrices["G"], cols, cfg.dependence)
+    candidates, weights = generate_all_portfolios(
+        reduced_universe=reduction.reduced_universes[0],
+        strategy_frame=strategy_frame,
+        covariance_bundle=bundle,
+        returns_exec=matrices["R_exec"],
+        column_indices=cols,
+        config=cfg,
+        calendar_version=str(strategy_frame["calendar_version"].iloc[0]),
+    )
+    art = simulate_session_batch(
+        portfolio_candidates=candidates.head(1),
+        portfolio_weights=weights,
+        strategy_frame=strategy_frame,
+        matrices=matrices,
+        calendar=pd.read_parquet(store.calendar_index_path),
+        config=cfg,
+        return_weight_history=False,
+    )
+    low_risk_paths = art.session_paths.copy()
+    low_risk_paths["gross_exposure_mult"] = 0.01
+    low_risk_paths["session_return"] = np.linspace(1.0e-5, 2.0e-5, low_risk_paths.shape[0])
+    scored = score_session_paths(
+        session_paths=low_risk_paths,
+        session_summary=art.portfolio_summary,
+        portfolio_weights=weights,
+        strategy_frame=strategy_frame,
+        config=cfg,
+    )
+    assert bool(scored["hard_reject"].iloc[0]) is True
+    assert str(scored["hard_reject_reason"].iloc[0]) == "SESSION_AVG_GROSS_BELOW_MIN"
+    assert float(scored["first_pass_score"].iloc[0]) == -1.0
+
+
 def test_cross_universe_scores_reject_dead_portfolios():
     cfg = make_test_config()
     finalists = pd.DataFrame(
@@ -199,11 +256,15 @@ def test_cross_universe_scores_reject_dead_portfolios():
             "minute_annualized_return": [0.2, 0.1],
             "minute_max_drawdown": [0.05, 0.04],
             "minute_turnover": [0.1, 0.2],
+            "minute_average_gross_exposure": [0.4, 0.4],
+            "minute_realized_volatility": [0.2, 0.2],
             "support_coverage": [0.9, 0.9],
             "availability_burden": [0.0, 0.0],
             "session_disable_flag": [0, 1],
             "session_breach_count": [0, 0],
             "session_gross_exposure_peak": [1.2, 1.1],
+            "session_average_gross_exposure": [0.4, 0.4],
+            "session_realized_volatility": [0.2, 0.2],
             "minute_disable_flag": [0, 0],
             "minute_breach_count": [0, 0],
             "minute_gross_exposure_peak": [1.2, 1.1],

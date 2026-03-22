@@ -94,6 +94,9 @@ class ReductionConfig:
     mv_universe_cap: int = 64
     hedge_keep_count: int = 16
     min_exact_duplicate_overlap: float = 0.999999
+    friction_curve_bps: tuple[float, ...] = (0.0, 1.0, 2.0, 3.0, 5.0)
+    conservative_friction_bps: float = 2.0
+    min_conservative_net_sharpe: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -203,6 +206,8 @@ class ScoringConfig:
     support_penalty_soft_min: float = 0.55
     support_penalty_soft_max: float = 0.80
     support_penalty_weight: float = 1.0
+    min_average_gross_exposure: float = 0.15
+    min_realized_volatility: float = 0.05
 
 
 @dataclass(frozen=True)

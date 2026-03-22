@@ -18,8 +18,18 @@ def test_cross_universe_support_short_rejected():
             "minute_annualized_return": [0.1, 0.2],
             "minute_max_drawdown": [0.1, 0.05],
             "minute_turnover": [0.1, 0.1],
+            "minute_average_gross_exposure": [0.3, 0.3],
+            "minute_realized_volatility": [0.2, 0.2],
             "support_coverage": [0.6, 1.0],
             "availability_burden": [0.4, 0.0],
+            "session_disable_flag": [0, 0],
+            "session_breach_count": [0, 0],
+            "session_gross_exposure_peak": [0.4, 0.4],
+            "session_average_gross_exposure": [0.3, 0.3],
+            "session_realized_volatility": [0.2, 0.2],
+            "minute_disable_flag": [0, 0],
+            "minute_breach_count": [0, 0],
+            "minute_gross_exposure_peak": [0.4, 0.4],
         }
     )
     comparison_support = pd.DataFrame({"session_id": list(range(10))})
@@ -37,8 +47,18 @@ def test_cross_universe_calendar_mismatch_blocks():
             "minute_annualized_return": [0.1, 0.2],
             "minute_max_drawdown": [0.1, 0.05],
             "minute_turnover": [0.1, 0.1],
+            "minute_average_gross_exposure": [0.3, 0.3],
+            "minute_realized_volatility": [0.2, 0.2],
             "support_coverage": [1.0, 1.0],
             "availability_burden": [0.0, 0.0],
+            "session_disable_flag": [0, 0],
+            "session_breach_count": [0, 0],
+            "session_gross_exposure_peak": [0.4, 0.4],
+            "session_average_gross_exposure": [0.3, 0.3],
+            "session_realized_volatility": [0.2, 0.2],
+            "minute_disable_flag": [0, 0],
+            "minute_breach_count": [0, 0],
+            "minute_gross_exposure_peak": [0.4, 0.4],
         }
     )
     with pytest.raises(Module6ValidationError):
@@ -55,8 +75,18 @@ def test_cross_universe_requires_canonical_recompute():
             "minute_annualized_return": [0.1, 0.2],
             "minute_max_drawdown": [0.1, 0.05],
             "minute_turnover": [0.1, 0.1],
+            "minute_average_gross_exposure": [0.3, 0.3],
+            "minute_realized_volatility": [0.2, 0.2],
             "support_coverage": [1.0, 1.0],
             "availability_burden": [0.0, 0.0],
+            "session_disable_flag": [0, 0],
+            "session_breach_count": [0, 0],
+            "session_gross_exposure_peak": [0.4, 0.4],
+            "session_average_gross_exposure": [0.3, 0.3],
+            "session_realized_volatility": [0.2, 0.2],
+            "minute_disable_flag": [0, 0],
+            "minute_breach_count": [0, 0],
+            "minute_gross_exposure_peak": [0.4, 0.4],
         }
     )
     with pytest.raises(Module6ValidationError, match="comparison-support recomputation"):

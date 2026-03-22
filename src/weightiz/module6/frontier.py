@@ -4,33 +4,60 @@ import numpy as np
 import pandas as pd
 
 from weightiz.module6.config import Module6Config
-from weightiz.module6.utils import Module6ValidationError
+from weightiz.module6.utils import Module6ValidationError, require_columns, require_numeric_series
 
 
 def _false_series(df: pd.DataFrame) -> pd.Series:
     return pd.Series(False, index=df.index, dtype=bool)
 
 
-def _int_flag(df: pd.DataFrame, column: str) -> pd.Series:
+def _required_numeric(df: pd.DataFrame, column: str, *, integer: bool = False) -> pd.Series:
     if column not in df.columns:
-        return _false_series(df)
-    return pd.to_numeric(df[column], errors="coerce").fillna(0).astype(int) > 0
+        raise Module6ValidationError(f"frontier selection missing required column: {column}")
+    return require_numeric_series(df[column], label=f"frontier.{column}", integer=integer)
+
+
+def _int_flag(df: pd.DataFrame, column: str) -> pd.Series:
+    return _required_numeric(df, column, integer=True).astype(bool)
 
 
 def _nonpositive_float(df: pd.DataFrame, column: str) -> pd.Series:
-    if column not in df.columns:
-        return _false_series(df)
-    return pd.to_numeric(df[column], errors="coerce").fillna(0.0) <= 0.0
+    return _required_numeric(df, column) <= 0.0
 
 
-def _strict_live_mask(df: pd.DataFrame) -> pd.Series:
+def _strict_live_mask(df: pd.DataFrame, config: Module6Config) -> pd.Series:
     dead = _false_series(df)
     for column in ("session_disable_flag", "minute_disable_flag", "disable_flag"):
-        dead = dead | _int_flag(df, column)
+        if column in df.columns:
+            dead = dead | _int_flag(df, column)
     for column in ("session_breach_count", "minute_breach_count", "breach_count"):
-        dead = dead | _int_flag(df, column)
+        if column in df.columns:
+            dead = dead | _int_flag(df, column)
     for column in ("session_gross_exposure_peak", "minute_gross_exposure_peak", "gross_exposure_peak"):
-        dead = dead | _nonpositive_float(df, column)
+        if column in df.columns:
+            dead = dead | _nonpositive_float(df, column)
+    gross_columns = [
+        column
+        for column in ("minute_average_gross_exposure", "session_average_gross_exposure", "average_gross_exposure")
+        if column in df.columns
+    ]
+    vol_columns = [
+        column
+        for column in ("minute_realized_volatility", "session_realized_volatility", "realized_volatility")
+        if column in df.columns
+    ]
+    if not gross_columns:
+        raise Module6ValidationError("frontier selection requires average gross exposure metrics")
+    if not vol_columns:
+        raise Module6ValidationError("frontier selection requires realized volatility metrics")
+    for column in gross_columns:
+        dead = dead | (
+            _required_numeric(df, column) < float(config.scoring.min_average_gross_exposure)
+        )
+    for column in vol_columns:
+        dead = dead | (
+            _required_numeric(df, column) < float(config.scoring.min_realized_volatility)
+        )
     return ~dead
 
 
@@ -66,23 +93,41 @@ def select_diverse_finalists(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if scores.shape[0] <= 0:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    if "cross_universe_reject" not in scores.columns:
-        raise Module6ValidationError("frontier selection requires cross_universe_reject")
-    live_mask = _strict_live_mask(scores)
+    require_columns(
+        scores,
+        [
+            "portfolio_pk",
+            "cross_universe_reject",
+            "comparable_truth_score",
+            "final_score",
+            "minute_annualized_return",
+            "minute_max_drawdown",
+            "minute_turnover",
+            "availability_burden",
+            "minute_average_gross_exposure",
+            "minute_realized_volatility",
+            "session_average_gross_exposure",
+            "session_realized_volatility",
+        ],
+        "frontier_scores",
+    )
+    live_mask = _strict_live_mask(scores, config)
+    if scores["cross_universe_reject"].isna().any():
+        raise Module6ValidationError("frontier selection cross_universe_reject contains missing values")
     eligible_scores = scores.loc[
-        (~scores["cross_universe_reject"].fillna(False).astype(bool)) & live_mask
+        (~scores["cross_universe_reject"].astype(bool)) & live_mask
     ].copy()
     if eligible_scores.shape[0] <= 0:
         raise Module6ValidationError("NO_COMPARABLE_FINALISTS_SURVIVED")
     risk_return = pareto_frontier(eligible_scores, maximize=["minute_annualized_return"], minimize=["minute_max_drawdown"])
     operational = pareto_frontier(
         eligible_scores,
-        maximize=["headroom"] if "headroom" in eligible_scores.columns else [],
+        maximize=["minute_average_gross_exposure"],
         minimize=["minute_turnover", "availability_burden"],
     )
     global_frontier = pareto_frontier(
         eligible_scores,
-        maximize=["final_score", "minute_annualized_return"],
+        maximize=["final_score", "minute_annualized_return", "minute_average_gross_exposure"],
         minimize=["minute_max_drawdown", "minute_turnover", "availability_burden"],
     )
     weight_map = {
