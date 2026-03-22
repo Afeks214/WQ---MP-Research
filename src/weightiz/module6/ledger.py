@@ -451,16 +451,25 @@ def enrich_strategy_instance_master_from_session_ledger(
         on="strategy_instance_pk",
         how="left",
     )
-    fill_defaults: dict[str, object] = {
-        "availability_ratio": 0.0,
-        "observed_session_count": 0,
-        "first_session_id": -1,
-        "last_session_id": -1,
-        "max_gap_sessions": 0,
-        "contiguous_support_ok": False,
-    }
-    for col, default in fill_defaults.items():
-        enriched[col] = enriched[col].fillna(default)
+    required_stats = [
+        "availability_ratio",
+        "observed_session_count",
+        "first_session_id",
+        "last_session_id",
+        "max_gap_sessions",
+        "contiguous_support_ok",
+    ]
+    missing_mask = enriched[required_stats].isna().any(axis=1)
+    if bool(missing_mask.any()):
+        sample = (
+            enriched.loc[missing_mask, ["strategy_instance_pk"] + required_stats]
+            .head(5)
+            .to_dict("records")
+        )
+        raise Module6ValidationError(
+            "strategy_instance_master missing session-ledger enrichment rows: "
+            + json.dumps(sample, sort_keys=True)
+        )
     return enriched.sort_values(["strategy_instance_pk"], kind="mergesort").reset_index(drop=True)
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import numpy as np
 import pandas as pd
 
 from weightiz.module6.io import load_module5_run
@@ -145,3 +146,69 @@ def test_session_simulator_costs_hit_floor_from_starting_capital(tmp_path):
     assert int(art.portfolio_summary["disable_flag"].iloc[0]) == 1
     assert float(art.session_paths["session_start_equity"].iloc[0]) == 2000.0
     assert float(art.session_paths["equity"].iloc[0]) < float(cfg.simulator.account_disable_equity)
+
+
+def test_session_simulator_rebalances_after_current_session_returns_without_lookahead():
+    base_cfg = make_test_config()
+    cfg = replace(
+        base_cfg,
+        simulator=replace(
+            base_cfg.simulator,
+            fixed_fee=0.0,
+            linear_cost_bps=0.0,
+            slippage_cost_bps=0.0,
+        ),
+    )
+    portfolio_candidates = pd.DataFrame(
+        {
+            "portfolio_pk": ["p0"],
+            "reduced_universe_id": ["ru0"],
+            "cash_weight": [0.10],
+            "rebalance_policy": ["daily_close"],
+        }
+    )
+    portfolio_weights = pd.DataFrame(
+        {
+            "portfolio_pk": ["p0"],
+            "strategy_instance_pk": ["s0"],
+            "target_weight": [0.90],
+        }
+    )
+    strategy_frame = pd.DataFrame(
+        {
+            "strategy_instance_pk": ["s0"],
+            "column_idx": [0],
+            "cluster_id": [0],
+            "family_id": ["f0"],
+            "robustness_score": [1.0],
+        }
+    )
+    matrices = {
+        "R_exec": np.asarray([[0.10], [0.0]], dtype=np.float64),
+        "A": np.asarray([[True], [True]], dtype=bool),
+        "U": np.asarray([[999.0], [999.0]], dtype=np.float64),
+        "state_codes": np.asarray([[1], [1]], dtype=np.int16),
+        "gross_peak": np.asarray([[10.0], [10.0]], dtype=np.float64),
+        "buying_power_min": np.asarray([[1.0], [1.0]], dtype=np.float64),
+        "overnight_flag": np.asarray([[0], [0]], dtype=np.int8),
+    }
+    calendar = pd.DataFrame({"session_id": [1, 2], "is_monday_close": [0, 0]})
+    art = simulate_session_batch(
+        portfolio_candidates=portfolio_candidates,
+        portfolio_weights=portfolio_weights,
+        strategy_frame=strategy_frame,
+        matrices=matrices,
+        calendar=calendar,
+        config=cfg,
+        return_weight_history=True,
+    )
+    first_session = art.session_paths.sort_values(["session_id"], kind="mergesort").iloc[0]
+    second_weight = (
+        art.weight_history.sort_values(["session_id"], kind="mergesort")
+        .loc[:, ["session_id", "end_weight"]]
+        .iloc[1]
+    )
+    expected_first_equity = float(cfg.simulator.starting_capital * (1.0 + 0.90 * 0.10))
+    assert abs(float(first_session["equity"]) - expected_first_equity) < 1.0e-9
+    assert float(first_session["gross_exposure_mult"]) <= float(cfg.simulator.intraday_leverage_max)
+    assert float(second_weight["end_weight"]) < 0.90

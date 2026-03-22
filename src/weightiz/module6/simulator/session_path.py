@@ -16,7 +16,7 @@ from weightiz.module6.constants import (
     AVAIL_STRUCTURALLY_MISSING,
 )
 from weightiz.module6.constraints import check_path_constraints, project_to_feasible_weights
-from weightiz.module6.utils import Module6ValidationError
+from weightiz.module6.utils import Module6ValidationError, annualized_volatility
 
 
 @dataclass(frozen=True)
@@ -83,19 +83,30 @@ def simulate_session_batch(
     priority_map = dict(strategy_frame[["strategy_instance_pk", "robustness_score"]].itertuples(index=False, name=None))
     r_exec = np.asarray(matrices["R_exec"], dtype=np.float64)
     a = np.asarray(matrices["A"], dtype=bool)
-    u = np.asarray(matrices["U"], dtype=np.float64)
     state_codes = np.asarray(matrices["state_codes"], dtype=np.int16)
     gross_peak = np.asarray(matrices["gross_peak"], dtype=np.float64)
     buying_power_min = np.asarray(matrices["buying_power_min"], dtype=np.float64)
     overnight = np.asarray(matrices["overnight_flag"], dtype=np.int8)
     if isinstance(calendar, pd.DataFrame):
-        calendar_df = calendar[["session_id", "is_monday_close"]].copy()
+        if "session_id" not in calendar.columns:
+            raise Module6ValidationError("calendar is missing session_id")
+        calendar_df = calendar.copy()
+        if "is_monday_close" not in calendar_df.columns:
+            if portfolio_candidates["rebalance_policy"].astype(str).eq("weekly_monday_close").any():
+                raise Module6ValidationError(
+                    "weekly_monday_close requires calendar is_monday_close semantics"
+                )
+            calendar_df["is_monday_close"] = 0
+        if calendar_df["is_monday_close"].isna().any():
+            raise Module6ValidationError("calendar is_monday_close contains missing values")
+        calendar_df = calendar_df[["session_id", "is_monday_close"]].copy()
     else:
+        if portfolio_candidates["rebalance_policy"].astype(str).eq("weekly_monday_close").any():
+            raise Module6ValidationError("weekly_monday_close requires calendar is_monday_close semantics")
         calendar_df = pd.DataFrame({"session_id": np.asarray(calendar, dtype=np.int64)})
-    if "is_monday_close" not in calendar_df.columns:
         calendar_df["is_monday_close"] = 0
     calendar_df["session_id"] = calendar_df["session_id"].astype(np.int64)
-    calendar_df["is_monday_close"] = calendar_df["is_monday_close"].fillna(0).astype(np.int8)
+    calendar_df["is_monday_close"] = calendar_df["is_monday_close"].astype(np.int8)
     session_rows: list[dict[str, Any]] = []
     summary_rows: list[dict[str, Any]] = []
     weight_rows: list[dict[str, Any]] = []
@@ -126,6 +137,7 @@ def simulate_session_batch(
         total_forced_cash = 0.0
         total_missing = 0.0
         path_returns: list[float] = []
+        gross_history: list[float] = []
         for t_idx, cal_row in enumerate(calendar_df.itertuples(index=False)):
             session_id = int(cal_row.session_id)
             session_meta = {"is_monday_close": int(cal_row.is_monday_close)}
@@ -196,11 +208,10 @@ def simulate_session_batch(
                         path_state_codes,
                     )
                     turnover = float(0.5 * np.sum(np.abs(drift - projected_weights)))
-                    liquidity_penalty = 1.0 + float(np.sum(np.asarray(u[t_idx, cols], dtype=np.float64) * np.maximum(drift, 0.0)))
                     cost_abs = (
                         float(config.simulator.fixed_fee) * float(turnover > 0.0)
                         + float(config.simulator.linear_cost_bps) * 1.0e-4 * turnover * pre_cost_equity
-                        + float(config.simulator.slippage_cost_bps) * 1.0e-4 * turnover * pre_cost_equity * liquidity_penalty
+                        + float(config.simulator.slippage_cost_bps) * 1.0e-4 * turnover * pre_cost_equity
                     )
                     cost_frac = float(cost_abs / max(pre_cost_equity, 1.0e-12))
             else:
@@ -250,6 +261,7 @@ def simulate_session_batch(
             total_forced_cash += forced_cash_weight
             total_missing += missing_weight
             path_returns.append(session_return)
+            gross_history.append(float(gross_exposure_mult))
             session_rows.append(
                 {
                     "portfolio_pk": str(candidate.portfolio_pk),
@@ -307,6 +319,16 @@ def simulate_session_batch(
                     )
             day_start_equity = float(equity)
         ann_return = float(np.mean(path_returns) * 252.0) if path_returns else 0.0
+        realized_volatility = (
+            float(
+                annualized_volatility(
+                    np.asarray(path_returns, dtype=np.float64),
+                    label=f"session_path.realized_volatility[{candidate.portfolio_pk}]",
+                )
+            )
+            if path_returns
+            else 0.0
+        )
         max_dd = float(max(row["drawdown"] for row in session_rows if row["portfolio_pk"] == str(candidate.portfolio_pk))) if path_returns else 0.0
         summary_rows.append(
             {
@@ -315,7 +337,9 @@ def simulate_session_batch(
                 "starting_equity": float(start_equity),
                 "final_equity": float(equity),
                 "annualized_return": float(ann_return),
+                "realized_volatility": float(realized_volatility),
                 "max_drawdown": float(max_dd),
+                "average_gross_exposure": float(np.mean(np.asarray(gross_history, dtype=np.float64))) if gross_history else 0.0,
                 "turnover": float(total_turnover / max(calendar_df.shape[0], 1)),
                 "forced_cash_burden": float(total_forced_cash / max(calendar_df.shape[0], 1)),
                 "missingness_burden": float(total_missing / max(calendar_df.shape[0], 1)),

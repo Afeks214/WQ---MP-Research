@@ -8,7 +8,7 @@ import pandas as pd
 from weightiz.module6.config import Module6Config
 from weightiz.module6.constraints import apply_long_only_weight_caps
 from weightiz.module6.types import ReducedUniverseSpec
-from weightiz.module6.utils import portfolio_pk, target_weights_hash
+from weightiz.module6.utils import Module6ValidationError, portfolio_pk, require_numeric_series, target_weights_hash
 
 
 def generate_cluster_balanced_batch(
@@ -44,7 +44,16 @@ def generate_cluster_balanced_batch(
             grp = grouped[int(cluster_id)]
             pick_count = min(max(1, int(rng.integers(1, 3))), grp.shape[0])
             chosen = grp.head(pick_count)
-            local_raw = np.asarray([1.0 / max(float(x), 1.0e-6) for x in chosen["avg_turnover_metrics"].fillna(0.0).astype(float).tolist()], dtype=np.float64)
+            turnover_values = require_numeric_series(
+                chosen["avg_turnover_metrics"],
+                label=f"cluster_balanced.avg_turnover_metrics[{cluster_id}]",
+            ).to_numpy(dtype=np.float64, copy=False)
+            if np.any(turnover_values < 0.0):
+                raise Module6ValidationError("cluster_balanced received negative avg_turnover_metrics")
+            local_raw = np.asarray(
+                [1.0 / max(float(x), 1.0e-6) for x in turnover_values.tolist()],
+                dtype=np.float64,
+            )
             if np.sum(local_raw) <= 0.0:
                 local_raw = np.ones(pick_count, dtype=np.float64)
             local_raw = local_raw / np.sum(local_raw)

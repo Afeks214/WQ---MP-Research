@@ -8,7 +8,7 @@ import pandas as pd
 from scipy.stats import spearmanr
 
 from weightiz.module6.config import Module6Config
-from weightiz.module6.utils import Module6ValidationError
+from weightiz.module6.utils import Module6ValidationError, annualized_volatility
 
 
 @dataclass(frozen=True)
@@ -112,6 +112,7 @@ def replay_finalists_minute(
         disable = False
         portfolio_session_returns: list[float] = []
         portfolio_session_turnover: list[float] = []
+        portfolio_gross_samples: list[float] = []
         for session_row in path_df.sort_values("session_id", kind="mergesort").itertuples(index=False):
             session_detail = detail.loc[detail["session_id"] == int(session_row.session_id)].copy()
             if session_detail.shape[0] <= 0:
@@ -258,6 +259,7 @@ def replay_finalists_minute(
                         "disable_flag": int(disable),
                     }
                 )
+                portfolio_gross_samples.append(float(gross_total / max(portfolio_equity, 1.0e-12)))
                 if flattened:
                     for kk in range(k + 1, len(times)):
                         minute_rows.append(
@@ -274,6 +276,7 @@ def replay_finalists_minute(
                                 "disable_flag": int(disable),
                             }
                         )
+                        portfolio_gross_samples.append(0.0)
                     equity = float(portfolio_equity)
                     break
             if not flattened:
@@ -287,12 +290,10 @@ def replay_finalists_minute(
                     )
                 )
             )
-            embedded_turnover_frac = float(embedded_trade_notional / max(session_start_equity, 1.0e-12))
-            liquidity_penalty = 1.0 + embedded_turnover_frac
             rebalance_cost_abs = (
                 float(config.simulator.fixed_fee) * float(portfolio_turnover > 0.0)
                 + float(config.simulator.linear_cost_bps) * 1.0e-4 * portfolio_turnover * equity
-                + float(config.simulator.slippage_cost_bps) * 1.0e-4 * portfolio_turnover * equity * liquidity_penalty
+                + float(config.simulator.slippage_cost_bps) * 1.0e-4 * portfolio_turnover * equity
             )
             equity = max(0.0, float(equity - rebalance_cost_abs))
             if equity < float(config.simulator.account_disable_equity):
@@ -303,15 +304,27 @@ def replay_finalists_minute(
         minute_score = float(np.mean(portfolio_session_returns) * 252.0 - max((1.0 - equity / max(peak, 1.0e-12)), 0.0))
         max_dd = float(max((row["drawdown"] for row in minute_rows if row["portfolio_pk"] == str(candidate.portfolio_pk)), default=0.0))
         minute_turnover = float(np.mean(portfolio_session_turnover) if portfolio_session_turnover else 0.0)
+        minute_realized_volatility = (
+            float(
+                annualized_volatility(
+                    np.asarray(portfolio_session_returns, dtype=np.float64),
+                    label=f"minute_refine.realized_volatility[{candidate.portfolio_pk}]",
+                )
+            )
+            if portfolio_session_returns
+            else 0.0
+        )
         summary_rows.append(
             {
                 "portfolio_pk": str(candidate.portfolio_pk),
                 "starting_equity": float(start_equity),
                 "minute_score": float(minute_score),
                 "minute_annualized_return": float(np.mean(portfolio_session_returns) * 252.0 if portfolio_session_returns else 0.0),
+                "minute_realized_volatility": float(minute_realized_volatility),
                 "minute_max_drawdown": float(max_dd),
                 "minute_turnover": float(minute_turnover),
                 "minute_gross_exposure_peak": float(gross_peak_seen),
+                "minute_average_gross_exposure": float(np.mean(np.asarray(portfolio_gross_samples, dtype=np.float64))) if portfolio_gross_samples else 0.0,
                 "minute_final_equity": float(equity),
                 "minute_breach_count": int(breach_count),
                 "minute_disable_flag": int(disable),

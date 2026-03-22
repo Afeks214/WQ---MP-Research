@@ -213,20 +213,30 @@ def build_matrix_store(
     )
     sparse.save_npz(out_dir / "family_incidence.npz", family_incidence)
 
-    benchmark_daily = None
-    if run.paths.daily_returns and run.paths.daily_returns.exists():
-        daily_df = pd.read_parquet(run.paths.daily_returns)
-        if "benchmark" in daily_df.columns:
-            benchmark_daily = (
-                daily_df[["session_id", "benchmark"]]
-                .drop_duplicates("session_id", keep="last")
-                .sort_values("session_id", kind="mergesort")
-            )
-    if benchmark_daily is None:
-        benchmark_daily = pd.DataFrame({"session_id": calendar, "benchmark": np.zeros(T, dtype=np.float64)})
+    if not run.paths.daily_returns or not run.paths.daily_returns.exists():
+        raise Module6ValidationError("daily_returns.parquet is required for benchmark regime exposure")
+    daily_df = pd.read_parquet(run.paths.daily_returns)
+    if "benchmark" not in daily_df.columns:
+        raise Module6ValidationError("daily_returns.parquet missing benchmark column")
+    benchmark_daily = (
+        daily_df[["session_id", "benchmark"]]
+        .drop_duplicates("session_id", keep="last")
+        .sort_values("session_id", kind="mergesort")
+    )
+    if benchmark_daily["benchmark"].isna().any():
+        raise Module6ValidationError("daily_returns benchmark contains missing values")
     benchmark_map = {int(s): float(v) for s, v in benchmark_daily[["session_id", "benchmark"]].itertuples(index=False, name=None)}
-    benchmark_series = np.asarray([benchmark_map.get(int(s), 0.0) for s in calendar.tolist()], dtype=np.float64)
-    rolling_vol = pd.Series(benchmark_series).rolling(5, min_periods=1).std(ddof=0).fillna(0.0).to_numpy(dtype=np.float64)
+    missing_sessions = [int(s) for s in calendar.tolist() if int(s) not in benchmark_map]
+    if missing_sessions:
+        raise Module6ValidationError(
+            "benchmark series missing calendar sessions: " + ",".join(str(s) for s in missing_sessions[:10])
+        )
+    benchmark_series = np.asarray([benchmark_map[int(s)] for s in calendar.tolist()], dtype=np.float64)
+    if not np.isfinite(benchmark_series).all():
+        raise Module6ValidationError("benchmark series contains non-finite values")
+    rolling_vol = pd.Series(benchmark_series).rolling(5, min_periods=1).std(ddof=0).to_numpy(dtype=np.float64)
+    if not np.isfinite(rolling_vol).all():
+        raise Module6ValidationError("benchmark rolling volatility contains non-finite values")
     vol_cut = float(np.median(rolling_vol))
     regime_idx = (
         (benchmark_series > 0.0).astype(np.int64) * 2
