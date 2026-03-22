@@ -19,7 +19,14 @@ from weightiz.module6.config import (
 )
 from weightiz.module6.execution_overlap import build_execution_overlap_proxy
 from weightiz.module6.types import ReducedUniverseSpec
-from weightiz.module6.utils import Module6ValidationError, ensure_directory, stable_sha256_parts
+from weightiz.module6.utils import (
+    Module6ValidationError,
+    annualized_sharpe,
+    ensure_directory,
+    require_columns,
+    require_numeric_series,
+    stable_sha256_parts,
+)
 
 
 @dataclass(frozen=True)
@@ -83,6 +90,120 @@ def _instance_key_series(frame: pd.DataFrame, cols: list[str]) -> pd.Series:
     vals = frame.loc[:, cols].astype(str).to_numpy(dtype=object, copy=False)
     joined = ["|".join(str(part) for part in row.tolist()) for row in vals]
     return pd.Series(joined, index=frame.index, dtype=object)
+
+
+def _write_reduction_diagnostics(*, output_dir: Path, payload: dict[str, Any]) -> Path:
+    diagnostics_dir = ensure_directory(output_dir / "diagnostics")
+    path = diagnostics_dir / "module6_reduction_diagnostics.json"
+    path.write_text(
+        json.dumps(_sanitize_json_value(payload), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _strict_numeric_column(frame: pd.DataFrame, column: str, *, integer: bool = False) -> pd.Series:
+    if column not in frame.columns:
+        raise Module6ValidationError(f"reduction missing required column: {column}")
+    return require_numeric_series(frame[column], label=f"reduction.{column}", integer=integer)
+
+
+def _estimate_break_even_friction_bps(points: list[tuple[float, float]]) -> float:
+    ordered = sorted(points, key=lambda item: float(item[0]))
+    positive = [bps for bps, sharpe in ordered if float(sharpe) > 0.0]
+    if not positive:
+        return 0.0
+    best = float(max(positive))
+    for (bps_left, sharpe_left), (bps_right, sharpe_right) in zip(ordered[:-1], ordered[1:]):
+        left = float(sharpe_left)
+        right = float(sharpe_right)
+        if left > 0.0 >= right:
+            width = float(bps_right) - float(bps_left)
+            if abs(right - left) <= 1.0e-12:
+                return float(bps_left)
+            frac = left / max(left - right, 1.0e-12)
+            return float(bps_left + np.clip(frac, 0.0, 1.0) * width)
+    return best
+
+
+def _build_friction_gate_frame(
+    *,
+    strategy_master: pd.DataFrame,
+    session_ledger: pd.DataFrame,
+    config: Module6Config,
+) -> pd.DataFrame:
+    require_columns(
+        session_ledger,
+        ["strategy_pk", "return_exec", "session_turnover"],
+        "strategy_session_ledger",
+    )
+    curve_bps = sorted({float(x) for x in tuple(config.reduction.friction_curve_bps)})
+    if any(float(x) < 0.0 for x in curve_bps):
+        raise Module6ValidationError("module6.reduction.friction_curve_bps must be non-negative")
+    if not curve_bps:
+        raise Module6ValidationError("module6.reduction.friction_curve_bps must be non-empty")
+    conservative_bps = float(config.reduction.conservative_friction_bps)
+    if conservative_bps < 0.0:
+        raise Module6ValidationError("module6.reduction.conservative_friction_bps must be non-negative")
+    rows: list[dict[str, Any]] = []
+    for strategy_pk, grp in session_ledger.groupby("strategy_pk", dropna=False, sort=True):
+        returns = require_numeric_series(
+            grp["return_exec"],
+            label=f"reduction.return_exec[{strategy_pk}]",
+        ).to_numpy(dtype=np.float64, copy=False)
+        turnover = require_numeric_series(
+            grp["session_turnover"],
+            label=f"reduction.session_turnover[{strategy_pk}]",
+        ).to_numpy(dtype=np.float64, copy=False)
+        if np.any(turnover < 0.0):
+            raise Module6ValidationError(
+                f"reduction.session_turnover[{strategy_pk}] contains negative values"
+            )
+        curve_points: list[tuple[float, float]] = []
+        for bps in curve_bps:
+            stressed = returns - turnover * float(bps) * 1.0e-4
+            curve_points.append(
+                (
+                    float(bps),
+                    float(
+                        annualized_sharpe(
+                            stressed,
+                            label=f"reduction.friction_sharpe[{strategy_pk}][{bps:.4f}bps]",
+                        )
+                    ),
+                )
+            )
+        conservative_returns = returns - turnover * conservative_bps * 1.0e-4
+        conservative_net_sharpe = float(
+            annualized_sharpe(
+                conservative_returns,
+                label=f"reduction.conservative_net_sharpe[{strategy_pk}]",
+            )
+        )
+        reject = conservative_net_sharpe <= float(config.reduction.min_conservative_net_sharpe)
+        rows.append(
+            {
+                "strategy_pk": str(strategy_pk),
+                "friction_curve_bps": [float(bps) for bps, _ in curve_points],
+                "friction_curve_net_sharpe": [float(sharpe) for _, sharpe in curve_points],
+                "friction_break_even_bps": float(_estimate_break_even_friction_bps(curve_points)),
+                "friction_conservative_bps": float(conservative_bps),
+                "friction_conservative_net_sharpe": float(conservative_net_sharpe),
+                "friction_gate_reject": bool(reject),
+            }
+        )
+    friction = pd.DataFrame(rows)
+    merged = strategy_master[["strategy_pk"]].merge(
+        friction,
+        on="strategy_pk",
+        how="left",
+    )
+    if merged["friction_gate_reject"].isna().any():
+        missing = merged.loc[merged["friction_gate_reject"].isna(), "strategy_pk"].astype(str).tolist()
+        raise Module6ValidationError(
+            "reduction friction gate missing strategy stats: " + ",".join(sorted(missing[:10]))
+        )
+    return merged
 
 
 def _standardize_columns(matrix: np.ndarray) -> np.ndarray:
@@ -219,13 +340,25 @@ def reduce_universe(
             "strategy_master policy class mismatch for reduction intake: "
             f"configured={intake_policy_class} observed={sorted(observed_policy_classes)}"
         )
+    friction_gate = _build_friction_gate_frame(
+        strategy_master=strategy_master,
+        session_ledger=session_ledger,
+        config=config,
+    )
+    strategy_master = strategy_master.merge(
+        friction_gate,
+        on="strategy_pk",
+        how="left",
+    )
+    if strategy_master["friction_gate_reject"].isna().any():
+        raise Module6ValidationError("reduction friction gate merge produced missing rows")
     reject_gate = (
         ~strategy_master["reject"].fillna(False).astype(bool)
         if str(intake_policy_class) == "standard"
         else pd.Series(True, index=strategy_master.index, dtype=bool)
     )
     reject_gate_active = str(intake_policy_class) == "standard"
-    availability_ratio = pd.to_numeric(strategy_master["availability_ratio"], errors="coerce").fillna(0.0)
+    availability_ratio = _strict_numeric_column(strategy_master, "availability_ratio")
     availability_ratio_below_threshold = availability_ratio < float(min_availability_ratio)
     effective_availability_ratio_gate_mode = str(availability_ratio_gate_mode)
     if effective_availability_ratio_gate_mode == MODULE6_AVAILABILITY_RATIO_GATE_MODE_HARD:
@@ -244,8 +377,13 @@ def reduce_universe(
         if effective_availability_ratio_gate_mode == MODULE6_AVAILABILITY_RATIO_GATE_MODE_WARN
         else 0
     )
-    observed_session_count = pd.to_numeric(strategy_master["observed_session_count"], errors="coerce").fillna(0).astype(int)
-    avg_turnover_metrics = pd.to_numeric(strategy_master["avg_turnover_metrics"], errors="coerce").fillna(0.0)
+    observed_session_count = _strict_numeric_column(
+        strategy_master,
+        "observed_session_count",
+        integer=True,
+    )
+    avg_turnover_metrics = _strict_numeric_column(strategy_master, "avg_turnover_metrics")
+    friction_gate_mask = ~strategy_master["friction_gate_reject"].astype(bool)
     gate_sequence: list[tuple[str, pd.Series, bool]] = [
         ("portfolio_admit_flag_gate", strategy_master["portfolio_admit_flag"].astype(bool), True),
         ("failed_status_gate", ~strategy_master["failed"].fillna(False).astype(bool), True),
@@ -257,6 +395,7 @@ def reduce_universe(
         ),
         ("observed_session_count_gate", observed_session_count >= int(min_observed_sessions), True),
         ("turnover_sanity_gate", avg_turnover_metrics >= 0.0, True),
+        ("break_even_friction_gate", friction_gate_mask, True),
     ]
     cumulative_gate_mask = pd.Series(True, index=strategy_master.index, dtype=bool)
     gate_rows: list[dict[str, Any]] = []
@@ -297,6 +436,9 @@ def reduce_universe(
                     "availability_ratio_gate_effective_mode": str(effective_availability_ratio_gate_mode),
                     "availability_ratio_warning_count": int(availability_ratio_warning_count),
                     "reject_gate_active": bool(reject_gate_active),
+                    "friction_curve_bps": [float(x) for x in config.reduction.friction_curve_bps],
+                    "conservative_friction_bps": float(config.reduction.conservative_friction_bps),
+                    "min_conservative_net_sharpe": float(config.reduction.min_conservative_net_sharpe),
                 },
                 "gates": gate_rows,
                 "metric_summary": {
@@ -304,6 +446,10 @@ def reduce_universe(
                     "availability_ratio_warning_count": int(availability_ratio_warning_count),
                     "observed_session_count": _summarize_numeric(observed_session_count, as_int=True),
                     "avg_turnover_metrics": _summarize_numeric(avg_turnover_metrics),
+                    "friction_conservative_net_sharpe": _summarize_numeric(
+                        strategy_master["friction_conservative_net_sharpe"]
+                    ),
+                    "friction_gate_reject_count": int(strategy_master["friction_gate_reject"].astype(bool).sum()),
                 },
             },
         )
@@ -314,6 +460,23 @@ def reduce_universe(
     canonical_instances = canonical_instances.loc[
         canonical_instances["strategy_pk"].isin(admitted["strategy_pk"])
     ].sort_values(["strategy_instance_pk"], kind="mergesort")
+    canonical_instances = canonical_instances.merge(
+        admitted[
+            [
+                "strategy_pk",
+                "friction_curve_bps",
+                "friction_curve_net_sharpe",
+                "friction_break_even_bps",
+                "friction_conservative_bps",
+                "friction_conservative_net_sharpe",
+                "friction_gate_reject",
+            ]
+        ].drop_duplicates("strategy_pk", keep="first"),
+        on="strategy_pk",
+        how="left",
+    )
+    if canonical_instances["friction_gate_reject"].isna().any():
+        raise Module6ValidationError("reduction admitted instances missing friction gate diagnostics")
     column_index = pd.DataFrame(matrices["column_index"]).copy() if "column_index" in matrices else None
     if column_index is None:
         raise Module6ValidationError("matrix column_index missing from reduction inputs")
@@ -537,6 +700,25 @@ def reduce_universe(
             "metadata": [mv_spec.metadata],
         }
     ).to_parquet(out_dir / "reduced_universe_mv_000.parquet", index=False)
+    _write_reduction_diagnostics(
+        output_dir=Path(output_dir),
+        payload={
+            "diagnostic_schema_version": "module6_reduction_diagnostics_v1",
+            "stage": "reduction",
+            "friction_curve_bps": [float(x) for x in config.reduction.friction_curve_bps],
+            "conservative_friction_bps": float(config.reduction.conservative_friction_bps),
+            "min_conservative_net_sharpe": float(config.reduction.min_conservative_net_sharpe),
+            "friction_gate_rejected_strategy_count": int(strategy_master["friction_gate_reject"].astype(bool).sum()),
+            "friction_gate_survivor_strategy_count": int((~strategy_master["friction_gate_reject"].astype(bool)).sum()),
+            "pre_reduction_admitted_strategy_count": int(admitted.shape[0]),
+            "reduced_universe_strategy_count": int(len(reduced_final)),
+            "mv_universe_strategy_count": int(len(mv_final)),
+            "friction_reject_samples": strategy_master.loc[
+                strategy_master["friction_gate_reject"].astype(bool),
+                ["strategy_id", "strategy_pk", "friction_conservative_net_sharpe", "friction_break_even_bps"],
+            ].head(10).to_dict("records"),
+        },
+    )
     return ReductionArtifacts(
         admitted_instances=canonical_instances,
         cluster_membership=membership_df,

@@ -14,7 +14,7 @@ from weightiz.module6.utils import Module6ValidationError
 from tests.module6_testkit import build_synthetic_module5_run, make_test_config
 
 
-def test_reduction_collapses_duplicates_and_keeps_hedge(tmp_path):
+def test_reduction_collapses_duplicates_and_rejects_unprofitable_hedge(tmp_path):
     run_dir = build_synthetic_module5_run(tmp_path)
     cfg = make_test_config()
     loaded = load_module5_run(run_dir, cfg)
@@ -27,7 +27,11 @@ def test_reduction_collapses_duplicates_and_keeps_hedge(tmp_path):
     dup = membership.loc[membership["candidate_id"].isin(["cand_000", "cand_001"])]
     assert dup["cluster_id"].nunique() == 1
     retained = membership.loc[membership["retained_in_reduced_universe"].astype(bool), ["candidate_id", "strategy_instance_pk"]]
-    assert "cand_002" in set(retained["candidate_id"].astype(str))
+    retained_candidates = set(retained["candidate_id"].astype(str))
+    assert "cand_002" not in retained_candidates
+    diagnostics = json.loads((run_dir / "reduce_out" / "diagnostics" / "module6_reduction_diagnostics.json").read_text(encoding="utf-8"))
+    assert int(diagnostics["friction_gate_rejected_strategy_count"]) == 1
+    assert diagnostics["friction_reject_samples"][0]["strategy_id"] == "cand_002"
     assert len(reduction.reduced_universes) >= 2
     assert len(reduction.reduced_universes[0].strategy_instance_pks) <= cfg.reduction.reduced_universe_cap
     assert len(reduction.reduced_universes[1].strategy_instance_pks) <= cfg.reduction.mv_universe_cap
@@ -81,6 +85,7 @@ def test_pre_reduction_fail_closed_writes_intake_gate_diagnostics(tmp_path):
         "availability_ratio_gate",
         "observed_session_count_gate",
         "turnover_sanity_gate",
+        "break_even_friction_gate",
     ]
     assert all(int(row["survivor_count"]) >= 0 for row in diagnostics["gates"])
     assert not (reduce_dir / "reduced_universes" / "reduced_universe_000.parquet").exists()
@@ -226,3 +231,45 @@ def test_matrix_entry_fail_closed_writes_intake_gate_diagnostics(tmp_path):
         "canonical_portfolio_role_gate",
         "portfolio_admit_flag_gate",
     ]
+
+
+def test_break_even_friction_gate_rejects_negative_net_sharpe_strategies(tmp_path):
+    run_dir = build_synthetic_module5_run(tmp_path)
+    base_cfg = make_test_config()
+    cfg = replace(
+        base_cfg,
+        reduction=replace(
+            base_cfg.reduction,
+            conservative_friction_bps=2.0,
+            min_conservative_net_sharpe=0.0,
+        ),
+    )
+    loaded = load_module5_run(run_dir, cfg)
+    ledgers = materialize_canonical_ledgers(loaded, run_dir / "ledgers_friction_gate", cfg)
+    weak_ids = ledgers["strategy_master"]["strategy_id"].astype(str).isin({"cand_002"})
+    ledgers["strategy_master"].loc[weak_ids, "avg_turnover_metrics"] = 20.0
+    weak_pks = ledgers["strategy_master"].loc[weak_ids, "strategy_pk"].astype(str).tolist()
+    weak_instance_pks = ledgers["strategy_instance_master"].loc[
+        ledgers["strategy_instance_master"]["strategy_pk"].astype(str).isin(weak_pks),
+        "strategy_instance_pk",
+    ].astype(str)
+    weak_session_mask = ledgers["strategy_session_ledger"]["strategy_instance_pk"].astype(str).isin(set(weak_instance_pks.tolist()))
+    ledgers["strategy_session_ledger"].loc[weak_session_mask, "session_turnover"] = 20.0
+    store = build_matrix_store(ledgers=ledgers, run=loaded, output_dir=run_dir / "matrix_friction_gate", config=cfg)
+    matrices = open_matrix_store(store)
+    matrices["column_index"] = store.column_index
+    reduction = reduce_universe(
+        ledgers=ledgers,
+        matrices=matrices,
+        run=loaded,
+        output_dir=run_dir / "reduce_friction_gate",
+        config=cfg,
+    )
+    admitted_candidates = set(reduction.admitted_instances["candidate_id"].astype(str))
+    assert "cand_002" not in admitted_candidates
+    diagnostics = json.loads(
+        (run_dir / "reduce_friction_gate" / "diagnostics" / "module6_reduction_diagnostics.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert int(diagnostics["friction_gate_rejected_strategy_count"]) >= 1

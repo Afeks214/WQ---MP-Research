@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
+import pandas as pd
 
 
 class Module6ValidationError(RuntimeError):
@@ -34,6 +35,62 @@ def require_columns(df: Any, required: Iterable[str], artifact_name: str) -> Non
         raise Module6ValidationError(
             f"{artifact_name} missing required columns: {', '.join(sorted(missing))}"
         )
+
+
+def require_numeric_series(
+    values: Any,
+    *,
+    label: str,
+    integer: bool = False,
+) -> pd.Series:
+    series = values if isinstance(values, pd.Series) else pd.Series(values)
+    if series.shape[0] <= 0:
+        return pd.Series([], dtype=np.int64 if integer else np.float64)
+    numeric = pd.to_numeric(series, errors="coerce")
+    arr = numeric.to_numpy(dtype=np.float64, copy=False)
+    bad = ~np.isfinite(arr)
+    if bool(np.any(bad)):
+        sample = series.loc[bad].head(5).tolist()
+        raise Module6ValidationError(
+            f"{label} contains non-finite or missing numeric values; sample={sample}"
+        )
+    return numeric.astype(np.int64 if integer else np.float64)
+
+
+def annualized_volatility(
+    values: Any,
+    *,
+    periods_per_year: float = 252.0,
+    label: str,
+) -> float:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size < 2:
+        raise Module6ValidationError(f"{label} requires at least two observations")
+    if not np.isfinite(arr).all():
+        raise Module6ValidationError(f"{label} contains non-finite observations")
+    return float(np.std(arr, ddof=1) * np.sqrt(float(periods_per_year)))
+
+
+def annualized_sharpe(
+    values: Any,
+    *,
+    periods_per_year: float = 252.0,
+    label: str,
+) -> float:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size < 2:
+        raise Module6ValidationError(f"{label} requires at least two observations")
+    if not np.isfinite(arr).all():
+        raise Module6ValidationError(f"{label} contains non-finite observations")
+    vol = float(np.std(arr, ddof=1))
+    mean = float(np.mean(arr))
+    if vol <= 1.0e-12:
+        if mean > 0.0:
+            return float(np.inf)
+        if mean < 0.0:
+            return float(-np.inf)
+        return 0.0
+    return float(mean / vol * np.sqrt(float(periods_per_year)))
 
 
 def assert_no_duplicates(df: Any, cols: list[str], artifact_name: str) -> None:
