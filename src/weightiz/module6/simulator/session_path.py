@@ -27,10 +27,19 @@ class SessionSimulationArtifacts:
 
 
 def _resolve_starting_equity(config: Module6Config) -> float:
+    starting_capital = float(config.simulator.starting_capital)
     floor = float(config.simulator.account_disable_equity)
+    if not np.isfinite(starting_capital):
+        raise Module6ValidationError("module6.simulator.starting_capital must be finite")
     if not np.isfinite(floor):
         raise Module6ValidationError("module6.simulator.account_disable_equity must be finite")
-    return float(max(floor, 1.0))
+    if starting_capital <= 0.0:
+        raise Module6ValidationError("module6.simulator.starting_capital must be > 0")
+    if starting_capital <= floor:
+        raise Module6ValidationError(
+            "module6.simulator.starting_capital must exceed account_disable_equity"
+        )
+    return float(starting_capital)
 
 
 def _policy_rebalance_due(
@@ -246,6 +255,8 @@ def simulate_session_batch(
                     "portfolio_pk": str(candidate.portfolio_pk),
                     "reduced_universe_id": str(candidate.reduced_universe_id),
                     "session_id": int(session_id),
+                    "starting_equity": float(start_equity),
+                    "session_start_equity": float(day_start_equity),
                     "session_return": float(session_return),
                     "equity": float(equity),
                     "drawdown": float(drawdown),
@@ -301,6 +312,7 @@ def simulate_session_batch(
             {
                 "portfolio_pk": str(candidate.portfolio_pk),
                 "reduced_universe_id": str(candidate.reduced_universe_id),
+                "starting_equity": float(start_equity),
                 "final_equity": float(equity),
                 "annualized_return": float(ann_return),
                 "max_drawdown": float(max_dd),

@@ -20,10 +20,19 @@ class MinuteReplayArtifacts:
 
 
 def _resolve_starting_equity(config: Module6Config) -> float:
+    starting_capital = float(config.simulator.starting_capital)
     floor = float(config.simulator.account_disable_equity)
+    if not np.isfinite(starting_capital):
+        raise Module6ValidationError("module6.simulator.starting_capital must be finite")
     if not np.isfinite(floor):
         raise Module6ValidationError("module6.simulator.account_disable_equity must be finite")
-    return float(max(floor, 1.0))
+    if starting_capital <= 0.0:
+        raise Module6ValidationError("module6.simulator.starting_capital must be > 0")
+    if starting_capital <= floor:
+        raise Module6ValidationError(
+            "module6.simulator.starting_capital must exceed account_disable_equity"
+        )
+    return float(starting_capital)
 
 
 def replay_finalists_minute(
@@ -241,6 +250,8 @@ def replay_finalists_minute(
                         "reduced_universe_id": str(candidate.reduced_universe_id),
                         "ts_ns": int(ts_ns),
                         "session_id": int(session_row.session_id),
+                        "starting_equity": float(start_equity),
+                        "session_start_equity": float(session_start_equity),
                         "equity": float(portfolio_equity),
                         "drawdown": float(dd),
                         "gross_exposure_mult": float(gross_total / max(portfolio_equity, 1.0e-12)),
@@ -255,6 +266,8 @@ def replay_finalists_minute(
                                 "reduced_universe_id": str(candidate.reduced_universe_id),
                                 "ts_ns": int(times[kk]),
                                 "session_id": int(session_row.session_id),
+                                "starting_equity": float(start_equity),
+                                "session_start_equity": float(session_start_equity),
                                 "equity": float(portfolio_equity),
                                 "drawdown": float(dd),
                                 "gross_exposure_mult": 0.0,
@@ -282,6 +295,9 @@ def replay_finalists_minute(
                 + float(config.simulator.slippage_cost_bps) * 1.0e-4 * portfolio_turnover * equity * liquidity_penalty
             )
             equity = max(0.0, float(equity - rebalance_cost_abs))
+            if equity < float(config.simulator.account_disable_equity):
+                breach_count += 1
+                disable = True
             portfolio_session_returns.append(float(equity / max(session_start_equity, 1.0e-12) - 1.0))
             portfolio_session_turnover.append(float(portfolio_turnover))
         minute_score = float(np.mean(portfolio_session_returns) * 252.0 - max((1.0 - equity / max(peak, 1.0e-12)), 0.0))
@@ -290,6 +306,7 @@ def replay_finalists_minute(
         summary_rows.append(
             {
                 "portfolio_pk": str(candidate.portfolio_pk),
+                "starting_equity": float(start_equity),
                 "minute_score": float(minute_score),
                 "minute_annualized_return": float(np.mean(portfolio_session_returns) * 252.0 if portfolio_session_returns else 0.0),
                 "minute_max_drawdown": float(max_dd),
@@ -297,6 +314,7 @@ def replay_finalists_minute(
                 "minute_gross_exposure_peak": float(gross_peak_seen),
                 "minute_final_equity": float(equity),
                 "minute_breach_count": int(breach_count),
+                "minute_disable_flag": int(disable),
             }
         )
 
@@ -307,6 +325,8 @@ def replay_finalists_minute(
     session_to_map = dict(session_summary[["portfolio_pk", "turnover"]].itertuples(index=False, name=None))
     session_gross_map = dict(session_summary[["portfolio_pk", "gross_exposure_peak"]].itertuples(index=False, name=None)) if "gross_exposure_peak" in session_summary.columns else {str(row.portfolio_pk): 0.0 for row in session_summary.itertuples(index=False)}
     session_breach_map = dict(session_summary[["portfolio_pk", "breach_count"]].itertuples(index=False, name=None))
+    session_disable_map = dict(session_summary[["portfolio_pk", "disable_flag"]].itertuples(index=False, name=None)) if "disable_flag" in session_summary.columns else {str(row.portfolio_pk): 0 for row in session_summary.itertuples(index=False)}
+    session_starting_equity_map = dict(session_summary[["portfolio_pk", "starting_equity"]].itertuples(index=False, name=None)) if "starting_equity" in session_summary.columns else {str(row.portfolio_pk): float(start_equity) for row in session_summary.itertuples(index=False)}
 
     minute_summary["session_first_pass_score"] = minute_summary["portfolio_pk"].map(lambda x: float(session_score_map.get(str(x), 0.0)))
     minute_summary["session_annualized_return"] = minute_summary["portfolio_pk"].map(lambda x: float(session_return_map.get(str(x), 0.0)))
@@ -314,6 +334,8 @@ def replay_finalists_minute(
     minute_summary["session_turnover"] = minute_summary["portfolio_pk"].map(lambda x: float(session_to_map.get(str(x), 0.0)))
     minute_summary["session_gross_exposure_peak"] = minute_summary["portfolio_pk"].map(lambda x: float(session_gross_map.get(str(x), 0.0)))
     minute_summary["session_breach_count"] = minute_summary["portfolio_pk"].map(lambda x: int(session_breach_map.get(str(x), 0)))
+    minute_summary["session_disable_flag"] = minute_summary["portfolio_pk"].map(lambda x: int(session_disable_map.get(str(x), 0)))
+    minute_summary["session_starting_equity"] = minute_summary["portfolio_pk"].map(lambda x: float(session_starting_equity_map.get(str(x), start_equity)))
     minute_summary["session_score"] = minute_summary["session_annualized_return"] - np.maximum(
         minute_summary["session_max_drawdown"],
         0.0,

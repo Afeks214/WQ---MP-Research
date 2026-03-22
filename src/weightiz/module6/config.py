@@ -156,6 +156,7 @@ class GeneratorConfig:
 
 @dataclass(frozen=True)
 class SimulatorConfig:
+    starting_capital: float = 2000.0
     fixed_fee: float = 0.0
     linear_cost_bps: float = 1.0
     slippage_cost_bps: float = 2.0
