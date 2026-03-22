@@ -229,8 +229,9 @@ def reduce_universe(
     availability_ratio_below_threshold = availability_ratio < float(min_availability_ratio)
     effective_availability_ratio_gate_mode = str(availability_ratio_gate_mode)
     if effective_availability_ratio_gate_mode == MODULE6_AVAILABILITY_RATIO_GATE_MODE_HARD:
-        effective_availability_ratio_gate_mode = MODULE6_AVAILABILITY_RATIO_GATE_MODE_WARN
-    if effective_availability_ratio_gate_mode == MODULE6_AVAILABILITY_RATIO_GATE_MODE_WARN:
+        availability_ratio_gate_mask = availability_ratio >= float(min_availability_ratio)
+        availability_ratio_warning = False
+    elif effective_availability_ratio_gate_mode == MODULE6_AVAILABILITY_RATIO_GATE_MODE_WARN:
         availability_ratio_gate_mask = pd.Series(True, index=strategy_master.index, dtype=bool)
         availability_ratio_warning = bool(availability_ratio_below_threshold.any())
     elif effective_availability_ratio_gate_mode == MODULE6_AVAILABILITY_RATIO_GATE_MODE_OFF:
@@ -252,7 +253,7 @@ def reduce_universe(
         (
             "availability_ratio_gate",
             availability_ratio_gate_mask,
-            False,
+            bool(effective_availability_ratio_gate_mode == MODULE6_AVAILABILITY_RATIO_GATE_MODE_HARD),
         ),
         ("observed_session_count_gate", observed_session_count >= int(min_observed_sessions), True),
         ("turnover_sanity_gate", avg_turnover_metrics >= 0.0, True),

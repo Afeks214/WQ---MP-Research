@@ -22,6 +22,7 @@ _BASE_AVAIL_ALLOWED = {
 }
 
 _SELECTION_STAGE = "module5_bridge_canonical_baseline_v1"
+_CANONICAL_BASELINE_POLICY = "enabled_baseline_common_calendar_median_v2"
 
 
 def _calendar_version(common_sessions: np.ndarray) -> str:
@@ -83,6 +84,66 @@ def _session_payload_map(
     if not isinstance(payload, dict):
         return {}
     return _series_map(payload.get("session_id"), payload.get(field))
+
+
+def _aggregate_float_maps(
+    maps: list[dict[int, float]],
+    *,
+    reducer: str,
+) -> dict[int, float]:
+    bucket: dict[int, list[float]] = {}
+    for mp in maps:
+        for session_id, value in mp.items():
+            bucket.setdefault(int(session_id), []).append(float(value))
+    out: dict[int, float] = {}
+    for session_id, values in bucket.items():
+        arr = np.asarray(values, dtype=np.float64)
+        finite = arr[np.isfinite(arr)]
+        if finite.size <= 0:
+            continue
+        if reducer == "median":
+            out[int(session_id)] = float(np.median(finite))
+        elif reducer == "max":
+            out[int(session_id)] = float(np.max(finite))
+        elif reducer == "min":
+            out[int(session_id)] = float(np.min(finite))
+        elif reducer == "sum":
+            out[int(session_id)] = float(np.sum(finite))
+        else:
+            raise RuntimeError(f"unsupported reducer for module6 bridge map aggregation: {reducer}")
+    return out
+
+
+def _aggregate_int_maps(
+    maps: list[dict[int, int]],
+    *,
+    reducer: str,
+) -> dict[int, int]:
+    float_maps = [{int(k): float(v) for k, v in mp.items()} for mp in maps]
+    reduced = _aggregate_float_maps(float_maps, reducer=reducer)
+    return {int(k): int(round(float(v))) for k, v in reduced.items()}
+
+
+def _aggregate_availability_state_codes(state_maps: list[dict[int, int]]) -> dict[int, int]:
+    observed_active = int(AVAIL_OBSERVED_ACTIVE)
+    observed_flat = int(AVAIL_OBSERVED_FLAT)
+    dq_invalid = int(AVAIL_INVALIDATED_BY_DQ)
+    structural = int(AVAIL_STRUCTURALLY_MISSING)
+    bucket: dict[int, list[int]] = {}
+    for mp in state_maps:
+        for session_id, code in mp.items():
+            bucket.setdefault(int(session_id), []).append(int(code))
+    out: dict[int, int] = {}
+    for session_id, codes in bucket.items():
+        if any(code == observed_active for code in codes):
+            out[int(session_id)] = observed_active
+        elif any(code == observed_flat for code in codes):
+            out[int(session_id)] = observed_flat
+        elif any(code == dq_invalid for code in codes):
+            out[int(session_id)] = dq_invalid
+        else:
+            out[int(session_id)] = structural
+    return out
 
 
 def _turnover_by_session(trade_payload: dict[str, np.ndarray] | None, ts_to_session: dict[int, int], initial_cash: float) -> dict[int, float]:
@@ -308,6 +369,396 @@ def build_module6_bridge_artifacts(
                 f"scenario_id={canonical_reference_scenario_id} status={str(canonical_row.get('status', ''))}"
             )
 
+        canonical_baseline_rows = [
+            r
+            for r in candidate_results
+            if str(r.get("scenario_id", "")) == str(canonical_reference_scenario_id)
+            and str(r.get("status", "")) == "ok"
+        ]
+        if not canonical_baseline_rows:
+            raise RuntimeError(
+                "module6 bridge canonical baseline aggregation requires at least one successful baseline row; "
+                f"candidate_id={candidate_id} scenario_id={canonical_reference_scenario_id}"
+            )
+        canonical_exec_map = _aggregate_float_maps(
+            [
+                _series_map(r.get("session_ids_exec"), r.get("daily_returns_exec"))
+                for r in canonical_baseline_rows
+            ],
+            reducer="median",
+        )
+        canonical_raw_map = _aggregate_float_maps(
+            [
+                _series_map(r.get("session_ids_raw"), r.get("daily_returns_raw"))
+                for r in canonical_baseline_rows
+            ],
+            reducer="median",
+        )
+        canonical_state_map = _aggregate_availability_state_codes(
+            [
+                _state_code_map(
+                    r.get("availability_state_session_ids", r.get("session_ids_exec")),
+                    r.get("availability_state_codes"),
+                )
+                for r in canonical_baseline_rows
+            ]
+        )
+        canonical_turnover = _aggregate_float_maps(
+            [
+                _turnover_by_session(
+                    r.get("trade_payload") if isinstance(r.get("trade_payload"), dict) else None,
+                    {
+                        int(ts): int(sess)
+                        for ts, sess in zip(
+                            np.asarray(
+                                (
+                                    r.get("equity_payload", {}).get("ts_ns", np.zeros(0, dtype=np.int64))
+                                    if isinstance(r.get("equity_payload"), dict)
+                                    else np.zeros(0, dtype=np.int64)
+                                ),
+                                dtype=np.int64,
+                            ).tolist(),
+                            np.asarray(
+                                (
+                                    r.get("equity_payload", {}).get("session_id", np.zeros(0, dtype=np.int64))
+                                    if isinstance(r.get("equity_payload"), dict)
+                                    else np.zeros(0, dtype=np.int64)
+                                ),
+                                dtype=np.int64,
+                            ).tolist(),
+                        )
+                    },
+                    initial_cash,
+                )
+                for r in canonical_baseline_rows
+            ],
+            reducer="median",
+        )
+        canonical_trade_count = _aggregate_int_maps(
+            [
+                _trade_count_by_session(
+                    r.get("trade_payload") if isinstance(r.get("trade_payload"), dict) else None,
+                    {
+                        int(ts): int(sess)
+                        for ts, sess in zip(
+                            np.asarray(
+                                (
+                                    r.get("equity_payload", {}).get("ts_ns", np.zeros(0, dtype=np.int64))
+                                    if isinstance(r.get("equity_payload"), dict)
+                                    else np.zeros(0, dtype=np.int64)
+                                ),
+                                dtype=np.int64,
+                            ).tolist(),
+                            np.asarray(
+                                (
+                                    r.get("equity_payload", {}).get("session_id", np.zeros(0, dtype=np.int64))
+                                    if isinstance(r.get("equity_payload"), dict)
+                                    else np.zeros(0, dtype=np.int64)
+                                ),
+                                dtype=np.int64,
+                            ).tolist(),
+                        )
+                    },
+                )
+                for r in canonical_baseline_rows
+            ],
+            reducer="median",
+        )
+        canonical_equity_stats = []
+        for r in canonical_baseline_rows:
+            equity_payload = r.get("equity_payload")
+            canonical_equity_stats.append(
+                _equity_stats_by_session(equity_payload if isinstance(equity_payload, dict) else None)
+            )
+        canonical_gross_mean = _aggregate_float_maps([stats[0] for stats in canonical_equity_stats], reducer="median")
+        canonical_gross_peak = _aggregate_float_maps([stats[1] for stats in canonical_equity_stats], reducer="max")
+        canonical_buying_power_min = _aggregate_float_maps([stats[2] for stats in canonical_equity_stats], reducer="min")
+        canonical_daily_loss_max = _aggregate_float_maps([stats[3] for stats in canonical_equity_stats], reducer="max")
+        canonical_session_start_equity = _aggregate_float_maps([stats[4] for stats in canonical_equity_stats], reducer="median")
+        canonical_borrow_cost = _aggregate_float_maps([stats[5] for stats in canonical_equity_stats], reducer="median")
+        canonical_debit_cost = _aggregate_float_maps([stats[6] for stats in canonical_equity_stats], reducer="median")
+        canonical_overnight = _aggregate_int_maps(
+            [
+                _overnight_by_session(r.get("micro_payload") if isinstance(r.get("micro_payload"), dict) else None)
+                for r in canonical_baseline_rows
+            ],
+            reducer="max",
+        )
+        canonical_slippage_cost = _aggregate_float_maps(
+            [
+                _sum_trade_field_by_session(
+                    r.get("trade_payload") if isinstance(r.get("trade_payload"), dict) else None,
+                    {
+                        int(ts): int(sess)
+                        for ts, sess in zip(
+                            np.asarray(
+                                (
+                                    r.get("equity_payload", {}).get("ts_ns", np.zeros(0, dtype=np.int64))
+                                    if isinstance(r.get("equity_payload"), dict)
+                                    else np.zeros(0, dtype=np.int64)
+                                ),
+                                dtype=np.int64,
+                            ).tolist(),
+                            np.asarray(
+                                (
+                                    r.get("equity_payload", {}).get("session_id", np.zeros(0, dtype=np.int64))
+                                    if isinstance(r.get("equity_payload"), dict)
+                                    else np.zeros(0, dtype=np.int64)
+                                ),
+                                dtype=np.int64,
+                            ).tolist(),
+                        )
+                    },
+                    "trade_cost_slippage",
+                )
+                for r in canonical_baseline_rows
+            ],
+            reducer="median",
+        )
+        canonical_commission_cost = _aggregate_float_maps(
+            [
+                _sum_trade_field_by_session(
+                    r.get("trade_payload") if isinstance(r.get("trade_payload"), dict) else None,
+                    {
+                        int(ts): int(sess)
+                        for ts, sess in zip(
+                            np.asarray(
+                                (
+                                    r.get("equity_payload", {}).get("ts_ns", np.zeros(0, dtype=np.int64))
+                                    if isinstance(r.get("equity_payload"), dict)
+                                    else np.zeros(0, dtype=np.int64)
+                                ),
+                                dtype=np.int64,
+                            ).tolist(),
+                            np.asarray(
+                                (
+                                    r.get("equity_payload", {}).get("session_id", np.zeros(0, dtype=np.int64))
+                                    if isinstance(r.get("equity_payload"), dict)
+                                    else np.zeros(0, dtype=np.int64)
+                                ),
+                                dtype=np.int64,
+                            ).tolist(),
+                        )
+                    },
+                    "trade_cost_commission",
+                )
+                for r in canonical_baseline_rows
+            ],
+            reducer="median",
+        )
+        canonical_regulatory_cost = _aggregate_float_maps(
+            [
+                _sum_trade_field_by_session(
+                    r.get("trade_payload") if isinstance(r.get("trade_payload"), dict) else None,
+                    {
+                        int(ts): int(sess)
+                        for ts, sess in zip(
+                            np.asarray(
+                                (
+                                    r.get("equity_payload", {}).get("ts_ns", np.zeros(0, dtype=np.int64))
+                                    if isinstance(r.get("equity_payload"), dict)
+                                    else np.zeros(0, dtype=np.int64)
+                                ),
+                                dtype=np.int64,
+                            ).tolist(),
+                            np.asarray(
+                                (
+                                    r.get("equity_payload", {}).get("session_id", np.zeros(0, dtype=np.int64))
+                                    if isinstance(r.get("equity_payload"), dict)
+                                    else np.zeros(0, dtype=np.int64)
+                                ),
+                                dtype=np.int64,
+                            ).tolist(),
+                        )
+                    },
+                    "trade_cost_regulatory",
+                )
+                for r in canonical_baseline_rows
+            ],
+            reducer="median",
+        )
+        canonical_locate_cost = _aggregate_float_maps(
+            [
+                _sum_trade_field_by_session(
+                    r.get("trade_payload") if isinstance(r.get("trade_payload"), dict) else None,
+                    {
+                        int(ts): int(sess)
+                        for ts, sess in zip(
+                            np.asarray(
+                                (
+                                    r.get("equity_payload", {}).get("ts_ns", np.zeros(0, dtype=np.int64))
+                                    if isinstance(r.get("equity_payload"), dict)
+                                    else np.zeros(0, dtype=np.int64)
+                                ),
+                                dtype=np.int64,
+                            ).tolist(),
+                            np.asarray(
+                                (
+                                    r.get("equity_payload", {}).get("session_id", np.zeros(0, dtype=np.int64))
+                                    if isinstance(r.get("equity_payload"), dict)
+                                    else np.zeros(0, dtype=np.int64)
+                                ),
+                                dtype=np.int64,
+                            ).tolist(),
+                        )
+                    },
+                    "trade_cost_locate",
+                )
+                for r in canonical_baseline_rows
+            ],
+            reducer="median",
+        )
+        canonical_fill_cap_hit_count = _aggregate_int_maps(
+            [
+                (
+                    _session_payload_map(
+                        r.get("session_fill_payload") if isinstance(r.get("session_fill_payload"), dict) else None,
+                        "fill_cap_hit_count",
+                    )
+                    or _sum_trade_field_by_session(
+                        r.get("trade_payload") if isinstance(r.get("trade_payload"), dict) else None,
+                        {
+                            int(ts): int(sess)
+                            for ts, sess in zip(
+                                np.asarray(
+                                    (
+                                        r.get("equity_payload", {}).get("ts_ns", np.zeros(0, dtype=np.int64))
+                                        if isinstance(r.get("equity_payload"), dict)
+                                        else np.zeros(0, dtype=np.int64)
+                                    ),
+                                    dtype=np.int64,
+                                ).tolist(),
+                                np.asarray(
+                                    (
+                                        r.get("equity_payload", {}).get("session_id", np.zeros(0, dtype=np.int64))
+                                        if isinstance(r.get("equity_payload"), dict)
+                                        else np.zeros(0, dtype=np.int64)
+                                    ),
+                                    dtype=np.int64,
+                                ).tolist(),
+                            )
+                        },
+                        "fill_capped_flag",
+                    )
+                )
+                for r in canonical_baseline_rows
+            ],
+            reducer="max",
+        )
+        canonical_fill_reject_count = _aggregate_int_maps(
+            [
+                (
+                    _session_payload_map(
+                        r.get("session_fill_payload") if isinstance(r.get("session_fill_payload"), dict) else None,
+                        "fill_reject_count",
+                    )
+                    or _sum_trade_field_by_session(
+                        r.get("trade_payload") if isinstance(r.get("trade_payload"), dict) else None,
+                        {
+                            int(ts): int(sess)
+                            for ts, sess in zip(
+                                np.asarray(
+                                    (
+                                        r.get("equity_payload", {}).get("ts_ns", np.zeros(0, dtype=np.int64))
+                                        if isinstance(r.get("equity_payload"), dict)
+                                        else np.zeros(0, dtype=np.int64)
+                                    ),
+                                    dtype=np.int64,
+                                ).tolist(),
+                                np.asarray(
+                                    (
+                                        r.get("equity_payload", {}).get("session_id", np.zeros(0, dtype=np.int64))
+                                        if isinstance(r.get("equity_payload"), dict)
+                                        else np.zeros(0, dtype=np.int64)
+                                    ),
+                                    dtype=np.int64,
+                                ).tolist(),
+                            )
+                        },
+                        "fill_rejected_flag",
+                    )
+                )
+                for r in canonical_baseline_rows
+            ],
+            reducer="max",
+        )
+        canonical_desired_qty_abs_sum = _aggregate_float_maps(
+            [
+                (
+                    _session_payload_map(
+                        r.get("session_fill_payload") if isinstance(r.get("session_fill_payload"), dict) else None,
+                        "desired_qty_abs_sum",
+                    )
+                    or _sum_trade_field_by_session(
+                        r.get("trade_payload") if isinstance(r.get("trade_payload"), dict) else None,
+                        {
+                            int(ts): int(sess)
+                            for ts, sess in zip(
+                                np.asarray(
+                                    (
+                                        r.get("equity_payload", {}).get("ts_ns", np.zeros(0, dtype=np.int64))
+                                        if isinstance(r.get("equity_payload"), dict)
+                                        else np.zeros(0, dtype=np.int64)
+                                    ),
+                                    dtype=np.int64,
+                                ).tolist(),
+                                np.asarray(
+                                    (
+                                        r.get("equity_payload", {}).get("session_id", np.zeros(0, dtype=np.int64))
+                                        if isinstance(r.get("equity_payload"), dict)
+                                        else np.zeros(0, dtype=np.int64)
+                                    ),
+                                    dtype=np.int64,
+                                ).tolist(),
+                            )
+                        },
+                        "desired_qty",
+                        absolute=True,
+                    )
+                )
+                for r in canonical_baseline_rows
+            ],
+            reducer="median",
+        )
+        canonical_unfilled_qty_abs_sum = _aggregate_float_maps(
+            [
+                (
+                    _session_payload_map(
+                        r.get("session_fill_payload") if isinstance(r.get("session_fill_payload"), dict) else None,
+                        "unfilled_qty_abs_sum",
+                    )
+                    or _sum_trade_field_by_session(
+                        r.get("trade_payload") if isinstance(r.get("trade_payload"), dict) else None,
+                        {
+                            int(ts): int(sess)
+                            for ts, sess in zip(
+                                np.asarray(
+                                    (
+                                        r.get("equity_payload", {}).get("ts_ns", np.zeros(0, dtype=np.int64))
+                                        if isinstance(r.get("equity_payload"), dict)
+                                        else np.zeros(0, dtype=np.int64)
+                                    ),
+                                    dtype=np.int64,
+                                ).tolist(),
+                                np.asarray(
+                                    (
+                                        r.get("equity_payload", {}).get("session_id", np.zeros(0, dtype=np.int64))
+                                        if isinstance(r.get("equity_payload"), dict)
+                                        else np.zeros(0, dtype=np.int64)
+                                    ),
+                                    dtype=np.int64,
+                                ).tolist(),
+                            )
+                        },
+                        "unfilled_qty",
+                        absolute=True,
+                    )
+                )
+                for r in canonical_baseline_rows
+            ],
+            reducer="median",
+        )
+
         for row in candidate_results:
             split_id = str(row.get("split_id", ""))
             scenario_id = str(row.get("scenario_id", ""))
@@ -408,6 +859,31 @@ def build_module6_bridge_artifacts(
                     absolute=True,
                 )
 
+            availability_state_source = "upstream_worker_truth_v1"
+            if canonical_row is row:
+                exec_map = canonical_exec_map
+                raw_map = canonical_raw_map
+                state_map = canonical_state_map
+                session_turnover = canonical_turnover
+                session_trade_count = canonical_trade_count
+                gross_mean = canonical_gross_mean
+                gross_peak = canonical_gross_peak
+                buying_power_min = canonical_buying_power_min
+                daily_loss_max = canonical_daily_loss_max
+                session_start_equity = canonical_session_start_equity
+                borrow_cost = canonical_borrow_cost
+                debit_cost = canonical_debit_cost
+                overnight_flag = canonical_overnight
+                session_slippage_cost = canonical_slippage_cost
+                session_commission_cost = canonical_commission_cost
+                session_regulatory_cost = canonical_regulatory_cost
+                session_locate_cost = canonical_locate_cost
+                session_fill_cap_hit_count = canonical_fill_cap_hit_count
+                session_fill_reject_count = canonical_fill_reject_count
+                session_desired_qty_abs_sum = canonical_desired_qty_abs_sum
+                session_unfilled_qty_abs_sum = canonical_unfilled_qty_abs_sum
+                availability_state_source = "candidate_baseline_common_calendar_median_v2"
+
             selection_rows.append(
                 {
                     "strategy_id": strategy_id,
@@ -467,7 +943,7 @@ def build_module6_bridge_artifacts(
                         "return_exec": float(exec_map.get(s, 0.0)),
                         "return_raw": float(raw_map.get(s, 0.0)),
                         "availability_state_code": int(availability_state_code),
-                        "availability_state_source": "upstream_worker_truth_v1",
+                        "availability_state_source": availability_state_source,
                         "observed_exec": int(observed_exec),
                         "observed_raw": int(observed_raw),
                         "session_turnover": float(session_turnover.get(s, 0.0)),

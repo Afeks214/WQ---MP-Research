@@ -47,7 +47,7 @@ def _resolve_module6_canonical_reference(
     return (
         str(getattr(chosen_split, "split_id", "")),
         str(getattr(enabled_baseline[0], "scenario_id", "")),
-        "enabled_baseline_first_split_v1",
+        "enabled_baseline_common_calendar_median_v2",
     )
 
 

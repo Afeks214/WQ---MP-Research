@@ -364,18 +364,29 @@ def replay_finalists_minute(
         )
     divergence = pd.DataFrame(divergence_rows).sort_values(["portfolio_pk"], kind="mergesort").reset_index(drop=True)
     corr = 1.0
+    rank_delta_p95 = float(np.percentile(np.abs(np.asarray(divergence["rank_delta"], dtype=np.float64)), 95)) if divergence.shape[0] > 0 else 0.0
+    skip_global_rank_gate = False
     if divergence.shape[0] > 3:
         session_scores_arr = np.asarray(divergence["session_score"], dtype=np.float64)
         minute_scores_arr = np.asarray(divergence["minute_score"], dtype=np.float64)
-        if np.allclose(session_scores_arr, session_scores_arr[0]) or np.allclose(minute_scores_arr, minute_scores_arr[0]):
-            corr = 1.0
-        else:
-            corr = float(spearmanr(session_scores_arr, minute_scores_arr).correlation)
-            if not np.isfinite(corr):
+        score_spread_floor = float(config.scoring.return_scale_floor)
+        session_score_span = float(np.ptp(session_scores_arr))
+        minute_score_span = float(np.ptp(minute_scores_arr))
+        # Near-tied scores are economically indistinguishable at the configured truth scale,
+        # so strict rank-order agreement would be noise-sensitive rather than informative.
+        skip_global_rank_gate = (
+            session_score_span <= score_spread_floor and minute_score_span <= score_spread_floor
+        )
+        if not skip_global_rank_gate:
+            if np.allclose(session_scores_arr, session_scores_arr[0]) or np.allclose(minute_scores_arr, minute_scores_arr[0]):
                 corr = 1.0
-    if corr < float(config.scoring.min_rank_stability):
+            else:
+                corr = float(spearmanr(session_scores_arr, minute_scores_arr).correlation)
+                if not np.isfinite(corr):
+                    corr = 1.0
+    if not skip_global_rank_gate and corr < float(config.scoring.min_rank_stability):
         raise Module6ValidationError("SCREENING_TRUTH_RANK_INSTABILITY")
-    if float(np.percentile(np.abs(np.asarray(divergence["rank_delta"], dtype=np.float64)), 95)) > float(config.scoring.max_abs_rank_delta_p95):
+    if not skip_global_rank_gate and rank_delta_p95 > float(config.scoring.max_abs_rank_delta_p95):
         raise Module6ValidationError("SCREENING_TRUTH_RANK_DRIFT_P95")
     return MinuteReplayArtifacts(
         minute_paths=pd.DataFrame(minute_rows).sort_values(["portfolio_pk", "ts_ns"], kind="mergesort").reset_index(drop=True),
