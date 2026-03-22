@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from weightiz.module6.config import Module6Config
+from weightiz.module6.utils import Module6ValidationError
 
 
 def pareto_frontier(df: pd.DataFrame, maximize: list[str], minimize: list[str]) -> pd.DataFrame:
@@ -38,10 +39,19 @@ def select_diverse_finalists(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if scores.shape[0] <= 0:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    risk_return = pareto_frontier(scores, maximize=["minute_annualized_return"], minimize=["minute_max_drawdown"])
-    operational = pareto_frontier(scores, maximize=["headroom"] if "headroom" in scores.columns else [], minimize=["minute_turnover", "availability_burden"])
+    if "cross_universe_reject" not in scores.columns:
+        raise Module6ValidationError("frontier selection requires cross_universe_reject")
+    eligible_scores = scores.loc[~scores["cross_universe_reject"].fillna(False).astype(bool)].copy()
+    if eligible_scores.shape[0] <= 0:
+        raise Module6ValidationError("NO_COMPARABLE_FINALISTS_SURVIVED")
+    risk_return = pareto_frontier(eligible_scores, maximize=["minute_annualized_return"], minimize=["minute_max_drawdown"])
+    operational = pareto_frontier(
+        eligible_scores,
+        maximize=["headroom"] if "headroom" in eligible_scores.columns else [],
+        minimize=["minute_turnover", "availability_burden"],
+    )
     global_frontier = pareto_frontier(
-        scores,
+        eligible_scores,
         maximize=["final_score", "minute_annualized_return"],
         minimize=["minute_max_drawdown", "minute_turnover", "availability_burden"],
     )
@@ -51,7 +61,7 @@ def select_diverse_finalists(
     }
     cluster_map = dict(strategy_frame[["strategy_instance_pk", "cluster_id"]].itertuples(index=False, name=None))
     selected_rows: list[pd.Series] = []
-    for row in scores.itertuples(index=False):
+    for row in eligible_scores.itertuples(index=False):
         series = weight_map.get(str(row.portfolio_pk))
         if series is None:
             continue
@@ -77,7 +87,7 @@ def select_diverse_finalists(
                 accept = False
                 break
         if accept:
-            selected_rows.append(scores.loc[scores["portfolio_pk"] == str(row.portfolio_pk)].iloc[0])
+            selected_rows.append(eligible_scores.loc[eligible_scores["portfolio_pk"] == str(row.portfolio_pk)].iloc[0])
         if len(selected_rows) >= int(config.scoring.final_scalar_keep):
             break
     selected = pd.DataFrame(selected_rows)

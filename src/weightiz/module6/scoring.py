@@ -75,10 +75,22 @@ def score_session_paths(
         1.0,
         scored["gross_exposure_peak"].fillna(0.0) / max(config.simulator.intraday_leverage_max, 1.0e-12),
     )
+    required_support_final = float(max(config.intake.required_comparison_support, config.scoring.min_cross_universe_support))
+    required_support_soft = float(
+        np.clip(
+            required_support_final - float(config.scoring.support_penalty_soft_delta),
+            float(config.scoring.support_penalty_soft_min),
+            float(config.scoring.support_penalty_soft_max),
+        )
+    )
+    scored["support_penalty"] = np.clip(
+        (required_support_soft - scored["support_coverage"].fillna(0.0))
+        / max(required_support_soft, 1.0e-12),
+        0.0,
+        1.0,
+    )
     scored["hard_reject"] = (
         scored["breach_count"].fillna(0).astype(int) > 0
-    ) | (
-        scored["support_coverage"].fillna(0.0) < float(config.intake.min_availability_ratio)
     ) | (
         scored["final_equity"].fillna(0.0) <= 0.0
     )
@@ -104,6 +116,7 @@ def score_session_paths(
         + 0.10 * scored["turnover_rank"]
         + 0.05 * scored["concentration_rank"]
         + 0.05 * scored["overlap_rank"]
+        - float(config.scoring.support_penalty_weight) * scored["support_penalty"]
     )
     scored.loc[scored["hard_reject"], "first_pass_score"] = float(REJECT_SCORE_FLOOR)
     return scored.sort_values(["first_pass_score", "portfolio_pk"], ascending=[False, True], kind="mergesort").reset_index(drop=True)

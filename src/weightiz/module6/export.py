@@ -81,17 +81,45 @@ def write_module6_outputs(
     for reduced_universe_id, bundle in sorted(dependence_artifacts.items(), key=lambda item: str(item[0])):
         dep_out = ensure_directory(dependence_dir / str(reduced_universe_id))
         np.save(dep_out / "covariance.npy", np.asarray(bundle.covariance, dtype=np.float64))
+        np.save(dep_out / "covariance_pre_psd.npy", np.asarray(bundle.covariance_pre_psd, dtype=np.float64))
+        np.save(dep_out / "covariance_post_psd.npy", np.asarray(bundle.covariance, dtype=np.float64))
         np.save(dep_out / "correlation.npy", np.asarray(bundle.correlation, dtype=np.float64))
         np.save(dep_out / "downside_covariance.npy", np.asarray(bundle.downside_covariance, dtype=np.float64))
         np.save(dep_out / "regime_overlap.npy", np.asarray(bundle.regime_overlap, dtype=np.float64))
-        np.save(dep_out / "common_support.npy", np.asarray(bundle.common_support, dtype=bool))
+        np.save(dep_out / "asset_column_indices.npy", np.asarray(bundle.asset_column_indices, dtype=np.int64))
+        np.save(dep_out / "pair_overlap_counts.npy", np.asarray(bundle.pair_overlap_counts, dtype=np.int64))
+        np.save(dep_out / "pair_reliability.npy", np.asarray(bundle.pair_reliability, dtype=np.float64))
+        np.save(dep_out / "pair_completion_reason_codes.npy", np.asarray(bundle.pair_completion_reason_codes, dtype="<U24"))
+        np.save(dep_out / "completion_mask.npy", np.asarray(bundle.completion_mask, dtype=bool))
         sparse.save_npz(dep_out / "drawdown_concurrence.npz", bundle.drawdown_concurrence.tocsr())
         (dep_out / "metadata.json").write_text(
             json.dumps(
                 _sanitize_json_value(
                     {
-                    "shrinkage": float(bundle.shrinkage),
-                    "negative_mass": float(bundle.negative_mass),
+                        "asset_column_indices": np.asarray(bundle.asset_column_indices, dtype=np.int64).tolist(),
+                        "asset_observed_counts": np.asarray(bundle.asset_observed_counts, dtype=np.int64).tolist(),
+                        "asset_support_minimum": int(bundle.asset_support_minimum),
+                        "pair_support_minimum": int(bundle.pair_support_minimum),
+                        "pair_support_full": int(bundle.pair_support_full),
+                        "completion_prior_used": bool(bundle.completion_prior_used),
+                        "completion_reason_codes": list(bundle.completion_reason_codes),
+                        "pair_completion_reason_codes_artifact": "pair_completion_reason_codes.npy",
+                        "shrinkage": float(bundle.shrinkage),
+                        "negative_mass": float(bundle.negative_mass),
+                        "negative_eigen_mass_ratio": float(bundle.negative_eigen_mass_ratio),
+                        "condition_number": float(bundle.condition_number),
+                        "psd_projection_distortion": float(bundle.psd_projection_distortion),
+                        "min_eigenvalue_pre": float(bundle.min_eigenvalue_pre),
+                        "min_eigenvalue_post": float(bundle.min_eigenvalue_post),
+                        "off_diagonal_sign_flip_rate": float(bundle.off_diagonal_sign_flip_rate),
+                        "spurious_extreme_correlation_rate": float(bundle.spurious_extreme_correlation_rate),
+                        "regime_mismatch_rate": float(bundle.regime_mismatch_rate),
+                        "effective_pair_count": int(bundle.effective_pair_count),
+                        "effective_pair_reliability": float(bundle.effective_pair_reliability),
+                        "prior_only_pair_count": int(bundle.prior_only_pair_count),
+                        "zero_overlap_pair_count": int(bundle.zero_overlap_pair_count),
+                        "submin_overlap_pair_count": int(bundle.submin_overlap_pair_count),
+                        "repair_status": str(bundle.repair_status),
                     }
                 ),
                 indent=2,

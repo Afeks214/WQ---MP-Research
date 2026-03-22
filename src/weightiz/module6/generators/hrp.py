@@ -56,7 +56,8 @@ def generate_hrp_variants(
     config: Module6Config,
     calendar_version: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if covariance_bundle.common_support.sum() < 2 * len(reduced_universe.strategy_instance_pks):
+    min_pair_count = max(len(reduced_universe.strategy_instance_pks) - 1, 1)
+    if covariance_bundle.effective_pair_count < min_pair_count or covariance_bundle.effective_pair_reliability <= 0.0:
         return pd.DataFrame(columns=["portfolio_pk"]), pd.DataFrame(columns=["portfolio_pk", "strategy_instance_pk", "target_weight"])
     strategy_ids = list(reduced_universe.strategy_instance_pks)
     base_weights = _hrp_weights(

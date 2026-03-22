@@ -227,20 +227,20 @@ def reduce_universe(
     reject_gate_active = str(intake_policy_class) == "standard"
     availability_ratio = pd.to_numeric(strategy_master["availability_ratio"], errors="coerce").fillna(0.0)
     availability_ratio_below_threshold = availability_ratio < float(min_availability_ratio)
-    if str(availability_ratio_gate_mode) == MODULE6_AVAILABILITY_RATIO_GATE_MODE_HARD:
-        availability_ratio_gate_mask = availability_ratio >= float(min_availability_ratio)
-        availability_ratio_warning = False
-    elif str(availability_ratio_gate_mode) == MODULE6_AVAILABILITY_RATIO_GATE_MODE_WARN:
+    effective_availability_ratio_gate_mode = str(availability_ratio_gate_mode)
+    if effective_availability_ratio_gate_mode == MODULE6_AVAILABILITY_RATIO_GATE_MODE_HARD:
+        effective_availability_ratio_gate_mode = MODULE6_AVAILABILITY_RATIO_GATE_MODE_WARN
+    if effective_availability_ratio_gate_mode == MODULE6_AVAILABILITY_RATIO_GATE_MODE_WARN:
         availability_ratio_gate_mask = pd.Series(True, index=strategy_master.index, dtype=bool)
         availability_ratio_warning = bool(availability_ratio_below_threshold.any())
-    elif str(availability_ratio_gate_mode) == MODULE6_AVAILABILITY_RATIO_GATE_MODE_OFF:
+    elif effective_availability_ratio_gate_mode == MODULE6_AVAILABILITY_RATIO_GATE_MODE_OFF:
         availability_ratio_gate_mask = pd.Series(True, index=strategy_master.index, dtype=bool)
         availability_ratio_warning = False
     else:
         raise Module6ValidationError(f"unsupported availability ratio gate mode: {availability_ratio_gate_mode}")
     availability_ratio_warning_count = (
         int(availability_ratio_below_threshold.astype(bool).sum())
-        if str(availability_ratio_gate_mode) == MODULE6_AVAILABILITY_RATIO_GATE_MODE_WARN
+        if effective_availability_ratio_gate_mode == MODULE6_AVAILABILITY_RATIO_GATE_MODE_WARN
         else 0
     )
     observed_session_count = pd.to_numeric(strategy_master["observed_session_count"], errors="coerce").fillna(0).astype(int)
@@ -252,7 +252,7 @@ def reduce_universe(
         (
             "availability_ratio_gate",
             availability_ratio_gate_mask,
-            bool(str(availability_ratio_gate_mode) == MODULE6_AVAILABILITY_RATIO_GATE_MODE_HARD),
+            False,
         ),
         ("observed_session_count_gate", observed_session_count >= int(min_observed_sessions), True),
         ("turnover_sanity_gate", avg_turnover_metrics >= 0.0, True),
@@ -284,6 +284,7 @@ def reduce_universe(
                 "stage": "pre_reduction_intake",
                 "module6_policy_class": str(intake_policy_class),
                 "availability_ratio_gate_mode": str(availability_ratio_gate_mode),
+                "availability_ratio_gate_effective_mode": str(effective_availability_ratio_gate_mode),
                 "availability_ratio_warning": bool(availability_ratio_warning),
                 "intake_candidate_count": int(strategy_master.shape[0]),
                 "admitted_candidate_count": 0,
@@ -292,6 +293,7 @@ def reduce_universe(
                     "min_availability_ratio": float(min_availability_ratio),
                     "min_observed_sessions": int(min_observed_sessions),
                     "availability_ratio_gate_mode": str(availability_ratio_gate_mode),
+                    "availability_ratio_gate_effective_mode": str(effective_availability_ratio_gate_mode),
                     "availability_ratio_warning_count": int(availability_ratio_warning_count),
                     "reject_gate_active": bool(reject_gate_active),
                 },
@@ -329,12 +331,6 @@ def reduce_universe(
     r_sub = r_exec[:, column_idx]
     a_sub = a[:, column_idx]
     support_ratio = np.mean(a_sub, axis=0)
-    keep_mask = support_ratio >= float(min_availability_ratio)
-    canonical_instances = canonical_instances.loc[keep_mask].reset_index(drop=True)
-    column_idx = canonical_instances["column_idx"].to_numpy(dtype=np.int64)
-    r_sub = r_exec[:, column_idx]
-    if r_sub.shape[1] <= 0:
-        raise Module6ValidationError("all strategies removed by availability gate during reduction")
     signature = []
     for j in range(r_sub.shape[1]):
         signature.append(stable_sha256_parts(*np.round(r_sub[:, j], 12).tolist()))

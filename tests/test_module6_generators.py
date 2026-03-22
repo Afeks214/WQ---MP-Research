@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from weightiz.module6.config import GeneratorConfig, Module6Config
 from weightiz.module6.dependence import build_covariance_bundle
 from weightiz.module6.generators import generate_all_portfolios
 from weightiz.module6.types import ReducedUniverseSpec
+from weightiz.module6.utils import Module6ValidationError
 
 
 def test_generator_outputs_are_simplex_and_nonnegative():
@@ -21,7 +23,19 @@ def test_generator_outputs_are_simplex_and_nonnegative():
         }
     )
     returns = np.asarray([[0.01, 0.0, -0.01, 0.02], [0.0, 0.01, -0.01, 0.01], [0.01, 0.01, -0.02, 0.0], [0.0, 0.0, 0.0, 0.01]], dtype=np.float64)
-    bundle = build_covariance_bundle(returns, np.ones_like(returns, dtype=bool), np.ones((4, 4), dtype=np.float64), np.asarray([0, 1, 2, 3]), Module6Config().dependence)
+    dep_cfg = Module6Config().dependence
+    dep_cfg = dep_cfg.__class__(
+        **{
+            **dep_cfg.__dict__,
+            "asset_support_min_sessions": 1,
+            "asset_support_max_sessions": 4,
+            "pair_support_min_sessions": 2,
+            "pair_support_max_sessions": 2,
+            "pair_support_full_min_sessions": 4,
+            "pair_support_full_max_sessions": 4,
+        }
+    )
+    bundle = build_covariance_bundle(returns, np.ones_like(returns, dtype=bool), np.ones((4, 4), dtype=np.float64), np.asarray([0, 1, 2, 3]), dep_cfg)
     cfg = Module6Config(generator=GeneratorConfig(random_sparse_quota=4, cluster_balanced_quota=2, hrp_variant_quota=9, active_cardinality_choices=(2, 3)))
     candidates, weights = generate_all_portfolios(
         reduced_universe=ReducedUniverseSpec("ru", ("a", "b", "c", "d"), ("a",), ("c",), 4),
@@ -57,24 +71,12 @@ def test_generators_handle_single_strategy_universe():
         }
     )
     returns = np.asarray([[0.01], [0.0], [0.01], [0.0]], dtype=np.float64)
-    bundle = build_covariance_bundle(
-        returns,
-        np.ones_like(returns, dtype=bool),
-        np.ones((4, 1), dtype=np.float64),
-        np.asarray([0], dtype=np.int64),
-        Module6Config().dependence,
-    )
-    cfg = Module6Config(generator=GeneratorConfig(random_sparse_quota=2, cluster_balanced_quota=2, hrp_variant_quota=2, active_cardinality_choices=(1,)))
-    candidates, weights = generate_all_portfolios(
-        reduced_universe=ReducedUniverseSpec("ru", ("a",), ("a",), tuple(), 1),
-        strategy_frame=strategy_frame,
-        covariance_bundle=bundle,
-        returns_exec=returns,
-        column_indices=np.asarray([0], dtype=np.int64),
-        config=cfg,
-        calendar_version="calv1",
-    )
-    assert not candidates.empty
-    assert not weights.empty
-    grouped = weights.groupby("portfolio_pk")["target_weight"].sum()
-    assert (grouped <= 1.0 + 1.0e-12).all()
+    with pytest.raises(Module6ValidationError, match="DEPENDENCE_UNIVERSE_TOO_SMALL"):
+        build_covariance_bundle(
+            returns,
+            np.ones_like(returns, dtype=bool),
+            np.ones((4, 1), dtype=np.float64),
+            np.asarray([0], dtype=np.int64),
+            Module6Config().dependence,
+            asset_support_minimum=1,
+        )

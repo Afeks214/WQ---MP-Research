@@ -18,13 +18,13 @@ def generate_mv_variants(
     column_indices: np.ndarray,
     config: Module6Config,
     calendar_version: str,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
     if not bool(config.generator.enable_mv_diagnostic):
         return pd.DataFrame(columns=["portfolio_pk"]), pd.DataFrame(columns=["portfolio_pk", "strategy_instance_pk", "target_weight"])
     if len(reduced_universe.strategy_instance_pks) > int(config.reduction.mv_universe_cap):
         return pd.DataFrame(columns=["portfolio_pk"]), pd.DataFrame(columns=["portfolio_pk", "strategy_instance_pk", "target_weight"])
-    support_count = int(np.sum(covariance_bundle.common_support))
-    if support_count < 3 * len(reduced_universe.strategy_instance_pks):
+    min_pair_count = max(2 * max(len(reduced_universe.strategy_instance_pks) - 1, 1), 1)
+    if covariance_bundle.effective_pair_count < min_pair_count or covariance_bundle.effective_pair_reliability <= 0.0:
         return pd.DataFrame(columns=["portfolio_pk"]), pd.DataFrame(columns=["portfolio_pk", "strategy_instance_pk", "target_weight"])
     cov = np.asarray(covariance_bundle.covariance, dtype=np.float64)
     mu = np.mean(np.asarray(returns_exec, dtype=np.float64)[:, np.asarray(column_indices, dtype=np.int64)], axis=0)

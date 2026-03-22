@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from weightiz.module6.config import Module6Config
-from weightiz.module6.dependence import build_covariance_bundle
+from weightiz.module6.dependence import build_covariance_bundle, resolve_dependence_column_selection
 from weightiz.module6.execution_overlap import finalist_exact_overlap
 from weightiz.module6.export import write_module6_outputs
 from weightiz.module6.frontier import select_diverse_finalists
@@ -53,6 +54,7 @@ def run_module6_portfolio_research(
     all_session_paths: list[pd.DataFrame] = []
     all_session_scores: list[pd.DataFrame] = []
     dependence_artifacts: dict[str, Any] = {}
+    dependence_rejections: dict[str, str] = {}
     shortlist_portfolio_pks: list[str] = []
     calendar_version = str(run.run_manifest["module6_bridge"]["calendar_version"])
 
@@ -64,16 +66,48 @@ def run_module6_portfolio_research(
         if strategy_frame.shape[0] <= 0:
             continue
         column_indices = strategy_frame["column_idx"].to_numpy(dtype="int64")
-        covariance_bundle = build_covariance_bundle(
-            returns_exec=matrices["R_exec"],
+        selection = resolve_dependence_column_selection(
             availability=matrices["A"],
-            regime_exposure=matrices["G"],
             column_indices=column_indices,
             config=cfg.dependence,
+            min_observed_sessions_override=cfg.intake.min_observed_sessions,
         )
-        dependence_artifacts[str(reduced_universe.reduced_universe_id)] = covariance_bundle
+        if not bool(np.any(selection.keep_mask)):
+            dependence_rejections[str(reduced_universe.reduced_universe_id)] = "DEPENDENCE_ASSET_SUPPORT_TOO_SHORT"
+            continue
+        strategy_frame = strategy_frame.loc[np.asarray(selection.keep_mask, dtype=bool)].copy().reset_index(drop=True)
+        if strategy_frame.shape[0] < 2:
+            dependence_rejections[str(reduced_universe.reduced_universe_id)] = "DEPENDENCE_UNIVERSE_TOO_SMALL"
+            continue
+        filtered_ids = tuple(strategy_frame["strategy_instance_pk"].astype(str).tolist())
+        filtered_id_set = set(filtered_ids)
+        active_universe = replace(
+            reduced_universe,
+            strategy_instance_pks=filtered_ids,
+            representative_strategy_instance_pks=tuple(
+                pk for pk in reduced_universe.representative_strategy_instance_pks if str(pk) in filtered_id_set
+            ),
+            retained_hedge_strategy_instance_pks=tuple(
+                pk for pk in reduced_universe.retained_hedge_strategy_instance_pks if str(pk) in filtered_id_set
+            ),
+            cluster_count=int(strategy_frame["cluster_id"].nunique()),
+        )
+        column_indices = strategy_frame["column_idx"].to_numpy(dtype="int64")
+        try:
+            covariance_bundle = build_covariance_bundle(
+                returns_exec=matrices["R_exec"],
+                availability=matrices["A"],
+                regime_exposure=matrices["G"],
+                column_indices=column_indices,
+                config=cfg.dependence,
+                asset_support_minimum=selection.support_minimum,
+            )
+        except Module6ValidationError as exc:
+            dependence_rejections[str(reduced_universe.reduced_universe_id)] = str(exc)
+            continue
+        dependence_artifacts[str(active_universe.reduced_universe_id)] = covariance_bundle
         candidates_df, weights_df = generate_all_portfolios(
-            reduced_universe=reduced_universe,
+            reduced_universe=active_universe,
             strategy_frame=strategy_frame,
             covariance_bundle=covariance_bundle,
             returns_exec=matrices["R_exec"],
@@ -112,6 +146,11 @@ def run_module6_portfolio_research(
         all_session_scores.append(session_scores)
 
     if not all_candidates:
+        if dependence_rejections:
+            raise Module6ValidationError(
+                "all reduced universes rejected by dependence diagnostics: "
+                + "; ".join(f"{k}={v}" for k, v in sorted(dependence_rejections.items()))
+            )
         raise Module6ValidationError("no portfolio candidates were produced by Module 6")
     portfolio_candidates = pd.concat(all_candidates, axis=0, ignore_index=True).drop_duplicates("portfolio_pk", keep="first")
     portfolio_weights = pd.concat(all_weights, axis=0, ignore_index=True)
@@ -200,6 +239,7 @@ def run_module6_portfolio_research(
             "n_alternates": int(len(alternate_pks)),
             "comparison_support_session_count": int(comparison_support_calendar.shape[0]),
             "canonical_reference_policy": str(run.run_manifest["module6_bridge"]["canonical_reference_policy"]),
+            "dependence_rejections": dict(sorted(dependence_rejections.items())),
         },
     )
     write_module6_outputs(

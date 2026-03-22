@@ -98,14 +98,44 @@ class ReductionConfig:
 
 @dataclass(frozen=True)
 class DependenceConfig:
-    shrinkage_floor_eps_mult: float = 1.0e-10
-    negative_mass_reject_mult: float = 1.0e-6
     drawdown_tail_threshold: float = 0.05
     overlap_weight_symbol_support: float = 0.25
     overlap_weight_activity: float = 0.35
     overlap_weight_gross: float = 0.25
     overlap_weight_rebalance: float = 0.15
     activity_signature_buckets: int = 8
+    asset_support_frac: float = 0.08
+    asset_support_min_sessions: int = 20
+    asset_support_max_sessions: int = 126
+    pair_support_frac: float = 0.08
+    pair_support_min_sessions: int = 20
+    pair_support_max_sessions: int = 63
+    pair_support_full_min_sessions: int = 40
+    pair_support_full_multiplier: float = 2.0
+    pair_support_full_max_sessions: int = 126
+    completion_alpha_regime: float = 0.20
+    variance_floor: float = 1.0e-12
+    regime_row_norm_eps: float = 1.0e-12
+    return_vol_clip: float = 5.0
+    shrinkage_base: float = 0.35
+    shrinkage_reliability_mult: float = 0.55
+    shrinkage_regime_mult: float = 0.10
+    shrinkage_min: float = 0.35
+    shrinkage_max: float = 0.95
+    psd_eig_floor_mult: float = 1.0e-10
+    psd_warn_distortion: float = 0.12
+    psd_max_distortion: float = 0.30
+    condition_number_max: float = 1.0e10
+    negative_eigen_mass_ratio_max: float = 0.25
+    regime_mismatch_warn: float = 0.30
+    regime_mismatch_reject: float = 0.60
+    sign_flip_significant_abs_corr_min: float = 0.20
+    sign_flip_rate_max: float = 0.05
+    spurious_extreme_post_abs_corr_min: float = 0.80
+    spurious_extreme_pre_abs_corr_max: float = 0.50
+    spurious_extreme_rate_max: float = 0.01
+    corr_diag_eps: float = 1.0e-12
+    eps: float = 1.0e-12
 
 
 @dataclass(frozen=True)
@@ -168,6 +198,10 @@ class ScoringConfig:
     final_scalar_keep: int = 64
     final_primary_count: int = 6
     final_alternate_count: int = 6
+    support_penalty_soft_delta: float = 0.15
+    support_penalty_soft_min: float = 0.55
+    support_penalty_soft_max: float = 0.80
+    support_penalty_weight: float = 1.0
 
 
 @dataclass(frozen=True)

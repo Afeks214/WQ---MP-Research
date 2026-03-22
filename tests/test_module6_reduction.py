@@ -86,7 +86,7 @@ def test_pre_reduction_fail_closed_writes_intake_gate_diagnostics(tmp_path):
     assert not (reduce_dir / "reduced_universes" / "reduced_universe_000.parquet").exists()
 
 
-def test_availability_ratio_gate_hard_mode_preserves_fail_closed_behavior(tmp_path):
+def test_availability_ratio_gate_hard_mode_is_remapped_to_warn_only(tmp_path):
     run_dir = build_synthetic_module5_run(tmp_path)
     base_cfg = make_test_config()
     cfg = replace(
@@ -94,7 +94,7 @@ def test_availability_ratio_gate_hard_mode_preserves_fail_closed_behavior(tmp_pa
         intake=replace(
             base_cfg.intake,
             availability_ratio_gate_mode="hard",
-            min_observed_sessions=1,
+            min_observed_sessions=10_000,
         ),
     )
     loaded = load_module5_run(run_dir, cfg)
@@ -114,14 +114,15 @@ def test_availability_ratio_gate_hard_mode_preserves_fail_closed_behavior(tmp_pa
         )
     diagnostics = json.loads((reduce_dir / "diagnostics" / "module6_intake_pre_reduction_intake.json").read_text(encoding="utf-8"))
     assert diagnostics["availability_ratio_gate_mode"] == "hard"
-    assert diagnostics["availability_ratio_warning"] is False
-    assert diagnostics["first_zero_gate"] == "availability_ratio_gate"
+    assert diagnostics["availability_ratio_gate_effective_mode"] == "warn"
+    assert diagnostics["availability_ratio_warning"] is True
     thresholds = diagnostics["resolved_thresholds"]
     assert thresholds["availability_ratio_gate_mode"] == "hard"
-    assert int(thresholds["availability_ratio_warning_count"]) == 0
+    assert thresholds["availability_ratio_gate_effective_mode"] == "warn"
+    assert int(thresholds["availability_ratio_warning_count"]) > 0
     availability_gate = next(row for row in diagnostics["gates"] if row["gate"] == "availability_ratio_gate")
-    assert availability_gate["gate_active"] is True
-    assert int(availability_gate["survivor_count"]) == 0
+    assert availability_gate["gate_active"] is False
+    assert int(availability_gate["dropped_count"]) == 0
 
 
 def test_availability_ratio_gate_warn_mode_emits_warning_without_hard_block(tmp_path):

@@ -11,7 +11,14 @@ from weightiz.module6.types import ReducedUniverseSpec
 
 def test_mv_generator_disabled_by_default():
     returns = np.asarray([[0.01, 0.02], [0.0, 0.01], [0.01, 0.0], [0.02, 0.01], [0.01, 0.03], [0.0, 0.01]], dtype=np.float64)
-    bundle = build_covariance_bundle(returns, np.ones_like(returns, dtype=bool), np.ones((2, 4), dtype=np.float64), np.asarray([0, 1], dtype=np.int64), Module6Config().dependence)
+    bundle = build_covariance_bundle(
+        returns,
+        np.ones_like(returns, dtype=bool),
+        np.ones((2, 4), dtype=np.float64),
+        np.asarray([0, 1], dtype=np.int64),
+        Module6Config().dependence,
+        asset_support_minimum=1,
+    )
     strategy_frame = pd.DataFrame(
         {
             "strategy_instance_pk": ["a", "b"],
