@@ -599,7 +599,17 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
             self.assertTrue(np.all(np.asarray(state.scores, dtype=np.float64) == 11.0))
             return self._dummy_m4_signal(state)
 
-        def fake_risk(close_px_ta, target_qty_ta, initial_cash, cost_cfg, risk_cfg, session_id_t=None, volume_ta=None, execution_realism=None):
+        def fake_risk(
+            close_px_ta,
+            target_qty_ta,
+            initial_cash,
+            cost_cfg,
+            risk_cfg,
+            session_id_t=None,
+            volume_ta=None,
+            execution_realism=None,
+            **kwargs,
+        ):
             close_px_ta = np.asarray(close_px_ta, dtype=np.float64)
             T_local, A_local = close_px_ta.shape
             self.assertIsNotNone(session_id_t)
@@ -607,6 +617,7 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
             self.assertIsNotNone(volume_ta)
             self.assertEqual(np.asarray(volume_ta, dtype=np.float64).shape, (T_local, A_local))
             self.assertIsNotNone(execution_realism)
+            self.assertIn("target_signal_mode", kwargs)
 
             class _Res:
                 equity_curve = np.full(T_local, float(initial_cash), dtype=np.float64)
@@ -890,7 +901,17 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
         def wrap_m4(state: h.TensorState, _m3: Module3Output, _cfg: Module4Config) -> Module4SignalOutput:
             return self._dummy_m4_signal(state)
 
-        def fake_risk(close_px_ta, target_qty_ta, initial_cash, cost_cfg, risk_cfg, session_id_t=None, volume_ta=None, execution_realism=None):
+        def fake_risk(
+            close_px_ta,
+            target_qty_ta,
+            initial_cash,
+            cost_cfg,
+            risk_cfg,
+            session_id_t=None,
+            volume_ta=None,
+            execution_realism=None,
+            **kwargs,
+        ):
             close_px_ta = np.asarray(close_px_ta, dtype=np.float64)
             T_local, A_local = close_px_ta.shape
             self.assertIsNotNone(session_id_t)
@@ -898,6 +919,7 @@ class TestModule5HarnessInstitutional(unittest.TestCase):
             self.assertIsNotNone(volume_ta)
             self.assertEqual(np.asarray(volume_ta, dtype=np.float64).shape, (T_local, A_local))
             self.assertIsNotNone(execution_realism)
+            self.assertIn("target_signal_mode", kwargs)
 
             class _Res:
                 equity_curve = np.full(T_local, float(initial_cash), dtype=np.float64)

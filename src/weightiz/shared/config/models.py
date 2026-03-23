@@ -102,6 +102,10 @@ class Module2ConfigModel(BaseModel):
     delta_mad_min_periods: int = 10
     sigma_delta_min: float = 0.05
     delta_gate_threshold: float = 1.0
+    signal_smoothing_alpha: float = 1.0
+    signal_hysteresis_entry_threshold: float = 0.0
+    signal_hysteresis_exit_threshold: float = 0.0
+    signal_debounce_window: int = 1
     normal_concentration_threshold: float = 0.05
     trend_spread_threshold_x: float = 2.5
     trend_delta_confirm_z: float = 1.5
@@ -164,6 +168,10 @@ class Module4ConfigModel(BaseModel):
     conviction_scale: float = 1.0
     conviction_clip: float = 1.0
     max_abs_weight: float = 1.0
+    target_signal_mode: str = "discrete_position"
+    target_weight_deadband_frac: float = 0.0
+    min_holding_minutes: int = 0
+    hard_stop_loss_frac: float = 0.0
     top_k_intraday: int = 5
     max_asset_cap_frac: float = 0.3
     max_turnover_frac_per_bar: float = 0.35

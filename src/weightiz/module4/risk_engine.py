@@ -11,6 +11,8 @@ REASON_COST_MODEL_VIOLATION = "cost_model_violation"
 TRADING_DAYS_PER_YEAR = 252.0
 EXECUTION_COST_MODEL_STATIC = "static_mid_rvol_legacy"
 EXECUTION_COST_MODEL_DYNAMIC = "dynamic_bucketed_v1"
+TARGET_SIGNAL_MODE_QUANTITY = "quantity_target"
+TARGET_SIGNAL_MODE_WEIGHT = "weight_target"
 
 
 @dataclass(frozen=True)
@@ -263,6 +265,64 @@ def _session_slippage_mult(
     return float(execution_realism.mid_slippage_mult)
 
 
+def _resolve_target_signal_mode(target_signal_mode: str) -> str:
+    mode = str(target_signal_mode).strip().lower()
+    if mode not in {TARGET_SIGNAL_MODE_QUANTITY, TARGET_SIGNAL_MODE_WEIGHT}:
+        raise RuntimeError(
+            "target_signal_mode must be one of: "
+            f"{TARGET_SIGNAL_MODE_QUANTITY}, {TARGET_SIGNAL_MODE_WEIGHT}"
+        )
+    return mode
+
+
+def _hard_stop_breached(
+    *,
+    qty: float,
+    entry_price: float,
+    mark_price: float,
+    hard_stop_loss_frac: float,
+) -> bool:
+    if abs(float(qty)) <= 0.0:
+        return False
+    if float(hard_stop_loss_frac) <= 0.0:
+        return False
+    if (not np.isfinite(float(entry_price))) or float(entry_price) <= 0.0:
+        return False
+    if (not np.isfinite(float(mark_price))) or float(mark_price) <= 0.0:
+        return False
+    pnl_frac = np.sign(float(qty)) * (float(mark_price) - float(entry_price)) / float(entry_price)
+    return bool(pnl_frac <= -float(hard_stop_loss_frac))
+
+
+def _resolve_target_qty(
+    *,
+    raw_target: float,
+    price: float,
+    current_qty: float,
+    equity: float,
+    target_signal_mode: str,
+    target_weight_deadband_frac: float,
+) -> float:
+    if str(target_signal_mode) == TARGET_SIGNAL_MODE_WEIGHT:
+        if not np.isfinite(float(raw_target)):
+            raise RuntimeError("weight-target mode requires finite target weights")
+        if (not np.isfinite(float(price))) or float(price) <= 0.0:
+            raise RuntimeError("weight-target mode requires finite positive prices")
+        if (not np.isfinite(float(equity))) or float(equity) <= 0.0:
+            return float(current_qty)
+        target_qty = float(np.rint(float(raw_target) * float(equity) / float(price)))
+    else:
+        target_qty = float(np.trunc(float(raw_target)))
+
+    current = float(current_qty)
+    deadband = float(target_weight_deadband_frac)
+    if deadband > 0.0:
+        if abs(current) > 0.0:
+            if abs(target_qty - current) < deadband * abs(current):
+                return current
+    return target_qty
+
+
 def _dynamic_slippage_bps(
     *,
     t_index: int,
@@ -299,13 +359,25 @@ def simulate_portfolio_from_signals(
     session_id_t: np.ndarray | None = None,
     volume_ta: np.ndarray | None = None,
     execution_realism: ExecutionRealismConfig | None = None,
+    *,
+    target_signal_mode: str = TARGET_SIGNAL_MODE_QUANTITY,
+    target_weight_deadband_frac: float = 0.0,
+    min_holding_minutes: int = 0,
+    hard_stop_loss_frac: float = 0.0,
 ) -> SimulationResult:
     close_px_ta = np.asarray(close_px_ta)
     target_qty_ta = np.asarray(target_qty_ta)
     assert_float64("risk_engine.close_px_ta", close_px_ta)
     assert_float64("risk_engine.target_qty_ta", target_qty_ta)
     close_px_ta = close_px_ta.astype(np.float64, copy=False)
-    target_qty_ta = np.trunc(target_qty_ta.astype(np.float64, copy=False))
+    target_qty_ta = target_qty_ta.astype(np.float64, copy=False)
+    target_signal_mode = _resolve_target_signal_mode(target_signal_mode)
+    if float(target_weight_deadband_frac) < 0.0:
+        raise RuntimeError("target_weight_deadband_frac must be >= 0")
+    if int(min_holding_minutes) < 0:
+        raise RuntimeError("min_holding_minutes must be >= 0")
+    if float(hard_stop_loss_frac) < 0.0:
+        raise RuntimeError("hard_stop_loss_frac must be >= 0")
 
     if close_px_ta.shape != target_qty_ta.shape:
         raise RuntimeError("risk_engine input shape mismatch")
@@ -336,6 +408,8 @@ def simulate_portfolio_from_signals(
         dynamic_tick_size_a = np.asarray(realism.tick_size_a, dtype=np.float64)
         dynamic_minute_of_day_t = np.asarray(realism.minute_of_day_t, dtype=np.int32)
     qty = np.zeros(A, dtype=np.float64)
+    position_entry_bar = np.full(A, -1, dtype=np.int64)
+    position_entry_price = np.zeros(A, dtype=np.float64)
     cash = float(initial_cash)
     eq = np.zeros(T, dtype=np.float64)
     filled_qty = np.zeros((T, A), dtype=np.float64)
@@ -402,9 +476,32 @@ def simulate_portfolio_from_signals(
             execution_diagnostics["debit_cost_total"] += float(debit_cost)
             day_start_eq = float(cash + np.sum(qty * px))
         session_start_equity_t[t] = float(day_start_eq)
+        mark_equity = float(cash + np.sum(qty * px))
 
         for a in range(A):
-            desired_dq = float(tgt[a] - qty[a])
+            target_qty = _resolve_target_qty(
+                raw_target=float(tgt[a]),
+                price=float(px[a]),
+                current_qty=float(qty[a]),
+                equity=mark_equity,
+                target_signal_mode=target_signal_mode,
+                target_weight_deadband_frac=float(target_weight_deadband_frac),
+            )
+            if abs(float(qty[a])) > 0.0 and int(min_holding_minutes) > 0:
+                holding_age = t - int(position_entry_bar[a]) if int(position_entry_bar[a]) >= 0 else int(min_holding_minutes)
+                stop_breached = _hard_stop_breached(
+                    qty=float(qty[a]),
+                    entry_price=float(position_entry_price[a]),
+                    mark_price=float(px[a]),
+                    hard_stop_loss_frac=float(hard_stop_loss_frac),
+                )
+                if (holding_age < int(min_holding_minutes)) and (not stop_breached):
+                    if abs(target_qty) + 1.0e-12 < abs(float(qty[a])) or (
+                        (abs(target_qty) > 0.0) and (np.sign(target_qty) != np.sign(float(qty[a])))
+                    ):
+                        target_qty = float(qty[a])
+
+            desired_dq = float(target_qty - qty[a])
             desired_qty[t, a] = float(desired_dq)
             if abs(desired_dq) <= 0.0:
                 continue
@@ -486,6 +583,8 @@ def simulate_portfolio_from_signals(
                 reg += abs(dq) * float(cost_cfg.finra_taf_per_share_sell)
                 reg += notional * float(cost_cfg.sec_fee_per_dollar_sell)
             total_cost = slip + comm + loc + reg
+            old_qty = float(qty[a])
+            old_entry_price = float(position_entry_price[a])
             cash -= dq * float(px[a]) + total_cost
             qty[a] += dq
             filled_qty[t, a] = float(dq)
@@ -503,6 +602,19 @@ def simulate_portfolio_from_signals(
             execution_diagnostics["commission_cost_total"] += float(comm)
             execution_diagnostics["regulatory_cost_total"] += float(reg)
             execution_diagnostics["locate_cost_total"] += float(loc)
+
+            new_qty = float(qty[a])
+            if abs(new_qty) <= 0.0:
+                position_entry_bar[a] = np.int64(-1)
+                position_entry_price[a] = 0.0
+            elif abs(old_qty) <= 0.0 or np.sign(old_qty) != np.sign(new_qty):
+                position_entry_bar[a] = np.int64(t)
+                position_entry_price[a] = float(px[a])
+            elif np.sign(old_qty) == np.sign(new_qty) and abs(new_qty) > abs(old_qty):
+                added = abs(new_qty) - abs(old_qty)
+                position_entry_price[a] = (
+                    abs(old_qty) * old_entry_price + added * float(px[a])
+                ) / max(abs(new_qty), 1.0)
 
         market_value = float(np.sum(qty * px))
         equity = float(cash + market_value)

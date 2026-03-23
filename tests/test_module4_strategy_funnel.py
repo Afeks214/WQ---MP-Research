@@ -127,6 +127,24 @@ class TestModule4StrategyFunnel(unittest.TestCase):
         np.testing.assert_array_equal(out_default.intent_short_ta, out_compat.intent_short_ta)
         np.testing.assert_allclose(out_default.target_qty_ta, out_compat.target_qty_ta, rtol=0.0, atol=0.0)
 
+    def test_weight_target_mode_exports_continuous_target_weights(self):
+        st = _mk_state(T=30, A=6)
+        out = run_module4_signal_funnel(
+            st,
+            _mk_canonical_m3(st.cfg.T, st.cfg.A),
+            Module4Config(
+                max_abs_weight=0.8,
+                target_signal_mode="weight_target",
+                target_weight_deadband_frac=0.15,
+                min_holding_minutes=10,
+            ),
+        )
+        self.assertTrue(np.all(np.isfinite(out.target_qty_ta)))
+        self.assertTrue(np.any(~np.isclose(out.target_qty_ta, np.sign(out.target_qty_ta), rtol=0.0, atol=1e-12)))
+        self.assertIsNotNone(out.target_weight_ta)
+        assert out.target_weight_ta is not None
+        np.testing.assert_allclose(out.target_qty_ta, out.target_weight_ta, rtol=0.0, atol=0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

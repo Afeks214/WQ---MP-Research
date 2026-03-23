@@ -92,6 +92,10 @@ class Module4Config:
 
     # Allocation controls
     max_abs_weight: float = 1.0
+    target_signal_mode: str = "discrete_position"
+    target_weight_deadband_frac: float = 0.0
+    min_holding_minutes: int = 0
+    hard_stop_loss_frac: float = 0.0
 
     # Allocation
     top_k_intraday: int = 5
@@ -148,6 +152,17 @@ class Module4Config:
     f6_numeric_tolerance: float = 1.0e-4
     f6_behavioral_mismatch_max: float = 0.02
     enable_f5_close_overlay: bool = True
+
+    def __post_init__(self) -> None:
+        mode = str(self.target_signal_mode).strip().lower()
+        if mode not in {"discrete_position", "weight_target"}:
+            raise RuntimeError("target_signal_mode must be one of: discrete_position, weight_target")
+        if float(self.target_weight_deadband_frac) < 0.0:
+            raise RuntimeError("target_weight_deadband_frac must be >= 0")
+        if int(self.min_holding_minutes) < 0:
+            raise RuntimeError("min_holding_minutes must be >= 0")
+        if float(self.hard_stop_loss_frac) < 0.0:
+            raise RuntimeError("hard_stop_loss_frac must be >= 0")
 
 
 @dataclass
@@ -412,13 +427,18 @@ def _execute_to_target(
     return cash, realized, delta, trade_cost, skipped
 
 
-def _decision_to_signal_output(decision: Any) -> Module4SignalOutput:
+def _decision_to_signal_output(decision: Any, cfg4: Module4Config) -> Module4SignalOutput:
+    target_signal_mode = str(getattr(cfg4, "target_signal_mode", "discrete_position")).strip().lower()
+    if target_signal_mode == "weight_target":
+        target_signal = np.asarray(decision.target_weight).T
+    else:
+        target_signal = np.asarray(decision.target_position).T
     out = Module4SignalOutput(
         regime_primary_ta=np.ascontiguousarray(np.asarray(decision.regime_id).T, dtype=np.int8),
         regime_confidence_ta=np.ascontiguousarray(np.asarray(decision.regime_confidence).T, dtype=np.float64),
         intent_long_ta=np.ascontiguousarray(np.asarray(decision.intent_long).T, dtype=bool),
         intent_short_ta=np.ascontiguousarray(np.asarray(decision.intent_short).T, dtype=bool),
-        target_qty_ta=np.ascontiguousarray(np.asarray(decision.target_position).T, dtype=np.float64),
+        target_qty_ta=np.ascontiguousarray(np.asarray(target_signal, dtype=np.float64), dtype=np.float64),
     )
     object.__setattr__(
         out,
@@ -1510,7 +1530,7 @@ def run_module4_signal_funnel(
         cfg4,
         degraded_mode_mask_at=degraded_mode_mask_at,
     )
-    return _decision_to_signal_output(decision)
+    return _decision_to_signal_output(decision, cfg4)
 
 
 if __name__ == "__main__":

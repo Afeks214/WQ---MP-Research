@@ -11,6 +11,8 @@ from weightiz.module1.core import (
 )
 from weightiz.module2.core import (
     Module2Config,
+    _apply_signal_hysteresis_ta,
+    _causal_ema_ta,
     _rolling_median_mad_causal,
     compute_value_area_greedy,
     precompute_market_physics,
@@ -61,6 +63,43 @@ def _fill_ohlcv_valid(st, seed: int = 7):
 
 
 class TestModule2Core(unittest.TestCase):
+    def test_causal_ema_ta_is_prefix_causal(self):
+        arr = np.array(
+            [
+                [0.0],
+                [1.0],
+                [0.0],
+                [1.0],
+            ],
+            dtype=np.float64,
+        )
+        valid = np.ones_like(arr, dtype=bool)
+        out = _causal_ema_ta(arr, valid, alpha=0.5)
+        np.testing.assert_allclose(
+            out[:, 0],
+            np.array([0.0, 0.5, 0.25, 0.625], dtype=np.float64),
+            rtol=0.0,
+            atol=1e-12,
+        )
+
+    def test_signal_hysteresis_requires_confirming_bars_before_flip(self):
+        long_signal = np.array([[0.7], [0.2], [0.2], [0.2], [0.2]], dtype=np.float64)
+        short_signal = np.array([[0.0], [0.8], [0.1], [0.8], [0.8]], dtype=np.float64)
+        valid = np.ones_like(long_signal, dtype=bool)
+
+        active_long, active_short, state = _apply_signal_hysteresis_ta(
+            long_signal_ta=long_signal,
+            short_signal_ta=short_signal,
+            valid_ta=valid,
+            entry_threshold=0.5,
+            exit_threshold=0.1,
+            debounce_window=2,
+        )
+
+        np.testing.assert_array_equal(state[:, 0], np.array([0, 0, 0, 0, -1], dtype=np.int8))
+        np.testing.assert_array_equal(active_long[:, 0], np.array([False, False, False, False, False]))
+        np.testing.assert_array_equal(active_short[:, 0], np.array([False, False, False, False, True]))
+
     def test_value_area_greedy_differs_from_offset_scan_on_asymmetric_shoulders(self):
         x = np.asarray([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=np.float64)
         # POC at 0 with asymmetric shoulders: greedy should select left first.

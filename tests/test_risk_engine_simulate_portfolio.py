@@ -345,3 +345,101 @@ def test_simulate_portfolio_initializes_execution_diagnostics_on_uncapped_trade_
     assert out.execution_diagnostics is not None
     assert int(out.execution_diagnostics["desired_fill_attempt_count"]) == 2
     assert int(out.execution_diagnostics["filled_trade_count"]) == 2
+
+
+def test_weight_target_mode_applies_deadband_before_rebalancing() -> None:
+    px = np.full((3, 1), 100.0, dtype=np.float64)
+    tgt = np.array([[0.20], [0.21], [0.30]], dtype=np.float64)
+
+    out = simulate_portfolio_from_signals(
+        px,
+        tgt,
+        10_000.0,
+        CostConfig(),
+        RiskConfig(
+            max_position_buying_power_frac=10.0,
+            overnight_exposure_equity_mult=100.0,
+            daily_loss_limit_frac=1.0,
+            account_disable_equity=0.0,
+        ),
+        target_signal_mode="weight_target",
+        target_weight_deadband_frac=0.15,
+    )
+
+    np.testing.assert_allclose(out.filled_qty_ta[:, 0], np.array([20.0, 0.0, 10.0], dtype=np.float64))
+    np.testing.assert_allclose(out.position_qty_ta[:, 0], np.array([20.0, 20.0, 30.0], dtype=np.float64))
+
+
+def test_weight_target_mode_does_not_block_flat_entry_with_deadband() -> None:
+    px = np.full((1, 1), 100.0, dtype=np.float64)
+    tgt = np.array([[0.06]], dtype=np.float64)
+
+    out = simulate_portfolio_from_signals(
+        px,
+        tgt,
+        10_000.0,
+        CostConfig(),
+        RiskConfig(
+            max_position_buying_power_frac=10.0,
+            overnight_exposure_equity_mult=100.0,
+            daily_loss_limit_frac=1.0,
+            account_disable_equity=0.0,
+        ),
+        target_signal_mode="weight_target",
+        target_weight_deadband_frac=0.15,
+    )
+
+    np.testing.assert_allclose(out.filled_qty_ta[:, 0], np.array([6.0], dtype=np.float64))
+
+
+def test_weight_target_mode_enforces_min_holding_before_reversal() -> None:
+    px = np.full((11, 1), 100.0, dtype=np.float64)
+    tgt = np.vstack(
+        [
+            np.array([[0.20]], dtype=np.float64),
+            np.full((10, 1), -0.20, dtype=np.float64),
+        ]
+    )
+
+    out = simulate_portfolio_from_signals(
+        px,
+        tgt,
+        10_000.0,
+        CostConfig(),
+        RiskConfig(
+            max_position_buying_power_frac=10.0,
+            overnight_exposure_equity_mult=100.0,
+            daily_loss_limit_frac=1.0,
+            account_disable_equity=0.0,
+        ),
+        target_signal_mode="weight_target",
+        min_holding_minutes=10,
+    )
+
+    np.testing.assert_allclose(out.filled_qty_ta[0, 0], 20.0, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(out.filled_qty_ta[1:10, 0], np.zeros(9, dtype=np.float64), rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(out.filled_qty_ta[10, 0], -40.0, rtol=0.0, atol=1e-12)
+
+
+def test_weight_target_mode_allows_stop_loss_override_before_min_hold() -> None:
+    px = np.array([[100.0], [94.0]], dtype=np.float64)
+    tgt = np.array([[0.20], [-0.20]], dtype=np.float64)
+
+    out = simulate_portfolio_from_signals(
+        px,
+        tgt,
+        10_000.0,
+        CostConfig(),
+        RiskConfig(
+            max_position_buying_power_frac=10.0,
+            overnight_exposure_equity_mult=100.0,
+            daily_loss_limit_frac=1.0,
+            account_disable_equity=0.0,
+        ),
+        target_signal_mode="weight_target",
+        min_holding_minutes=10,
+        hard_stop_loss_frac=0.03,
+    )
+
+    np.testing.assert_allclose(out.filled_qty_ta[0, 0], 20.0, rtol=0.0, atol=1e-12)
+    assert float(out.filled_qty_ta[1, 0]) < 0.0

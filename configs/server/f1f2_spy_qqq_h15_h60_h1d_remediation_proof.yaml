@@ -1,0 +1,275 @@
+run_name: f1f2_spy_qqq_h15_h60_h1d_remediation_proof
+symbols:
+  - SPY
+  - QQQ
+
+data:
+  root: /data/weightiz/repo/WQ---MP-Research-main-mp/data/minute_10asset_20260319
+  format: parquet
+  start: '2025-01-02T00:00:00Z'
+  end: '2025-06-30T23:59:59Z'
+  timestamp_column: timestamp
+
+engine:
+  initial_cash: 10000.0
+  tick_size_default: 0.01
+
+module2_configs:
+  - profile_window_bars: 45
+    profile_warmup_bars: 45
+    atr_span: 8
+    rvol_lookback_sessions: 8
+    va_threshold: 0.66
+    delta_gate_threshold: 1.05
+    signal_smoothing_alpha: 0.55
+    signal_hysteresis_entry_threshold: 0.08
+    signal_hysteresis_exit_threshold: 0.03
+    signal_debounce_window: 2
+    fail_on_non_finite_output: true
+  - profile_window_bars: 90
+    profile_warmup_bars: 90
+    atr_span: 14
+    rvol_lookback_sessions: 16
+    va_threshold: 0.70
+    delta_gate_threshold: 1.20
+    signal_smoothing_alpha: 0.40
+    signal_hysteresis_entry_threshold: 0.10
+    signal_hysteresis_exit_threshold: 0.04
+    signal_debounce_window: 3
+    fail_on_non_finite_output: true
+
+module3_configs:
+  - structural_windows: [15, 30]
+    selected_window: 15
+    context_mode: rolling_context
+    rolling_context_period: 4
+    block_minutes: 15
+    phase_mask: [1, 2]
+    include_partial_last_block: true
+    min_block_valid_bars: 6
+    min_block_valid_ratio: 0.80
+    ib_pop_frac: 0.010
+    fail_on_non_finite_output: false
+  - structural_windows: [30, 60, 90]
+    selected_window: 60
+    context_mode: ffill_last_complete
+    block_minutes: 30
+    phase_mask: [1, 2]
+    include_partial_last_block: true
+    min_block_valid_bars: 12
+    min_block_valid_ratio: 0.85
+    ib_pop_frac: 0.010
+    fail_on_non_finite_output: false
+  - structural_windows: [60, 120, 390]
+    selected_window: 390
+    context_mode: ffill_last_complete
+    block_minutes: 60
+    phase_mask: [1, 2]
+    include_partial_last_block: true
+    min_block_valid_bars: 12
+    min_block_valid_ratio: 0.85
+    ib_pop_frac: 0.010
+    fail_on_non_finite_output: false
+
+module4_configs:
+  - window_selection_mode: multi_window
+    fixed_window_index: 0
+    anchor_window_index: 0
+    regime_confidence_min: 0.60
+    entry_threshold: 0.58
+    exit_threshold: 0.20
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 0.06
+    target_signal_mode: weight_target
+    target_weight_deadband_frac: 0.15
+    min_holding_minutes: 15
+    hard_stop_loss_frac: 0.018
+    max_asset_cap_frac: 0.20
+    max_turnover_frac_per_bar: 0.10
+    overnight_min_conviction: 0.98
+    allow_cash_overnight: true
+  - window_selection_mode: multi_window
+    fixed_window_index: 1
+    anchor_window_index: 1
+    regime_confidence_min: 0.66
+    entry_threshold: 0.60
+    exit_threshold: 0.22
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 0.05
+    target_signal_mode: weight_target
+    target_weight_deadband_frac: 0.20
+    min_holding_minutes: 60
+    hard_stop_loss_frac: 0.025
+    max_asset_cap_frac: 0.18
+    max_turnover_frac_per_bar: 0.08
+    overnight_min_conviction: 0.92
+    allow_cash_overnight: true
+  - window_selection_mode: multi_window
+    fixed_window_index: 2
+    anchor_window_index: 2
+    regime_confidence_min: 0.70
+    entry_threshold: 0.62
+    exit_threshold: 0.24
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 0.04
+    target_signal_mode: weight_target
+    target_weight_deadband_frac: 0.25
+    min_holding_minutes: 390
+    hard_stop_loss_frac: 0.035
+    max_asset_cap_frac: 0.15
+    max_turnover_frac_per_bar: 0.05
+    overnight_min_conviction: 0.70
+    allow_cash_overnight: false
+
+harness:
+  seed: 97
+  research_mode: discovery
+  timezone: America/New_York
+  freq: 1min
+  min_asset_coverage: 0.80
+  purge_bars: 30
+  embargo_bars: 15
+  wf_train_sessions: 30
+  wf_test_sessions: 30
+  wf_step_sessions: 10
+  cpcv_slices: 4
+  cpcv_k_test: 2
+  disable_cpcv_splits: false
+  parallel_backend: process_pool
+  parallel_workers: 40
+  stress_profile: baseline_mild_severe
+  report_dir: /data/weightiz/runs/f1f2_spy_qqq_h15_h60_h1d_remediation_proof_20260323/artifacts
+  export_micro_diagnostics: true
+  cluster_corr_threshold: 0.85
+  group_bound_execution_enabled: true
+  group_dispatch_policy: largest_first_stable
+  group_max_in_flight_factor: 1
+  group_target_wall_time_sec: 180.0
+  group_min_candidates_per_chunk: 4
+  group_max_candidates_per_chunk_hard: 8
+  process_pool_candidate_chunk_size: 4
+  scratch_mode: compact
+  daily_return_min_days: 30
+  benchmark_symbol: SPY
+  horizon_minutes: [15, 60, 390]
+  robustness_weight_dsr: 0.20
+  robustness_weight_pbo: 0.15
+  robustness_weight_spa: 0.10
+  robustness_weight_regime: 0.20
+  robustness_weight_execution: 0.20
+  robustness_weight_horizon: 0.15
+  robustness_reject_threshold: 0.40
+  execution_cost_model: dynamic_bucketed_v1
+  execution_transaction_cost_per_trade: 0.0015
+  execution_finra_taf_per_share_sell: 0.000195
+  execution_sec31_rate_per_million: 0.0
+  execution_short_borrow_apr: 0.003
+  execution_short_locate_fee_per_share: 0.0
+  execution_debit_apr: 0.0
+  execution_max_volume_participation: 0.10
+  execution_open_bucket_minutes: 30
+  execution_close_bucket_minutes: 30
+  execution_open_slippage_mult: 1.25
+  execution_mid_slippage_mult: 1.0
+  execution_close_slippage_mult: 1.15
+  execution_participation_slippage_coeff: 1.0
+  execution_dynamic_slippage_bps_cap: 15.0
+
+stress_scenarios:
+  - scenario_id: baseline
+    name: baseline
+    scenario_group: stress
+    missing_burst_prob: 0.0
+    missing_burst_min: 0
+    missing_burst_max: 0
+    jitter_sigma_bps: 0.0
+    slippage_mult: 1.0
+    signal_lag_bars: 0
+    entry_threshold_shift: 0.0
+    exit_threshold_shift: 0.0
+    target_scale_mult: 1.0
+    enabled: true
+
+candidates:
+  mode: manual
+  specs:
+    - candidate_id: cand_F1_H15
+      m2_idx: 0
+      m3_idx: 0
+      m4_idx: 0
+      enabled_assets: all
+      tags:
+        - family_id=F1
+        - family_name=fast_persistence_momentum
+        - horizon_id=H15
+        - hypothesis_id=F1_H15
+    - candidate_id: cand_F2_H15
+      m2_idx: 1
+      m3_idx: 0
+      m4_idx: 0
+      enabled_assets: all
+      tags:
+        - family_id=F2
+        - family_name=slow_structural_hold
+        - horizon_id=H15
+        - hypothesis_id=F2_H15
+    - candidate_id: cand_F1_H60
+      m2_idx: 0
+      m3_idx: 1
+      m4_idx: 1
+      enabled_assets: all
+      tags:
+        - family_id=F1
+        - family_name=fast_persistence_momentum
+        - horizon_id=H60
+        - hypothesis_id=F1_H60
+    - candidate_id: cand_F2_H60
+      m2_idx: 1
+      m3_idx: 1
+      m4_idx: 1
+      enabled_assets: all
+      tags:
+        - family_id=F2
+        - family_name=slow_structural_hold
+        - horizon_id=H60
+        - hypothesis_id=F2_H60
+    - candidate_id: cand_F1_H1D
+      m2_idx: 0
+      m3_idx: 2
+      m4_idx: 2
+      enabled_assets: all
+      tags:
+        - family_id=F1
+        - family_name=fast_persistence_momentum
+        - horizon_id=H1D
+        - hypothesis_id=F1_H1D
+    - candidate_id: cand_F2_H1D
+      m2_idx: 1
+      m3_idx: 2
+      m4_idx: 2
+      enabled_assets: all
+      tags:
+        - family_id=F2
+        - family_name=slow_structural_hold
+        - horizon_id=H1D
+        - hypothesis_id=F2_H1D
+
+module6:
+  intake:
+    run_policy_class: representative_discovery
+    min_availability_ratio: 0.20
+    min_observed_sessions: 20
+    required_comparison_support: 0.80
+  gate_overrides:
+    min_availability_ratio:
+      value: 0.20
+      force_static: true
+  reduction:
+    duplicate_corr_threshold: 0.85
+  scoring:
+    min_cross_universe_support: 0.80
+    shortlist_session_keep: 32
+    shortlist_minute_keep: 12

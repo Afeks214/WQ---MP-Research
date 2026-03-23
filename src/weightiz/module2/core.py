@@ -154,6 +154,10 @@ class Module2Config:
     delta_mad_min_periods: int = 10
     sigma_delta_min: float = 0.05
     delta_gate_threshold: float = 1.0
+    signal_smoothing_alpha: float = 1.0
+    signal_hysteresis_entry_threshold: float = 0.0
+    signal_hysteresis_exit_threshold: float = 0.0
+    signal_debounce_window: int = 1
 
     # Taxonomy thresholds (for optional snapshot output)
     normal_concentration_threshold: float = 0.05
@@ -176,6 +180,18 @@ class Module2Config:
     golden_reference_path: str | None = None
     spec_path: str | None = None
     spec_id: str = "main-3"
+
+    def __post_init__(self) -> None:
+        if not (0.0 < float(self.signal_smoothing_alpha) <= 1.0):
+            raise RuntimeError("signal_smoothing_alpha must be in (0, 1]")
+        if float(self.signal_hysteresis_entry_threshold) < 0.0:
+            raise RuntimeError("signal_hysteresis_entry_threshold must be >= 0")
+        if float(self.signal_hysteresis_exit_threshold) < 0.0:
+            raise RuntimeError("signal_hysteresis_exit_threshold must be >= 0")
+        if float(self.signal_hysteresis_exit_threshold) > float(self.signal_hysteresis_entry_threshold):
+            raise RuntimeError("signal_hysteresis_exit_threshold must be <= signal_hysteresis_entry_threshold")
+        if int(self.signal_debounce_window) <= 0:
+            raise RuntimeError("signal_debounce_window must be > 0")
 
 
 @dataclass
@@ -221,6 +237,115 @@ def _assert_finite(name: str, arr: np.ndarray) -> None:
     if not np.all(np.isfinite(arr)):
         bad = np.argwhere(~np.isfinite(arr))[:8]
         raise RuntimeError(f"{name} contains non-finite values at indices {bad.tolist()}")
+
+
+def _causal_ema_ta(arr_ta: np.ndarray, valid_ta: np.ndarray, *, alpha: float) -> np.ndarray:
+    arr = np.asarray(arr_ta, dtype=np.float64)
+    valid = np.asarray(valid_ta, dtype=bool)
+    if arr.shape != valid.shape:
+        raise RuntimeError(f"_causal_ema_ta shape mismatch: arr={arr.shape} valid={valid.shape}")
+    if float(alpha) >= 1.0:
+        return np.where(valid, arr, 0.0)
+
+    T, A = arr.shape
+    out = np.zeros((T, A), dtype=np.float64)
+    prev = np.zeros(A, dtype=np.float64)
+    seeded = np.zeros(A, dtype=bool)
+    one_minus_alpha = 1.0 - float(alpha)
+
+    for t in range(T):
+        row_valid = valid[t]
+        if not np.any(row_valid):
+            continue
+        row = np.where(row_valid, arr[t], 0.0)
+        seed_mask = row_valid & (~seeded)
+        if np.any(seed_mask):
+            prev[seed_mask] = row[seed_mask]
+            seeded[seed_mask] = True
+        live_mask = row_valid & seeded & (~seed_mask)
+        if np.any(live_mask):
+            prev[live_mask] = float(alpha) * row[live_mask] + one_minus_alpha * prev[live_mask]
+        out[t, row_valid] = prev[row_valid]
+    return out
+
+
+def _apply_signal_hysteresis_ta(
+    *,
+    long_signal_ta: np.ndarray,
+    short_signal_ta: np.ndarray,
+    valid_ta: np.ndarray,
+    entry_threshold: float,
+    exit_threshold: float,
+    debounce_window: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    long_signal = np.asarray(long_signal_ta, dtype=np.float64)
+    short_signal = np.asarray(short_signal_ta, dtype=np.float64)
+    valid = np.asarray(valid_ta, dtype=bool)
+    if long_signal.shape != short_signal.shape or long_signal.shape != valid.shape:
+        raise RuntimeError(
+            "_apply_signal_hysteresis_ta shape mismatch: "
+            f"long={long_signal.shape} short={short_signal.shape} valid={valid.shape}"
+        )
+
+    T, A = long_signal.shape
+    active_long = np.zeros((T, A), dtype=bool)
+    active_short = np.zeros((T, A), dtype=bool)
+    state_ta = np.zeros((T, A), dtype=np.int8)
+    entry = float(entry_threshold)
+    exit_ = float(exit_threshold)
+    debounce = int(debounce_window)
+
+    for a in range(A):
+        state = 0
+        up_count = 0
+        down_count = 0
+        for t in range(T):
+            if not bool(valid[t, a]):
+                state = 0
+                up_count = 0
+                down_count = 0
+                continue
+
+            long_v = float(long_signal[t, a])
+            short_v = float(short_signal[t, a])
+            signed_edge = long_v - short_v
+
+            long_trigger = signed_edge >= entry
+            short_trigger = signed_edge <= -entry
+            flat_trigger = abs(signed_edge) <= exit_
+
+            up_count = up_count + 1 if long_trigger else 0
+            down_count = down_count + 1 if short_trigger else 0
+
+            if state > 0:
+                if down_count >= debounce:
+                    state = -1
+                    up_count = 0
+                elif flat_trigger:
+                    state = 0
+                    up_count = 0
+                    down_count = 0
+            elif state < 0:
+                if up_count >= debounce:
+                    state = 1
+                    down_count = 0
+                elif flat_trigger:
+                    state = 0
+                    up_count = 0
+                    down_count = 0
+            else:
+                if up_count >= debounce:
+                    state = 1
+                    down_count = 0
+                elif down_count >= debounce:
+                    state = -1
+                    up_count = 0
+
+            state_ta[t, a] = np.int8(state)
+            active_long[t, a] = state > 0
+            active_short[t, a] = state < 0
+
+    return active_long, active_short, state_ta
 
 
 def validate_feature_tensor_contract(tensor: np.ndarray, metadata: dict[str, object] | None = None) -> None:
@@ -1451,6 +1576,39 @@ def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
     score_reject = sbase_reject * greject
     score_rej_long = score_reject * _sigmoid(-dclip_all)
     score_rej_short = score_reject * _sigmoid(dclip_all)
+
+    signal_alpha = float(cfg.signal_smoothing_alpha)
+    if signal_alpha < 1.0:
+        z_delta = _causal_ema_ta(z_delta, valid_post, alpha=signal_alpha)
+        gbreak = _causal_ema_ta(gbreak, valid_post, alpha=signal_alpha)
+        greject = _causal_ema_ta(greject, valid_post, alpha=signal_alpha)
+        score_bo_long = _causal_ema_ta(score_bo_long, valid_post, alpha=signal_alpha)
+        score_bo_short = _causal_ema_ta(score_bo_short, valid_post, alpha=signal_alpha)
+        score_reject = _causal_ema_ta(score_reject, valid_post, alpha=signal_alpha)
+        score_rej_long = _causal_ema_ta(score_rej_long, valid_post, alpha=signal_alpha)
+        score_rej_short = _causal_ema_ta(score_rej_short, valid_post, alpha=signal_alpha)
+
+    entry_threshold = float(cfg.signal_hysteresis_entry_threshold)
+    exit_threshold = float(cfg.signal_hysteresis_exit_threshold)
+    debounce_window = int(cfg.signal_debounce_window)
+    if (entry_threshold > 0.0) or (debounce_window > 1):
+        active_long, active_short, state_dir = _apply_signal_hysteresis_ta(
+            long_signal_ta=np.maximum(score_bo_long, score_rej_long),
+            short_signal_ta=np.maximum(score_bo_short, score_rej_short),
+            valid_ta=valid_post,
+            entry_threshold=entry_threshold,
+            exit_threshold=exit_threshold,
+            debounce_window=debounce_window,
+        )
+        score_bo_long = np.where(active_long, score_bo_long, 0.0)
+        score_bo_short = np.where(active_short, score_bo_short, 0.0)
+        score_rej_long = np.where(active_long, score_rej_long, 0.0)
+        score_rej_short = np.where(active_short, score_rej_short, 0.0)
+        score_reject = np.maximum(score_rej_long, score_rej_short)
+        gbreak = np.where(active_long | active_short, gbreak, 0.0)
+        greject = np.where(active_long | active_short, greject, 0.0)
+        z_delta = np.where(state_dir > 0, np.maximum(z_delta, 0.0), z_delta)
+        z_delta = np.where(state_dir < 0, np.minimum(z_delta, 0.0), z_delta)
 
     z_chan = state.profile_stats[:, :, int(ProfileStatIdx.Z_DELTA)]
     gb_chan = state.profile_stats[:, :, int(ProfileStatIdx.GBREAK)]

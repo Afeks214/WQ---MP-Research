@@ -1828,6 +1828,14 @@ def _run_group_task(
                 session_id_t=st.session_id,
                 volume_ta=st.volume,
                 execution_realism=raw_execution_realism,
+                target_signal_mode=(
+                    "weight_target"
+                    if str(getattr(m4_cfg, "target_signal_mode", "discrete_position")).strip().lower() == "weight_target"
+                    else "quantity_target"
+                ),
+                target_weight_deadband_frac=float(getattr(m4_cfg, "target_weight_deadband_frac", 0.0)),
+                min_holding_minutes=int(getattr(m4_cfg, "min_holding_minutes", 0)),
+                hard_stop_loss_frac=float(getattr(m4_cfg, "hard_stop_loss_frac", 0.0)),
             )
             low_slippage_bps = (
                 float(m4_cfg.slippage_bps_low_rvol)
@@ -1884,6 +1892,14 @@ def _run_group_task(
                 session_id_t=st.session_id,
                 volume_ta=st.volume,
                 execution_realism=exec_execution_realism,
+                target_signal_mode=(
+                    "weight_target"
+                    if str(getattr(m4_cfg, "target_signal_mode", "discrete_position")).strip().lower() == "weight_target"
+                    else "quantity_target"
+                ),
+                target_weight_deadband_frac=float(getattr(m4_cfg, "target_weight_deadband_frac", 0.0)),
+                min_holding_minutes=int(getattr(m4_cfg, "min_holding_minutes", 0)),
+                hard_stop_loss_frac=float(getattr(m4_cfg, "hard_stop_loss_frac", 0.0)),
             )
             m4_out = _materialize_risk_outputs_into_state(st, m4_sig, risk_res_exec)
             if _resolve_candidate_scratch_mode(harness_cfg) == "full":
@@ -2492,8 +2508,6 @@ def run_weightiz_harness(
 ) -> HarnessOutput:
     if not m2_configs or not m3_configs or not m4_configs:
         raise RuntimeError("m2_configs/m3_configs/m4_configs must be non-empty")
-    if len(m2_configs) != 1:
-        raise RuntimeError("ARCHITECTURE_CONSISTENCY_FAILURE: canonical path requires exactly one module2 config")
 
     _validate_institutional_harness_config(harness_cfg)
 
