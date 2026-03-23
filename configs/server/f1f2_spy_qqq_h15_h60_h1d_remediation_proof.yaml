@@ -377,7 +377,20 @@ module6:
       force_static: true
   reduction:
     duplicate_corr_threshold: 0.85
+  generator:
+    random_sparse_quota: 512
+    cluster_balanced_quota: 128
+    hrp_variant_quota: 12
+    mv_variant_quota: 8
+    random_sparse_batch_size: 256
+    active_cardinality_choices: [2]
   scoring:
     min_cross_universe_support: 0.80
-    shortlist_session_keep: 32
-    shortlist_minute_keep: 12
+    shortlist_session_keep: 16
+    shortlist_minute_keep: 8
+    final_scalar_keep: 8
+    final_primary_count: 2
+    final_alternate_count: 2
+  runtime:
+    portfolio_batch_size: 256
+    minute_replay_batch_size: 8
