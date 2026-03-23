@@ -338,21 +338,6 @@ harness:
   execution_participation_slippage_coeff: 1.0
   execution_dynamic_slippage_bps_cap: 15.0
 
-stress_scenarios:
-  - scenario_id: baseline
-    name: baseline
-    scenario_group: stress
-    missing_burst_prob: 0.0
-    missing_burst_min: 0
-    missing_burst_max: 0
-    jitter_sigma_bps: 0.0
-    slippage_mult: 1.0
-    signal_lag_bars: 0
-    entry_threshold_shift: 0.0
-    exit_threshold_shift: 0.0
-    target_scale_mult: 1.0
-    enabled: true
-
 candidates:
   mode: manual
   specs:
@@ -368,7 +353,7 @@ candidates:
         - hypothesis_id=cand_F1_H15_00
     - candidate_id: cand_F1_H15_01
       m2_idx: 0
-      m3_idx: 0
+      m3_idx: 1
       m4_idx: 1
       enabled_assets: all
       tags:
@@ -377,8 +362,8 @@ candidates:
         - horizon_id=H15
         - hypothesis_id=cand_F1_H15_01
     - candidate_id: cand_F1_H15_02
-      m2_idx: 0
-      m3_idx: 1
+      m2_idx: 1
+      m3_idx: 0
       m4_idx: 0
       enabled_assets: all
       tags:
@@ -387,7 +372,7 @@ candidates:
         - horizon_id=H15
         - hypothesis_id=cand_F1_H15_02
     - candidate_id: cand_F1_H15_03
-      m2_idx: 0
+      m2_idx: 1
       m3_idx: 1
       m4_idx: 1
       enabled_assets: all
@@ -397,7 +382,7 @@ candidates:
         - horizon_id=H15
         - hypothesis_id=cand_F1_H15_03
     - candidate_id: cand_F1_H15_04
-      m2_idx: 1
+      m2_idx: 2
       m3_idx: 0
       m4_idx: 0
       enabled_assets: all
@@ -407,8 +392,8 @@ candidates:
         - horizon_id=H15
         - hypothesis_id=cand_F1_H15_04
     - candidate_id: cand_F1_H15_05
-      m2_idx: 1
-      m3_idx: 0
+      m2_idx: 2
+      m3_idx: 1
       m4_idx: 1
       enabled_assets: all
       tags:
@@ -416,106 +401,6 @@ candidates:
         - family_name=fast_persistence_momentum
         - horizon_id=H15
         - hypothesis_id=cand_F1_H15_05
-    - candidate_id: cand_F1_H15_06
-      m2_idx: 1
-      m3_idx: 1
-      m4_idx: 0
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H15
-        - hypothesis_id=cand_F1_H15_06
-    - candidate_id: cand_F1_H15_07
-      m2_idx: 1
-      m3_idx: 1
-      m4_idx: 1
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H15
-        - hypothesis_id=cand_F1_H15_07
-    - candidate_id: cand_F1_H15_08
-      m2_idx: 2
-      m3_idx: 0
-      m4_idx: 0
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H15
-        - hypothesis_id=cand_F1_H15_08
-    - candidate_id: cand_F1_H15_09
-      m2_idx: 2
-      m3_idx: 0
-      m4_idx: 1
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H15
-        - hypothesis_id=cand_F1_H15_09
-    - candidate_id: cand_F1_H15_10
-      m2_idx: 2
-      m3_idx: 1
-      m4_idx: 0
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H15
-        - hypothesis_id=cand_F1_H15_10
-    - candidate_id: cand_F1_H15_11
-      m2_idx: 2
-      m3_idx: 1
-      m4_idx: 1
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H15
-        - hypothesis_id=cand_F1_H15_11
-    - candidate_id: cand_F1_H15_12
-      m2_idx: 3
-      m3_idx: 0
-      m4_idx: 0
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H15
-        - hypothesis_id=cand_F1_H15_12
-    - candidate_id: cand_F1_H15_13
-      m2_idx: 3
-      m3_idx: 0
-      m4_idx: 1
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H15
-        - hypothesis_id=cand_F1_H15_13
-    - candidate_id: cand_F1_H15_14
-      m2_idx: 3
-      m3_idx: 1
-      m4_idx: 0
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H15
-        - hypothesis_id=cand_F1_H15_14
-    - candidate_id: cand_F1_H15_15
-      m2_idx: 3
-      m3_idx: 1
-      m4_idx: 1
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H15
-        - hypothesis_id=cand_F1_H15_15
     - candidate_id: cand_F1_H60_00
       m2_idx: 0
       m3_idx: 2
@@ -636,46 +521,6 @@ candidates:
         - family_name=fast_persistence_momentum
         - horizon_id=H60
         - hypothesis_id=cand_F1_H60_11
-    - candidate_id: cand_F1_H60_12
-      m2_idx: 3
-      m3_idx: 2
-      m4_idx: 2
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H60
-        - hypothesis_id=cand_F1_H60_12
-    - candidate_id: cand_F1_H60_13
-      m2_idx: 3
-      m3_idx: 2
-      m4_idx: 3
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H60
-        - hypothesis_id=cand_F1_H60_13
-    - candidate_id: cand_F1_H60_14
-      m2_idx: 3
-      m3_idx: 3
-      m4_idx: 2
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H60
-        - hypothesis_id=cand_F1_H60_14
-    - candidate_id: cand_F1_H60_15
-      m2_idx: 3
-      m3_idx: 3
-      m4_idx: 3
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H60
-        - hypothesis_id=cand_F1_H60_15
     - candidate_id: cand_F1_H1D_00
       m2_idx: 0
       m3_idx: 4
@@ -727,8 +572,8 @@ candidates:
         - horizon_id=H1D
         - hypothesis_id=cand_F1_H1D_04
     - candidate_id: cand_F1_H1D_05
-      m2_idx: 1
-      m3_idx: 4
+      m2_idx: 2
+      m3_idx: 5
       m4_idx: 5
       enabled_assets: all
       tags:
@@ -736,106 +581,6 @@ candidates:
         - family_name=fast_persistence_momentum
         - horizon_id=H1D
         - hypothesis_id=cand_F1_H1D_05
-    - candidate_id: cand_F1_H1D_06
-      m2_idx: 1
-      m3_idx: 5
-      m4_idx: 4
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H1D
-        - hypothesis_id=cand_F1_H1D_06
-    - candidate_id: cand_F1_H1D_07
-      m2_idx: 1
-      m3_idx: 5
-      m4_idx: 5
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H1D
-        - hypothesis_id=cand_F1_H1D_07
-    - candidate_id: cand_F1_H1D_08
-      m2_idx: 2
-      m3_idx: 4
-      m4_idx: 4
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H1D
-        - hypothesis_id=cand_F1_H1D_08
-    - candidate_id: cand_F1_H1D_09
-      m2_idx: 2
-      m3_idx: 4
-      m4_idx: 5
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H1D
-        - hypothesis_id=cand_F1_H1D_09
-    - candidate_id: cand_F1_H1D_10
-      m2_idx: 2
-      m3_idx: 5
-      m4_idx: 4
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H1D
-        - hypothesis_id=cand_F1_H1D_10
-    - candidate_id: cand_F1_H1D_11
-      m2_idx: 2
-      m3_idx: 5
-      m4_idx: 5
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H1D
-        - hypothesis_id=cand_F1_H1D_11
-    - candidate_id: cand_F1_H1D_12
-      m2_idx: 3
-      m3_idx: 4
-      m4_idx: 4
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H1D
-        - hypothesis_id=cand_F1_H1D_12
-    - candidate_id: cand_F1_H1D_13
-      m2_idx: 3
-      m3_idx: 4
-      m4_idx: 5
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H1D
-        - hypothesis_id=cand_F1_H1D_13
-    - candidate_id: cand_F1_H1D_14
-      m2_idx: 3
-      m3_idx: 5
-      m4_idx: 4
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H1D
-        - hypothesis_id=cand_F1_H1D_14
-    - candidate_id: cand_F1_H1D_15
-      m2_idx: 3
-      m3_idx: 5
-      m4_idx: 5
-      enabled_assets: all
-      tags:
-        - family_id=F1
-        - family_name=fast_persistence_momentum
-        - horizon_id=H1D
-        - hypothesis_id=cand_F1_H1D_15
     - candidate_id: cand_F2_H15_00
       m2_idx: 4
       m3_idx: 0
@@ -867,7 +612,7 @@ candidates:
         - horizon_id=H15
         - hypothesis_id=cand_F2_H15_02
     - candidate_id: cand_F2_H15_03
-      m2_idx: 4
+      m2_idx: 5
       m3_idx: 1
       m4_idx: 1
       enabled_assets: all
@@ -877,7 +622,7 @@ candidates:
         - horizon_id=H15
         - hypothesis_id=cand_F2_H15_03
     - candidate_id: cand_F2_H15_04
-      m2_idx: 5
+      m2_idx: 7
       m3_idx: 0
       m4_idx: 0
       enabled_assets: all
@@ -887,8 +632,8 @@ candidates:
         - horizon_id=H15
         - hypothesis_id=cand_F2_H15_04
     - candidate_id: cand_F2_H15_05
-      m2_idx: 5
-      m3_idx: 0
+      m2_idx: 7
+      m3_idx: 1
       m4_idx: 1
       enabled_assets: all
       tags:
@@ -896,106 +641,6 @@ candidates:
         - family_name=slow_structural_hold
         - horizon_id=H15
         - hypothesis_id=cand_F2_H15_05
-    - candidate_id: cand_F2_H15_06
-      m2_idx: 5
-      m3_idx: 1
-      m4_idx: 0
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H15
-        - hypothesis_id=cand_F2_H15_06
-    - candidate_id: cand_F2_H15_07
-      m2_idx: 5
-      m3_idx: 1
-      m4_idx: 1
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H15
-        - hypothesis_id=cand_F2_H15_07
-    - candidate_id: cand_F2_H15_08
-      m2_idx: 6
-      m3_idx: 0
-      m4_idx: 0
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H15
-        - hypothesis_id=cand_F2_H15_08
-    - candidate_id: cand_F2_H15_09
-      m2_idx: 6
-      m3_idx: 0
-      m4_idx: 1
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H15
-        - hypothesis_id=cand_F2_H15_09
-    - candidate_id: cand_F2_H15_10
-      m2_idx: 6
-      m3_idx: 1
-      m4_idx: 0
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H15
-        - hypothesis_id=cand_F2_H15_10
-    - candidate_id: cand_F2_H15_11
-      m2_idx: 6
-      m3_idx: 1
-      m4_idx: 1
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H15
-        - hypothesis_id=cand_F2_H15_11
-    - candidate_id: cand_F2_H15_12
-      m2_idx: 7
-      m3_idx: 0
-      m4_idx: 0
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H15
-        - hypothesis_id=cand_F2_H15_12
-    - candidate_id: cand_F2_H15_13
-      m2_idx: 7
-      m3_idx: 0
-      m4_idx: 1
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H15
-        - hypothesis_id=cand_F2_H15_13
-    - candidate_id: cand_F2_H15_14
-      m2_idx: 7
-      m3_idx: 1
-      m4_idx: 0
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H15
-        - hypothesis_id=cand_F2_H15_14
-    - candidate_id: cand_F2_H15_15
-      m2_idx: 7
-      m3_idx: 1
-      m4_idx: 1
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H15
-        - hypothesis_id=cand_F2_H15_15
     - candidate_id: cand_F2_H60_00
       m2_idx: 4
       m3_idx: 2
@@ -1077,7 +722,7 @@ candidates:
         - horizon_id=H60
         - hypothesis_id=cand_F2_H60_07
     - candidate_id: cand_F2_H60_08
-      m2_idx: 6
+      m2_idx: 7
       m3_idx: 2
       m4_idx: 2
       enabled_assets: all
@@ -1087,7 +732,7 @@ candidates:
         - horizon_id=H60
         - hypothesis_id=cand_F2_H60_08
     - candidate_id: cand_F2_H60_09
-      m2_idx: 6
+      m2_idx: 7
       m3_idx: 2
       m4_idx: 3
       enabled_assets: all
@@ -1097,7 +742,7 @@ candidates:
         - horizon_id=H60
         - hypothesis_id=cand_F2_H60_09
     - candidate_id: cand_F2_H60_10
-      m2_idx: 6
+      m2_idx: 7
       m3_idx: 3
       m4_idx: 2
       enabled_assets: all
@@ -1107,7 +752,7 @@ candidates:
         - horizon_id=H60
         - hypothesis_id=cand_F2_H60_10
     - candidate_id: cand_F2_H60_11
-      m2_idx: 6
+      m2_idx: 7
       m3_idx: 3
       m4_idx: 3
       enabled_assets: all
@@ -1116,46 +761,6 @@ candidates:
         - family_name=slow_structural_hold
         - horizon_id=H60
         - hypothesis_id=cand_F2_H60_11
-    - candidate_id: cand_F2_H60_12
-      m2_idx: 7
-      m3_idx: 2
-      m4_idx: 2
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H60
-        - hypothesis_id=cand_F2_H60_12
-    - candidate_id: cand_F2_H60_13
-      m2_idx: 7
-      m3_idx: 2
-      m4_idx: 3
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H60
-        - hypothesis_id=cand_F2_H60_13
-    - candidate_id: cand_F2_H60_14
-      m2_idx: 7
-      m3_idx: 3
-      m4_idx: 2
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H60
-        - hypothesis_id=cand_F2_H60_14
-    - candidate_id: cand_F2_H60_15
-      m2_idx: 7
-      m3_idx: 3
-      m4_idx: 3
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H60
-        - hypothesis_id=cand_F2_H60_15
     - candidate_id: cand_F2_H1D_00
       m2_idx: 4
       m3_idx: 4
@@ -1207,8 +812,8 @@ candidates:
         - horizon_id=H1D
         - hypothesis_id=cand_F2_H1D_04
     - candidate_id: cand_F2_H1D_05
-      m2_idx: 5
-      m3_idx: 4
+      m2_idx: 7
+      m3_idx: 5
       m4_idx: 5
       enabled_assets: all
       tags:
@@ -1216,106 +821,6 @@ candidates:
         - family_name=slow_structural_hold
         - horizon_id=H1D
         - hypothesis_id=cand_F2_H1D_05
-    - candidate_id: cand_F2_H1D_06
-      m2_idx: 5
-      m3_idx: 5
-      m4_idx: 4
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H1D
-        - hypothesis_id=cand_F2_H1D_06
-    - candidate_id: cand_F2_H1D_07
-      m2_idx: 5
-      m3_idx: 5
-      m4_idx: 5
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H1D
-        - hypothesis_id=cand_F2_H1D_07
-    - candidate_id: cand_F2_H1D_08
-      m2_idx: 6
-      m3_idx: 4
-      m4_idx: 4
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H1D
-        - hypothesis_id=cand_F2_H1D_08
-    - candidate_id: cand_F2_H1D_09
-      m2_idx: 6
-      m3_idx: 4
-      m4_idx: 5
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H1D
-        - hypothesis_id=cand_F2_H1D_09
-    - candidate_id: cand_F2_H1D_10
-      m2_idx: 6
-      m3_idx: 5
-      m4_idx: 4
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H1D
-        - hypothesis_id=cand_F2_H1D_10
-    - candidate_id: cand_F2_H1D_11
-      m2_idx: 6
-      m3_idx: 5
-      m4_idx: 5
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H1D
-        - hypothesis_id=cand_F2_H1D_11
-    - candidate_id: cand_F2_H1D_12
-      m2_idx: 7
-      m3_idx: 4
-      m4_idx: 4
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H1D
-        - hypothesis_id=cand_F2_H1D_12
-    - candidate_id: cand_F2_H1D_13
-      m2_idx: 7
-      m3_idx: 4
-      m4_idx: 5
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H1D
-        - hypothesis_id=cand_F2_H1D_13
-    - candidate_id: cand_F2_H1D_14
-      m2_idx: 7
-      m3_idx: 5
-      m4_idx: 4
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H1D
-        - hypothesis_id=cand_F2_H1D_14
-    - candidate_id: cand_F2_H1D_15
-      m2_idx: 7
-      m3_idx: 5
-      m4_idx: 5
-      enabled_assets: all
-      tags:
-        - family_id=F2
-        - family_name=slow_structural_hold
-        - horizon_id=H1D
-        - hypothesis_id=cand_F2_H1D_15
 
 module6:
   intake:
