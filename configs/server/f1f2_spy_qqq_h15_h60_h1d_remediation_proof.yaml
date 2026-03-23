@@ -1,4 +1,4 @@
-run_name: f1f2_spy_qqq_h15_h60_h1d_remediation_proof
+run_name: f1f2_spy_qqq_h15_h60_h1d_remediation_proof_v2
 symbols:
   - SPY
   - QQQ
@@ -123,6 +123,74 @@ module4_configs:
     max_turnover_frac_per_bar: 0.05
     overnight_min_conviction: 0.70
     allow_cash_overnight: false
+  - window_selection_mode: multi_window
+    fixed_window_index: 0
+    anchor_window_index: 0
+    regime_confidence_min: 0.65
+    entry_threshold: 0.66
+    exit_threshold: 0.25
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 0.05
+    target_signal_mode: weight_target
+    target_weight_deadband_frac: 0.20
+    min_holding_minutes: 20
+    hard_stop_loss_frac: 0.020
+    max_asset_cap_frac: 0.18
+    max_turnover_frac_per_bar: 0.08
+    overnight_min_conviction: 0.88
+    allow_cash_overnight: true
+  - window_selection_mode: multi_window
+    fixed_window_index: 0
+    anchor_window_index: 0
+    regime_confidence_min: 0.68
+    entry_threshold: 0.70
+    exit_threshold: 0.28
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 0.05
+    target_signal_mode: weight_target
+    target_weight_deadband_frac: 0.22
+    min_holding_minutes: 24
+    hard_stop_loss_frac: 0.020
+    max_asset_cap_frac: 0.18
+    max_turnover_frac_per_bar: 0.08
+    overnight_min_conviction: 0.88
+    allow_cash_overnight: true
+  - window_selection_mode: multi_window
+    fixed_window_index: 1
+    anchor_window_index: 1
+    regime_confidence_min: 0.68
+    entry_threshold: 0.60
+    exit_threshold: 0.22
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 0.04
+    target_signal_mode: weight_target
+    target_weight_deadband_frac: 0.22
+    min_holding_minutes: 30
+    hard_stop_loss_frac: 0.030
+    max_asset_cap_frac: 0.15
+    max_turnover_frac_per_bar: 0.06
+    overnight_min_conviction: 0.90
+    allow_cash_overnight: true
+  - window_selection_mode: multi_window
+    fixed_window_index: 1
+    anchor_window_index: 1
+    regime_confidence_min: 0.72
+    entry_threshold: 0.64
+    exit_threshold: 0.24
+    conviction_scale: 1.0
+    conviction_clip: 1.0
+    max_abs_weight: 0.04
+    target_signal_mode: weight_target
+    target_weight_deadband_frac: 0.24
+    min_holding_minutes: 36
+    hard_stop_loss_frac: 0.030
+    max_asset_cap_frac: 0.15
+    max_turnover_frac_per_bar: 0.06
+    overnight_min_conviction: 0.92
+    allow_cash_overnight: true
 
 harness:
   seed: 97
@@ -216,6 +284,26 @@ candidates:
         - family_name=slow_structural_hold
         - horizon_id=H15
         - hypothesis_id=F2_H15
+    - candidate_id: cand_F1_H15_S1
+      m2_idx: 0
+      m3_idx: 0
+      m4_idx: 3
+      enabled_assets: all
+      tags:
+        - family_id=F1
+        - family_name=fast_persistence_momentum
+        - horizon_id=H15
+        - hypothesis_id=F1_H15_S1
+    - candidate_id: cand_F1_H15_S2
+      m2_idx: 0
+      m3_idx: 0
+      m4_idx: 4
+      enabled_assets: all
+      tags:
+        - family_id=F1
+        - family_name=fast_persistence_momentum
+        - horizon_id=H15
+        - hypothesis_id=F1_H15_S2
     - candidate_id: cand_F1_H60
       m2_idx: 0
       m3_idx: 1
@@ -236,6 +324,26 @@ candidates:
         - family_name=slow_structural_hold
         - horizon_id=H60
         - hypothesis_id=F2_H60
+    - candidate_id: cand_F2_H60_S1
+      m2_idx: 1
+      m3_idx: 1
+      m4_idx: 5
+      enabled_assets: all
+      tags:
+        - family_id=F2
+        - family_name=slow_structural_hold
+        - horizon_id=H60
+        - hypothesis_id=F2_H60_S1
+    - candidate_id: cand_F2_H60_S2
+      m2_idx: 1
+      m3_idx: 1
+      m4_idx: 6
+      enabled_assets: all
+      tags:
+        - family_id=F2
+        - family_name=slow_structural_hold
+        - horizon_id=H60
+        - hypothesis_id=F2_H60_S2
     - candidate_id: cand_F1_H1D
       m2_idx: 0
       m3_idx: 2
