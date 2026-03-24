@@ -46,9 +46,21 @@ def _gaussian_pdf(x_grid: np.ndarray, mu_a: np.ndarray, sigma_a: np.ndarray) -> 
     return np.where(np.isfinite(pdf), pdf, 0.0)
 
 
-def compute_pbuy_and_delta_coeff(inputs: ScoreInputs, eps_div_a: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def compute_pbuy_and_delta_coeff(
+    inputs: ScoreInputs,
+    eps_div_a: np.ndarray,
+    *,
+    dx: float,
+    eps_pdf: float,
+    sealed_mode: bool,
+) -> tuple[np.ndarray, np.ndarray]:
     # Locked sealed constants from the mathematical spec section used in module2 core.
-    p_sr_buy = _sigmoid(np.log(9.0) * inputs.ret_norm / (inputs.s_r + eps_div_a))
+    if sealed_mode:
+        s_eff_r = np.maximum(inputs.s_r, 0.5 * float(dx))
+        sr_denom = s_eff_r + float(eps_pdf)
+    else:
+        sr_denom = inputs.s_r + eps_div_a
+    p_sr_buy = _sigmoid(np.log(9.0) * inputs.ret_norm / sr_denom)
     p_clv_buy = _sigmoid(6.0 * inputs.clv)
     w_trend = np.clip(inputs.body_pct, 0.0, 1.0)
     p_buy = np.clip(w_trend * p_sr_buy + (1.0 - w_trend) * p_clv_buy, 0.0, 1.0)
@@ -75,14 +87,22 @@ def build_bar_mixture_params(
     cap_v_eff_a: np.ndarray,
     score_inputs: ScoreInputs,
     eps_div_a: np.ndarray,
+    eps_pdf: float,
     dx: float,
     sealed_mode: bool,
     mu1_clv_shift: float,
     mu2_clv_shift: float,
+    anchor_close_a: np.ndarray | None = None,
+    anchor_atr_eff_a: np.ndarray | None = None,
+    anchor_rvol_a: np.ndarray | None = None,
 ) -> MixtureBarParams:
-    denom = atr_eff_a + eps_div_a
+    close_anchor = np.asarray(close_a if anchor_close_a is None else anchor_close_a, dtype=np.float64)
+    atr_anchor = np.asarray(atr_eff_a if anchor_atr_eff_a is None else anchor_atr_eff_a, dtype=np.float64)
+    rvol_anchor = np.asarray(rvol_a if anchor_rvol_a is None else anchor_rvol_a, dtype=np.float64)
+
+    denom = atr_anchor + eps_div_a
     mid_a = 0.5 * (open_a + close_a)
-    mu_base = (mid_a - close_a) / denom
+    mu_base = (mid_a - close_anchor) / denom
     if sealed_mode:
         mu1 = mu_base
         mu2 = mu_base
@@ -90,18 +110,37 @@ def build_bar_mixture_params(
         mu1 = mu_base + float(mu1_clv_shift) * clv_a
         mu2 = mu_base + float(mu2_clv_shift) * clv_a
 
-    s1 = np.maximum(np.asarray(sigma1_a, dtype=np.float64), float(dx))
-    s2 = np.maximum(np.asarray(sigma2_a, dtype=np.float64), float(dx))
-    w1 = np.clip(np.asarray(w1_a, dtype=np.float64), 0.0, 1.0)
-    w2 = np.clip(np.asarray(w2_a, dtype=np.float64), 0.0, 1.0)
+    if sealed_mode:
+        range_a = np.maximum(high_a - low_a, eps_div_a)
+        body_a = np.abs(close_a - open_a)
+        body_pct_eff = np.clip(body_a / range_a, 0.0, 1.0)
+        w1 = body_pct_eff
+        w2 = 1.0 - w1
+        rvol_pos = np.maximum(rvol_anchor, 0.0)
+        w_rvol = rvol_pos / (1.0 + rvol_pos)
+        range_eff = w_rvol * range_a + (1.0 - w_rvol) * atr_anchor
+        sigma_base = range_eff / (4.0 * (atr_anchor + eps_div_a))
+        s1 = np.maximum(sigma_base / (1.0 + np.log1p(rvol_pos)), float(dx))
+        s2 = np.maximum(sigma_base, float(dx))
+    else:
+        s1 = np.maximum(np.asarray(sigma1_a, dtype=np.float64), float(dx))
+        s2 = np.maximum(np.asarray(sigma2_a, dtype=np.float64), float(dx))
+        w1 = np.clip(np.asarray(w1_a, dtype=np.float64), 0.0, 1.0)
+        w2 = np.clip(np.asarray(w2_a, dtype=np.float64), 0.0, 1.0)
     wsum = w1 + w2
     w1 = np.divide(w1, wsum, out=np.ones_like(w1), where=wsum > 0.0)
     w2 = 1.0 - w1
 
     vprof = np.minimum(np.maximum(volume_a, 0.0), np.maximum(cap_v_eff_a, 0.0))
-    vprof = np.where(np.isfinite(vprof), vprof * np.maximum(rvol_a, 0.0), 0.0)
+    vprof = np.where(np.isfinite(vprof), vprof, 0.0)
 
-    pbuy, delta_coeff = compute_pbuy_and_delta_coeff(score_inputs, eps_div_a)
+    pbuy, delta_coeff = compute_pbuy_and_delta_coeff(
+        score_inputs,
+        eps_div_a,
+        dx=dx,
+        eps_pdf=eps_pdf,
+        sealed_mode=sealed_mode,
+    )
 
     return MixtureBarParams(
         mu1=mu1,
@@ -130,7 +169,7 @@ def inject_profile_mass(
     mix = params.w1[:, None] * pdf1 + params.w2[:, None] * pdf2
     mix = np.where(np.isfinite(mix), mix, 0.0)
 
-    norm = np.sum(mix, axis=1) * float(dx)
+    norm = np.sum(mix, axis=1)
     mix = np.divide(
         mix,
         norm[:, None] + float(eps_pdf),

@@ -65,10 +65,15 @@ def _worker_execution_forbidden() -> bool:
 
 
 def _nanmedian_silent(arr: np.ndarray, axis: Optional[int] = None) -> np.ndarray:
+    # Fast path when there are no NaNs; preserves deterministic behavior while
+    # avoiding masked-array overhead in hot rolling statistics.
+    a = np.asarray(arr, dtype=np.float64)
+    if not np.isnan(a).any():
+        return np.median(a, axis=axis)
     # Deterministic guard against noisy "All-NaN slice encountered" warnings.
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="All-NaN slice encountered", category=RuntimeWarning)
-        return np.nanmedian(arr, axis=axis)
+        return np.nanmedian(a, axis=axis)
 
 
 class DayTypeIdx(IntEnum):
@@ -210,6 +215,7 @@ class MarketPhysics:
     rvol: np.ndarray
     range_: np.ndarray
     body_pct: np.ndarray
+    wick_ratio: np.ndarray
     clv: np.ndarray
     sigma1: np.ndarray
     sigma2: np.ndarray
@@ -596,10 +602,16 @@ def _rolling_median_mad_causal(
     if T == 0:
         return med, mad
 
+    has_nan = bool(np.isnan(arr).any())
+
     if T >= w:
         wins = sliding_window_view(arr, window_shape=w, axis=0)  # (T-w+1, A, w)
-        med_full = _nanmedian_silent(wins, axis=-1)
-        mad_full = _nanmedian_silent(np.abs(wins - med_full[:, :, None]), axis=-1)
+        if has_nan:
+            med_full = _nanmedian_silent(wins, axis=-1)
+            mad_full = _nanmedian_silent(np.abs(wins - med_full[:, :, None]), axis=-1)
+        else:
+            med_full = np.median(wins, axis=-1)
+            mad_full = np.median(np.abs(wins - med_full[:, :, None]), axis=-1)
         med[w - 1 :] = med_full
         mad[w - 1 :] = mad_full
 
@@ -609,8 +621,12 @@ def _rolling_median_mad_causal(
         if n < min_periods:
             continue
         seg = arr[:n]
-        m = _nanmedian_silent(seg, axis=0)
-        d = _nanmedian_silent(np.abs(seg - m[None, :]), axis=0)
+        if has_nan:
+            m = _nanmedian_silent(seg, axis=0)
+            d = _nanmedian_silent(np.abs(seg - m[None, :]), axis=0)
+        else:
+            m = np.median(seg, axis=0)
+            d = np.median(np.abs(seg - m[None, :]), axis=0)
         med[t] = m
         mad[t] = d
 
@@ -1042,8 +1058,10 @@ def precompute_market_physics(state: TensorState, cfg: Module2Config) -> MarketP
 
     # 5) Candle micro-physics precompute over full (T, A)
     range_ = np.maximum(high_use - low_use, state.eps.eps_range[None, :])
-    body_pct = np.abs(close_use - open_use) / (range_ + state.eps.eps_div[None, :])
+    body = np.abs(close_use - open_use)
+    body_pct = body / range_
     body_pct = np.clip(body_pct, 0.0, 1.0)
+    wick_ratio = np.clip((range_ - body) / range_, 0.0, 1.0)
 
     clv = ((close_use - low_use) - (high_use - close_use)) / (range_ + state.eps.eps_div[None, :])
     clv = np.clip(clv, -1.0, 1.0)
@@ -1112,6 +1130,7 @@ def precompute_market_physics(state: TensorState, cfg: Module2Config) -> MarketP
         ("s_r", s_r),
         ("range_", range_),
         ("body_pct", body_pct),
+        ("wick_ratio", wick_ratio),
         ("clv", clv),
         ("sigma1", sigma1),
         ("sigma2", sigma2),
@@ -1153,6 +1172,7 @@ def precompute_market_physics(state: TensorState, cfg: Module2Config) -> MarketP
         rvol=rvol,
         range_=range_,
         body_pct=body_pct,
+        wick_ratio=wick_ratio,
         clv=clv,
         sigma1=sigma1,
         sigma2=sigma2,
@@ -1172,7 +1192,7 @@ def precompute_market_physics(state: TensorState, cfg: Module2Config) -> MarketP
 # Stage C: Core profile loop
 # -----------------------------------------------------------------------------
 
-def run_weightiz_profile_engine(state: TensorState, cfg: Module2Config) -> None:
+def _legacy_run_weightiz_profile_engine_shadowed(state: TensorState, cfg: Module2Config) -> None:
     """
     Run the deterministic profile engine and write outputs in-place to state:
     - state.rvol and state.atr_floor (effective ATR denominator)

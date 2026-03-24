@@ -77,3 +77,17 @@ def apply_rolling_update(
     state.mom0_wa[slot] = moments.m0
     state.mom1_wa[slot] = moments.m1
     state.mom2_wa[slot] = moments.m2
+
+
+def clear_rolling_state(state: RollingProfileState) -> None:
+    """Clear rolling buffers and aggregates on reset/session boundary."""
+    state.inj_total_wan.fill(0.0)
+    state.inj_delta_wan.fill(0.0)
+    state.mom0_wa.fill(0.0)
+    state.mom1_wa.fill(0.0)
+    state.mom2_wa.fill(0.0)
+    state.vp_total_an.fill(0.0)
+    state.vp_delta_an.fill(0.0)
+    state.agg_m0_a.fill(0.0)
+    state.agg_m1_a.fill(0.0)
+    state.agg_m2_a.fill(0.0)

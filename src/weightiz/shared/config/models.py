@@ -50,6 +50,21 @@ class EngineConfigModel(BaseModel):
     tick_size_default: float = 0.01
     tick_size_by_symbol: dict[str, float] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def validate_sealed_locked_constants(self) -> "EngineConfigModel":
+        if self.mode == "sealed":
+            if int(self.B) != 240:
+                raise ValueError("engine.B must be exactly 240 in sealed mode")
+            if float(self.x_min) != -6.0:
+                raise ValueError("engine.x_min must be exactly -6.0 in sealed mode")
+            if float(self.dx) != 0.05:
+                raise ValueError("engine.dx must be exactly 0.05 in sealed mode")
+            if float(self.eps_pdf) != 1.0e-12:
+                raise ValueError("engine.eps_pdf must be exactly 1e-12 in sealed mode")
+            if float(self.eps_vol) != 1.0e-12:
+                raise ValueError("engine.eps_vol must be exactly 1e-12 in sealed mode")
+        return self
+
 
 class Module2ConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")

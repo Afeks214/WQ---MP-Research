@@ -18,7 +18,7 @@ from .market_profile_kernels import (
     build_bar_mixture_params,
     inject_profile_mass,
 )
-from .tensor_builder import RollingMoments, apply_rolling_update, init_rolling_profile_state
+from .tensor_builder import RollingMoments, apply_rolling_update, clear_rolling_state, init_rolling_profile_state
 
 
 @dataclass(frozen=True)
@@ -230,6 +230,39 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x64))
 
 
+def _window_median_mad_volume(vol_w: np.ndarray, valid_w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Median/MAD over the decision-time working window.
+
+    Semantics are equivalent to nan-median on `where(valid_w, vol_w, nan)`:
+    invalid rows are excluded, and empty windows return zeros.
+    """
+    v = np.asarray(vol_w, dtype=np.float64)
+    m = np.asarray(valid_w, dtype=bool)
+    if v.shape != m.shape:
+        raise RuntimeError(f"volume/valid window shape mismatch: {v.shape} vs {m.shape}")
+    _, assets = v.shape
+
+    # Hot-path: all rows valid, avoid nan/ma overhead.
+    if bool(np.all(m)):
+        med = np.median(v, axis=0)
+        mad = np.median(np.abs(v - med[None, :]), axis=0)
+        return np.asarray(med, dtype=np.float64), np.asarray(mad, dtype=np.float64)
+
+    med = np.zeros(assets, dtype=np.float64)
+    mad = np.zeros(assets, dtype=np.float64)
+    for a in range(assets):
+        col = v[:, a]
+        mask = m[:, a]
+        if not np.any(mask):
+            continue
+        vals = col[mask]
+        med_a = float(np.median(vals))
+        med[a] = med_a
+        mad[a] = float(np.median(np.abs(vals - med_a)))
+    return med, mad
+
+
 def run_streaming_profile_engine(
     *,
     state: Any,
@@ -261,8 +294,11 @@ def run_streaming_profile_engine(
 
     x = np.asarray(state.x_grid, dtype=np.float64)
     x2 = x * x
+    sqrt_2pi = float(np.sqrt(2.0 * np.pi))
     dx = float(state.cfg.dx)
     idx_zero = int(np.argmin(np.abs(x)))
+    eps_pdf = float(state.eps.eps_pdf)
+    eps_div_a = np.asarray(state.eps.eps_div, dtype=np.float64)
 
     rolling = init_rolling_profile_state(window=W, assets=A, bins=B)
     poc_rank = build_poc_rank_fn(x)
@@ -284,7 +320,22 @@ def run_streaming_profile_engine(
     w2_hist = np.zeros((T, A), dtype=np.float64) if collect_forensics else np.zeros((0, 0), dtype=np.float64)
     vprof_hist = np.zeros((T, A), dtype=np.float64) if collect_forensics else np.zeros((0, 0), dtype=np.float64)
 
+    gap_reset = np.zeros(T, dtype=bool)
+    if T > 1:
+        gap_reset[1:] = np.asarray(state.gap_min[1:], dtype=np.float64) > 5.0
+    session_start = 0
+
     for t in range(T):
+        reset_boundary = (
+            (t == 0)
+            or (state.reset_flag[t] == 1)
+            or gap_reset[t]
+            or (t > 0 and state.session_id[t] != state.session_id[t - 1])
+        )
+        if reset_boundary:
+            clear_rolling_state(rolling)
+            session_start = t
+
         tradable_t = (
             state.bar_valid[t]
             & np.isfinite(close_use[t])
@@ -292,64 +343,139 @@ def run_streaming_profile_engine(
             & (physics.atr_eff[t] > 0.0)
         )
 
-        score_inputs = ScoreInputs(
-            ret_norm=np.asarray(physics.ret_norm[t], dtype=np.float64),
-            s_r=np.asarray(physics.s_r[t], dtype=np.float64),
-            clv=np.asarray(physics.clv[t], dtype=np.float64),
-            body_pct=np.asarray(physics.body_pct[t], dtype=np.float64),
-        )
+        if sealed_mode:
+            w_start = max(session_start, t - W + 1)
+            open_w = np.asarray(open_use[w_start : t + 1], dtype=np.float64)
+            high_w = np.asarray(high_use[w_start : t + 1], dtype=np.float64)
+            low_w = np.asarray(low_use[w_start : t + 1], dtype=np.float64)
+            close_w = np.asarray(close_use[w_start : t + 1], dtype=np.float64)
+            vol_w = np.asarray(vol_use[w_start : t + 1], dtype=np.float64)
+            valid_w = np.asarray(valid[w_start : t + 1], dtype=bool)
+            clv_w = np.asarray(physics.clv[w_start : t + 1], dtype=np.float64)
+            K = int(open_w.shape[0])
 
-        params = build_bar_mixture_params(
-            open_a=np.asarray(open_use[t], dtype=np.float64),
-            high_a=np.asarray(high_use[t], dtype=np.float64),
-            low_a=np.asarray(low_use[t], dtype=np.float64),
-            close_a=np.asarray(close_use[t], dtype=np.float64),
-            atr_eff_a=np.asarray(physics.atr_eff[t], dtype=np.float64),
-            rvol_a=np.asarray(physics.rvol[t], dtype=np.float64),
-            clv_a=np.asarray(physics.clv[t], dtype=np.float64),
-            body_pct_a=np.asarray(physics.body_pct[t], dtype=np.float64),
-            sigma1_a=np.asarray(physics.sigma1[t], dtype=np.float64),
-            sigma2_a=np.asarray(physics.sigma2[t], dtype=np.float64),
-            w1_a=np.asarray(physics.w1[t], dtype=np.float64),
-            w2_a=np.asarray(physics.w2[t], dtype=np.float64),
-            volume_a=np.asarray(vol_use[t], dtype=np.float64),
-            cap_v_eff_a=np.asarray(physics.cap_v_eff[t], dtype=np.float64),
-            score_inputs=score_inputs,
-            eps_div_a=np.asarray(state.eps.eps_div, dtype=np.float64),
-            dx=dx,
-            sealed_mode=sealed_mode,
-            mu1_clv_shift=float(getattr(cfg, "mu1_clv_shift", 0.0)),
-            mu2_clv_shift=float(getattr(cfg, "mu2_clv_shift", 0.35)),
-        )
-        inj = inject_profile_mass(
-            params=params,
-            x_grid=x,
-            dx=dx,
-            eps_pdf=float(state.eps.eps_pdf),
-            valid_a=np.asarray(valid[t], dtype=bool),
-        )
+            close_t = np.asarray(close_use[t], dtype=np.float64)
+            atr_t = np.asarray(physics.atr_eff[t], dtype=np.float64)
+            rvol_t = np.maximum(np.asarray(physics.rvol[t], dtype=np.float64), 0.0)
+            ret_norm_t = np.asarray(physics.ret_norm[t], dtype=np.float64)
+            s_r_t = np.asarray(physics.s_r[t], dtype=np.float64)
 
-        apply_rolling_update(
-            rolling,
-            t_index=t,
-            inj_total_an=inj.total_an,
-            inj_delta_an=inj.delta_an,
-            moments=RollingMoments(m0=inj.m0_a, m1=inj.m1_a, m2=inj.m2_a),
-        )
+            med_v, mad_v = _window_median_mad_volume(vol_w, valid_w)
+            cap_base_t = med_v + 5.0 * mad_v
+            cap_eff_t = cap_base_t * (1.0 + np.log(np.maximum(1.0, rvol_t)))
+            cap_eff_t = np.where(np.isfinite(cap_eff_t), np.maximum(cap_eff_t, 0.0), 0.0)
+            range_w = np.maximum(high_w - low_w, eps_div_a[None, :])
+            body_w = np.abs(close_w - open_w)
+            body_pct_w = np.clip(body_w / range_w, 0.0, 1.0)
 
-        if collect_forensics:
-            mu_hist[t] = params.w1 * params.mu1 + params.w2 * params.mu2
-            sigma1_hist[t] = params.sigma1
-            sigma2_hist[t] = params.sigma2
-            w1_hist[t] = params.w1
-            w2_hist[t] = params.w2
-            vprof_hist[t] = params.vprof
+            denom_mu = atr_t[None, :] + eps_div_a[None, :]
+            mu_w = (0.5 * (open_w + close_w) - close_t[None, :]) / denom_mu
 
-        if t < int(eng_cfg.warmup) - 1:
-            continue
+            w_rvol_t = rvol_t / (1.0 + rvol_t)
+            range_eff_w = w_rvol_t[None, :] * range_w + (1.0 - w_rvol_t)[None, :] * atr_t[None, :]
+            sigma_base_w = range_eff_w / (4.0 * (atr_t[None, :] + eps_div_a[None, :]))
+            sigma1_w = np.maximum(sigma_base_w / (1.0 + np.log1p(rvol_t))[None, :], dx)
+            sigma2_w = np.maximum(sigma_base_w, dx)
 
-        vp_t = np.asarray(rolling.vp_total_an, dtype=np.float64).copy()
-        vpd_t = np.asarray(rolling.vp_delta_an, dtype=np.float64).copy()
+            s_eff_r_t = np.maximum(s_r_t, 0.5 * dx)
+            p_sr_buy_t = _sigmoid(np.log(9.0) * ret_norm_t / (s_eff_r_t + eps_pdf))
+            p_clv_buy_w = _sigmoid(6.0 * clv_w)
+            p_buy_w = np.clip(body_pct_w * p_sr_buy_t[None, :] + (1.0 - body_pct_w) * p_clv_buy_w, 0.0, 1.0)
+            delta_coeff_w = 2.0 * p_buy_w - 1.0
+
+            vprof_w = np.minimum(np.maximum(vol_w, 0.0), cap_eff_t[None, :])
+            vprof_w = np.where(np.isfinite(vprof_w), vprof_w, 0.0)
+
+            z1 = (x[None, None, :] - mu_w[:, :, None]) / sigma1_w[:, :, None]
+            z2 = (x[None, None, :] - mu_w[:, :, None]) / sigma2_w[:, :, None]
+            pdf1 = np.exp(-0.5 * z1 * z1) / (sigma1_w[:, :, None] * sqrt_2pi)
+            pdf2 = np.exp(-0.5 * z2 * z2) / (sigma2_w[:, :, None] * sqrt_2pi)
+
+            w1_w = body_pct_w
+            w2_w = 1.0 - w1_w
+            mix_w = w1_w[:, :, None] * pdf1 + w2_w[:, :, None] * pdf2
+            mix_w = np.where(np.isfinite(mix_w), mix_w, 0.0)
+            norm_w = np.sum(mix_w, axis=2)
+            mix_w = np.divide(
+                mix_w,
+                norm_w[:, :, None] + eps_pdf,
+                out=np.zeros_like(mix_w),
+                where=norm_w[:, :, None] > 0.0,
+            )
+
+            total_wab = vprof_w[:, :, None] * mix_w
+            total_wab = np.where(valid_w[:, :, None], total_wab, 0.0)
+            total_wab = np.where(np.isfinite(total_wab), total_wab, 0.0)
+            delta_wab = total_wab * delta_coeff_w[:, :, None]
+            delta_wab = np.where(np.isfinite(delta_wab), delta_wab, 0.0)
+
+            vp_t = np.sum(total_wab, axis=0)
+            vpd_t = np.sum(delta_wab, axis=0)
+
+            if collect_forensics:
+                mu_hist[t] = mu_w[-1]
+                sigma1_hist[t] = sigma1_w[-1]
+                sigma2_hist[t] = sigma2_w[-1]
+                w1_hist[t] = w1_w[-1]
+                w2_hist[t] = w2_w[-1]
+                vprof_hist[t] = vprof_w[-1]
+        else:
+            score_inputs = ScoreInputs(
+                ret_norm=np.asarray(physics.ret_norm[t], dtype=np.float64),
+                s_r=np.asarray(physics.s_r[t], dtype=np.float64),
+                clv=np.asarray(physics.clv[t], dtype=np.float64),
+                body_pct=np.asarray(physics.body_pct[t], dtype=np.float64),
+            )
+
+            params = build_bar_mixture_params(
+                open_a=np.asarray(open_use[t], dtype=np.float64),
+                high_a=np.asarray(high_use[t], dtype=np.float64),
+                low_a=np.asarray(low_use[t], dtype=np.float64),
+                close_a=np.asarray(close_use[t], dtype=np.float64),
+                atr_eff_a=np.asarray(physics.atr_eff[t], dtype=np.float64),
+                rvol_a=np.asarray(physics.rvol[t], dtype=np.float64),
+                clv_a=np.asarray(physics.clv[t], dtype=np.float64),
+                body_pct_a=np.asarray(physics.body_pct[t], dtype=np.float64),
+                sigma1_a=np.asarray(physics.sigma1[t], dtype=np.float64),
+                sigma2_a=np.asarray(physics.sigma2[t], dtype=np.float64),
+                w1_a=np.asarray(physics.w1[t], dtype=np.float64),
+                w2_a=np.asarray(physics.w2[t], dtype=np.float64),
+                volume_a=np.asarray(vol_use[t], dtype=np.float64),
+                cap_v_eff_a=np.asarray(physics.cap_v_eff[t], dtype=np.float64),
+                score_inputs=score_inputs,
+                eps_div_a=np.asarray(state.eps.eps_div, dtype=np.float64),
+                eps_pdf=float(state.eps.eps_pdf),
+                dx=dx,
+                sealed_mode=False,
+                mu1_clv_shift=float(getattr(cfg, "mu1_clv_shift", 0.0)),
+                mu2_clv_shift=float(getattr(cfg, "mu2_clv_shift", 0.35)),
+            )
+            inj = inject_profile_mass(
+                params=params,
+                x_grid=x,
+                dx=dx,
+                eps_pdf=float(state.eps.eps_pdf),
+                valid_a=np.asarray(valid[t], dtype=bool),
+            )
+
+            apply_rolling_update(
+                rolling,
+                t_index=t,
+                inj_total_an=inj.total_an,
+                inj_delta_an=inj.delta_an,
+                moments=RollingMoments(m0=inj.m0_a, m1=inj.m1_a, m2=inj.m2_a),
+            )
+
+            if collect_forensics:
+                mu_hist[t] = params.w1 * params.mu1 + params.w2 * params.mu2
+                sigma1_hist[t] = params.sigma1
+                sigma2_hist[t] = params.sigma2
+                w1_hist[t] = params.w1
+                w2_hist[t] = params.w2
+                vprof_hist[t] = params.vprof
+
+            vp_t = np.asarray(rolling.vp_total_an, dtype=np.float64).copy()
+            vpd_t = np.asarray(rolling.vp_delta_an, dtype=np.float64).copy()
         vp_t[~tradable_t] = 0.0
         vpd_t[~tradable_t] = 0.0
 
@@ -359,9 +485,10 @@ def run_streaming_profile_engine(
         total = np.sum(vp_t, axis=1)
         denom = total + float(state.eps.eps_vol)
 
-        # Mixture-moment profile moments (grid-optional path)
-        mu_prof = rolling.agg_m1_a / (rolling.agg_m0_a + float(state.eps.eps_vol))
-        var_prof = rolling.agg_m2_a / (rolling.agg_m0_a + float(state.eps.eps_vol)) - mu_prof * mu_prof
+        # Profile moments derived from the discrete VP grid.
+        mu_prof = np.sum(vp_t * x[None, :], axis=1) / denom
+        ex2_prof = np.sum(vp_t * x2[None, :], axis=1) / denom
+        var_prof = ex2_prof - mu_prof * mu_prof
         var_prof = np.maximum(var_prof, 0.0)
         sigma_prof = np.sqrt(var_prof)
 
@@ -416,7 +543,7 @@ def run_streaming_profile_engine(
         mask_t = computed_mask[t]
         if not np.any(mask_t):
             continue
-        if t == 0 or state.reset_flag[t] == 1 or state.session_id[t] != state.session_id[t - 1]:
+        if t == 0 or state.reset_flag[t] == 1 or gap_reset[t] or state.session_id[t] != state.session_id[t - 1]:
             d_delta[t, mask_t] = 0.0
         else:
             prev = delta_eff_all[t - 1]
@@ -427,23 +554,27 @@ def run_streaming_profile_engine(
 
     sigma_delta = np.full((T, A), np.nan, dtype=np.float64)
     sid = np.asarray(state.session_id, dtype=np.int64)
-    starts = np.where(np.r_[True, (sid[1:] != sid[:-1]) | (state.reset_flag[1:] == 1)])[0]
+    starts = np.where(np.r_[True, (sid[1:] != sid[:-1]) | (state.reset_flag[1:] == 1) | gap_reset[1:]])[0]
     ends = np.r_[starts[1:], T]
 
     for s, e in zip(starts.tolist(), ends.tolist()):
         seg_level = delta_eff_all[s:e]
         seg_chg = d_delta[s:e]
-
-        _, mad_level = rolling_median_mad_fn(
+        _, mad_level_curr = rolling_median_mad_fn(
             seg_level,
             window=int(getattr(cfg, "delta_mad_lookback_bars", 180)),
             min_periods=int(getattr(cfg, "delta_mad_min_periods", 10)),
         )
-        _, mad_chg = rolling_median_mad_fn(
+        _, mad_chg_curr = rolling_median_mad_fn(
             seg_chg,
             window=int(getattr(cfg, "delta_mad_lookback_bars", 180)),
             min_periods=int(getattr(cfg, "delta_mad_min_periods", 10)),
         )
+        mad_level = np.full_like(mad_level_curr, np.nan)
+        mad_chg = np.full_like(mad_chg_curr, np.nan)
+        if mad_level.shape[0] > 1:
+            mad_level[1:] = mad_level_curr[:-1]
+            mad_chg[1:] = mad_chg_curr[:-1]
 
         sig_seg = np.maximum(
             np.maximum(
@@ -512,7 +643,10 @@ def run_streaming_profile_engine(
     if np.any(warmup_rows):
         state.scores[warmup_rows] = 0.0
 
-    if str(getattr(cfg, "rvol_policy", "neutral_one")) == "warmup_mask":
+    rvol_policy = str(getattr(cfg, "rvol_policy", "neutral_one"))
+    if sealed_mode and rvol_policy == "warmup_mask":
+        raise RuntimeError("sealed mode forbids rvol_policy='warmup_mask'")
+    if rvol_policy == "warmup_mask":
         bad_mask = ~np.asarray(physics.rvol_eligible, dtype=bool)
         state.profile_stats[bad_mask] = np.nan
         state.scores[bad_mask] = np.nan
@@ -526,6 +660,17 @@ def run_streaming_profile_engine(
         state.profile_stats[invalid_mask, int(profile_stat_idx.IPOC)] = float(idx_zero)
         state.profile_stats[invalid_mask, int(profile_stat_idx.IVAH)] = float(idx_zero)
         state.profile_stats[invalid_mask, int(profile_stat_idx.IVAL)] = float(idx_zero)
+
+    if sealed_mode:
+        for name, arr in [
+            ("vp", state.vp),
+            ("vp_delta", state.vp_delta),
+            ("profile_stats", state.profile_stats),
+            ("scores", state.scores),
+        ]:
+            if not np.all(np.isfinite(arr)):
+                bad = np.argwhere(~np.isfinite(arr))[0]
+                raise RuntimeError(f"sealed non-finite output in {name} at index {bad.tolist()}")
 
     # Enforce immutable output tensors after completion.
     state.vp.flags.writeable = False

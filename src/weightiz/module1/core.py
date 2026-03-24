@@ -217,6 +217,18 @@ class TensorState:
     daily_loss_breach_flag: np.ndarray
     leverage_limit: np.ndarray
 
+    @property
+    def vp_buy(self) -> np.ndarray:
+        """Additive public output channel: buy-side profile mass."""
+        out = 0.5 * (self.vp + self.vp_delta)
+        return np.where(np.isfinite(out), np.maximum(out, 0.0), 0.0)
+
+    @property
+    def vp_sell(self) -> np.ndarray:
+        """Additive public output channel: sell-side profile mass."""
+        out = 0.5 * (self.vp - self.vp_delta)
+        return np.where(np.isfinite(out), np.maximum(out, 0.0), 0.0)
+
 
 # -----------------------------------------------------------------------------
 # Deterministic helper checks
@@ -266,6 +278,17 @@ def _validate_config(cfg: EngineConfig, symbols: Sequence[str]) -> np.ndarray:
     mode = str(cfg.mode).strip().lower()
     if mode not in {"research", "sealed"}:
         raise RuntimeError(f"engine.mode must be 'research' or 'sealed', got {cfg.mode!r}")
+    if mode == "sealed":
+        if int(cfg.B) != 240:
+            raise RuntimeError("sealed mode requires B == 240")
+        if float(cfg.x_min) != -6.0:
+            raise RuntimeError("sealed mode requires x_min == -6.0")
+        if float(cfg.dx) != 0.05:
+            raise RuntimeError("sealed mode requires dx == 0.05")
+        if float(cfg.eps_pdf) != 1.0e-12:
+            raise RuntimeError("sealed mode requires eps_pdf == 1e-12")
+        if float(cfg.eps_vol) != 1.0e-12:
+            raise RuntimeError("sealed mode requires eps_vol == 1e-12")
 
     tick = np.asarray(cfg.tick_size, dtype=np.float64)
     _assert_shape("tick_size", tick, (cfg.A,))
@@ -863,9 +886,9 @@ def validate_state_hard(state: TensorState) -> None:
     # Mandatory finite tensors
     for name, arr in [
         ("gap_min", state.gap_min),
-        ("vp", state.vp),
-        ("vp_delta", state.vp_delta),
-        ("position_qty", state.position_qty),
+            ("vp", state.vp),
+            ("vp_delta", state.vp_delta),
+            ("position_qty", state.position_qty),
         ("available_cash", state.available_cash),
         ("equity", state.equity),
         ("margin_used", state.margin_used),

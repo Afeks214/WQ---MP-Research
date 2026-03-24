@@ -1,0 +1,9 @@
+function_module,time_share_estimate,cumulative_time_sec,allocation_notes,decision
+src/weightiz/module2/market_profile_engine.py:run_streaming_profile_engine,~89% of module2 runtime,0.632,hot loop with sealed reprojection and per-bar reductions,optimize
+src/weightiz/module2/core.py:_rolling_median_mad_causal,~35% of end-to-end runtime,0.248,was routed through NaN-heavy median path,optimize
+src/weightiz/module2/core.py:_nanmedian_silent (via numpy.nanmedian stack),~34% of end-to-end runtime,0.238,masked-array median overhead with warnings guard,optimize
+src/weightiz/module2/core.py:compute_value_area_greedy,~11% of module2 runtime,0.082,algorithmic loop cost but bounded and spec-sensitive,leave
+src/weightiz/module2/core.py:precompute_market_physics,~10% of module2 runtime,0.072,mixed causal precompute cost; no dominant waste after fixes,leave
+numpy.ma median stack (extras/core),large indirect hotspot,0.214+,intermediate masked-array object churn,rejected-by-removal
+Persistent vp_buy/vp_sell tensor footprint,peak memory driver,n/a,extra (T,A,B) channels inflated peak memory,optimized-via-lazy-derived-output
+Numba JIT sealed kernel,n/a,n/a,would increase complexity and determinism risk; unnecessary after structural fixes,rejected
